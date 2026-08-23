@@ -4,6 +4,8 @@
 # 检查各节点和服务状态
 # ============================================================
 
+set -u
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -12,6 +14,10 @@ NC='\033[0m'
 OK="${GREEN}[OK]${NC}"
 FAIL="${RED}[FAIL]${NC}"
 WARN="${YELLOW}[WARN]${NC}"
+
+log_info() { echo -e "${GREEN}[INFO]${NC} $*"; }
+log_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
 
 echo ""
 echo "=========================================="
@@ -115,7 +121,6 @@ check_port 192.168.1.103 631 "CUPS"
 echo -e "\n--- WireGuard Mesh ---"
 if ssh "root@192.168.1.101" "wg show wg0 2>/dev/null" &>/dev/null; then
     echo -e "$OK  WireGuard Hub 运行中"
-    local peers
     peers=$(ssh "root@192.168.1.101" "wg show wg0 2>/dev/null | grep -c 'endpoint'" 2>/dev/null || echo 0)
     echo "  Peer 连接数: $peers"
 else
@@ -124,7 +129,6 @@ fi
 
 # ---- Syncthing 状态 ----
 echo -e "\n--- Syncthing 同步状态 ---"
-local st_devices
 st_devices=$(ssh "root@192.168.1.103" "curl -s http://127.0.0.1:8384/rest/db/devices 2>/dev/null | jq 'length'" 2>/dev/null || echo "N/A")
 echo "  已知设备数: $st_devices"
 

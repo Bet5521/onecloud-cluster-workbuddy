@@ -186,6 +186,14 @@ services:
       CUPS_PORT: "631"
     restart: unless-stopped
 
+  ariang:
+    node: wk-storage-03
+    container: true
+    image: p3terx/ariang:latest
+    ports:
+      - "6880:80"
+    restart: unless-stopped
+
   panel:
     node: wk-edge-01
     container: false

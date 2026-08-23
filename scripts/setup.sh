@@ -493,7 +493,7 @@ install_cloudflared() {
             --restart unless-stopped \
             -e TZ=$TZ \
             -v "${DATA_DIR}/cloudflared:/etc/cloudflared" \
-            cloudflare/cloudflared:latest tunnel --no-autoupdate
+            cloudflare/cloudflared:latest tunnel --no-autoupdate run
     fi
     log_success "Cloudflare Tunnel 已启动"
 }
@@ -909,32 +909,35 @@ install_panel() {
 
     # 安装 Python 依赖
     apt-get install -y python3-pip python3-venv 2>/dev/null || true
-    pip3 install flask pyyaml requests 2>/dev/null || true
+    pip3 install flask flask-cors pyyaml requests 2>/dev/null || true
 
-    # 生成面板应用
-    cat > "${panel_dir}/app.py" << 'PYEOF'
+    # 尝试从项目模板复制完整的面板文件
+    local script_dir
+    script_dir="$(cd "$(dirname "$0")" && pwd)"
+    local project_panel="${script_dir}/../panel"
+
+    if [ -d "$project_panel" ] && [ -f "${project_panel}/app.py" ]; then
+        log_info "从项目模板复制面板文件..."
+        cp -r "$project_panel"/* "$panel_dir/"
+    else
+        # 生成最小面板应用 (fallback)
+        log_warn "项目模板未找到, 生成最小面板..."
+        cat > "${panel_dir}/app.py" << 'PYEOF'
 #!/usr/bin/env python3
 """OneCloud Cluster 集群控制面板"""
-import json, os, subprocess, socket
+import json, os, subprocess
 from datetime import datetime
-from flask import Flask, jsonify, request, render_template
+from flask import Flask, jsonify, render_template
 
-app = Flask(__name__, template_folder="templates", static_folder="static")
+app = Flask(__name__)
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
 
 def load_config():
-    with open(CONFIG_PATH) as f:
-        return json.load(f)
-
-def check_online(ip, port=22, timeout=1):
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(timeout)
-        s.connect((ip, port))
-        s.close()
-        return True
+        with open(CONFIG_PATH) as f:
+            return json.load(f)
     except:
-        return False
+        return {"cluster_name": "OneCloud Cluster", "nodes": []}
 
 @app.route("/")
 def index():
@@ -945,13 +948,12 @@ def status():
     config = load_config()
     nodes = []
     for node in config.get("nodes", []):
-        online = check_online(node["ip"])
         nodes.append({
             "name": node["name"],
             "display_name": node.get("display_name", node["name"]),
             "ip": node["ip"],
             "wg_ip": node.get("wg_ip", "-"),
-            "online": online,
+            "online": False,
             "services": node.get("services", [])
         })
     return jsonify({
@@ -964,9 +966,9 @@ if __name__ == "__main__":
     app.run(host="0.0.0.0", port=9000)
 PYEOF
 
-    # 生成配置
-    if [ ! -f "${panel_dir}/config.json" ]; then
-        cat > "${panel_dir}/config.json" << 'EOF'
+        # 生成配置
+        if [ ! -f "${panel_dir}/config.json" ]; then
+            cat > "${panel_dir}/config.json" << 'EOF'
 {
   "cluster_name": "OneCloud Cluster",
   "nodes": [
@@ -976,35 +978,38 @@ PYEOF
   ]
 }
 EOF
-    fi
+        fi
 
-    # 生成最小前端
-    mkdir -p "${panel_dir}/templates" "${panel_dir}/static/css"
-    cat > "${panel_dir}/templates/index.html" << 'EOF'
+        # 生成最小前端
+        mkdir -p "${panel_dir}/templates" "${panel_dir}/static/css"
+        cat > "${panel_dir}/templates/index.html" << 'EOF'
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <title>OneCloud Cluster</title>
-<style>
-body{font-family:sans-serif;background:#1a1a2e;color:#e0e0e0;padding:20px}
-.node{background:rgba(255,255,255,0.06);border-radius:12px;padding:16px;margin:8px 0}
-.online{color:#38ef7d} .offline{color:#f5576c}
-</style>
+<link rel="stylesheet" href="/static/css/style.css">
 </head>
 <body>
 <h1>OneCloud Cluster</h1>
 <div id="nodes">加载中...</div>
-<script>
-fetch("/api/status").then(r=>r.json()).then(d=>{
-  document.getElementById("nodes").innerHTML=d.nodes.map(n=>
-    `<div class="node"><h3>${n.display_name} <span class="${n.online?'online':'offline'}">${n.online?'在线':'离线'}</span></h3><p>${n.ip} | WG: ${n.wg_ip}</p></div>`
-  ).join("");
-});
-</script>
+<script src="/static/js/app.js"></script>
 </body>
 </html>
 EOF
+        cat > "${panel_dir}/static/css/style.css" << 'EOF'
+body{font-family:sans-serif;background:#1a1a2e;color:#e0e0e0;padding:20px}
+.node{background:rgba(255,255,255,0.06);border-radius:12px;padding:16px;margin:8px 0}
+.online{color:#38ef7d} .offline{color:#f5576c}
+EOF
+        cat > "${panel_dir}/static/js/app.js" << 'EOF'
+fetch("/api/status").then(r=>r.json()).then(d=>{
+  document.getElementById("nodes").innerHTML=d.nodes.map(n=>
+    `<div class="node"><h3>${n.display_name}</h3><p>${n.ip}</p></div>`
+  ).join("");
+});
+EOF
+    fi
 
     # systemd
     cat > /etc/systemd/system/onecloud-panel.service << EOF

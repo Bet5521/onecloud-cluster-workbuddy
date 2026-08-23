@@ -18,10 +18,11 @@ log_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
 
 # 默认节点列表
+# 格式: 节点名|IP|目录后缀(node-<suffix>)
 NODES=(
-    "wk-edge-01|192.168.1.101|edge"
-    "wk-iot-02|192.168.1.102|iot"
-    "wk-storage-03|192.168.1.103|storage"
+    "wk-edge-01|192.168.1.101|wk-edge-01"
+    "wk-iot-02|192.168.1.102|wk-iot-02"
+    "wk-storage-03|192.168.1.103|wk-storage-03"
 )
 
 usage() {

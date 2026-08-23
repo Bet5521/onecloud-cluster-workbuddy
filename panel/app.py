@@ -18,8 +18,15 @@ CORS(app)
 CONFIG_PATH = os.environ.get("PANEL_CONFIG", os.path.join(os.path.dirname(__file__), "config.json"))
 
 def load_config():
-    with open(CONFIG_PATH) as f:
-        return json.load(f)
+    try:
+        with open(CONFIG_PATH) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        return {
+            "cluster_name": "OneCloud Cluster",
+            "version": "1.0.0",
+            "nodes": []
+        }
 
 def run_ssh(ip, command, timeout=3):
     try:

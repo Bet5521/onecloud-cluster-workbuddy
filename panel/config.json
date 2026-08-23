@@ -16,7 +16,8 @@
         {"name": "adguard", "display": "AdGuard Home", "container": true},
         {"name": "wireguard", "display": "WireGuard", "container": true},
         {"name": "memos", "display": "Memos", "container": true},
-        {"name": "mihomo", "display": "Clash", "container": false}
+        {"name": "clash", "display": "Clash", "container": false},
+        {"name": "panel", "display": "OneCloud Panel", "container": false}
       ]
     },
     {

@@ -100,6 +100,14 @@ case "$BACKUP_TYPE" in
     node)
         NODE_NAME="${TARGET:-wk-edge-01}"
         NODE_IP=$(grep "$NODE_NAME" "$SCRIPT_DIR/../inventory/nodes.yaml" 2>/dev/null | grep -oP 'ip: \K[0-9.]+' | head -1)
+        # Fallback: 硬编码节点映射
+        if [ -z "$NODE_IP" ]; then
+            case "$NODE_NAME" in
+                wk-edge-01)   NODE_IP="192.168.1.101" ;;
+                wk-iot-02)    NODE_IP="192.168.1.102" ;;
+                wk-storage-03) NODE_IP="192.168.1.103" ;;
+            esac
+        fi
         [ -z "$NODE_IP" ] && { log_error "未知节点: $NODE_NAME"; exit 1; }
 
         backup_remote "$NODE_IP" "/mnt/sd/srv/$NODE_NAME" "${NODE_NAME}" "$NODE_NAME 全部"

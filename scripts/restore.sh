@@ -102,6 +102,14 @@ case "$RESTORE_TARGET" in
     node)
         NODE_NAME="${3:-wk-edge-01}"
         NODE_IP=$(grep "$NODE_NAME" "$(dirname "$0")/../inventory/nodes.yaml" 2>/dev/null | grep -oP 'ip: \K[0-9.]+' | head -1)
+        # Fallback: 硬编码节点映射
+        if [ -z "$NODE_IP" ]; then
+            case "$NODE_NAME" in
+                wk-edge-01)   NODE_IP="192.168.1.101" ;;
+                wk-iot-02)    NODE_IP="192.168.1.102" ;;
+                wk-storage-03) NODE_IP="192.168.1.103" ;;
+            esac
+        fi
         [ -z "$NODE_IP" ] && { log_error "未知节点: $NODE_NAME"; exit 1; }
 
         BACKUP_SUBDIR=$(ls -d "${BACKUP_PATH}/${NODE_NAME}"* 2>/dev/null | head -1)

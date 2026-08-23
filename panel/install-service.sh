@@ -2,18 +2,22 @@
 # OneCloud Cluster Panel - systemd 服务
 # 复制到 /etc/systemd/system/ 后启用
 
-cat > /etc/systemd/system/onecloud-panel.service << 'EOF'
+PANEL_DIR="$(cd "$(dirname "$0")" && pwd)"
+NODE_NAME="${NODE_NAME:-wk-edge-01}"
+PANEL_SERVICE="${PANEL_DIR}/config.json"
+
+cat > /etc/systemd/system/onecloud-panel.service << EOF
 [Unit]
 Description=OneCloud Cluster Control Panel
 After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=/mnt/sd/edge-01/panel
-ExecStart=/usr/bin/python3 /mnt/sd/edge-01/panel/app.py
+WorkingDirectory=${PANEL_DIR}
+ExecStart=/usr/bin/python3 ${PANEL_DIR}/app.py
 Restart=on-failure
 RestartSec=5
-Environment=PANEL_CONFIG=/mnt/sd/edge-01/panel/config.json
+Environment=PANEL_CONFIG=${PANEL_SERVICE}
 Environment=PANEL_PORT=9000
 Environment=PANEL_HOST=0.0.0.0
 LimitNOFILE=4096
