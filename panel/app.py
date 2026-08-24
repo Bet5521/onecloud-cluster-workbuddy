@@ -13,9 +13,34 @@ from flask import Flask, jsonify, render_template, request
 from flask_cors import CORS
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, origins=[f"http://localhost:{os.environ.get('PANEL_PORT', '9000')}", "http://127.0.0.1:*"])
 
 CONFIG_PATH = os.environ.get("PANEL_CONFIG", os.path.join(os.path.dirname(__file__), "config.json"))
+
+# ---- 认证配置 ----
+# 通过环境变量 PANEL_USER/PANEL_PASS 设置账号密码
+PANEL_USER = os.environ.get("PANEL_USER", "admin")
+PANEL_PASS = os.environ.get("PANEL_PASS", "changeme")
+
+# 白名单命令前缀（只允许执行这些开头的命令）
+ALLOWED_CMD_PREFIXES = (
+    "free", "df", "ls ", "cat /proc", "uptime", "hostname",
+    "docker ps", "docker stats", "docker inspect", "docker logs",
+    "systemctl status", "systemctl is-active",
+    "ip a", "ip addr", "ss -", "netstat",
+    "cat /etc/os-release", "uname", "whoami", "date",
+)
+
+def is_command_safe(command: str) -> bool:
+    """白名单校验：只允许预定义的安全命令"""
+    cmd = command.strip().lower()
+    # 先做基础黑名单拦截（双保险）
+    blocked = ("rm -rf", "mkfs", "dd if=", "shutdown", "reboot", "poweroff",
+              ":(){", "fork bomb", "wget http", "curl http", ">/dev/sd")
+    if any(b in cmd for b in blocked):
+        return False
+    # 白名单匹配
+    return any(cmd.startswith(p) for p in ALLOWED_CMD_PREFIXES)
 
 def load_config():
     try:
@@ -128,6 +153,23 @@ def collect_all_status():
 
     return status
 
+def _check_auth():
+    """简单 Basic Auth 校验"""
+    auth = request.authorization
+    if not auth or auth.username != PANEL_USER or auth.password != PANEL_PASS:
+        return False
+    return True
+
+def require_auth(f):
+    """装饰器: 要求 API 请求必须通过 Basic Auth 认证"""
+    from functools import wraps
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not _check_auth():
+            return jsonify({"ok": False, "error": "未授权: 需要 Basic Auth 认证"}), 401
+        return f(*args, **kwargs)
+    return decorated
+
 # ---- 路由 ----
 
 @app.route("/")
@@ -135,10 +177,12 @@ def index():
     return render_template("index.html")
 
 @app.route("/api/status")
+@require_auth
 def api_status():
     return jsonify(collect_all_status())
 
 @app.route("/api/node/<node_name>/action", methods=["POST"])
+@require_auth
 def node_action(node_name):
     data = request.json or {}
     action = data.get("action", "")
@@ -146,6 +190,17 @@ def node_action(node_name):
     node = next((n for n in config["nodes"] if n["name"] == node_name), None)
     if not node:
         return jsonify({"ok": False, "error": "节点未找到"}), 404
+
+    # 危险操作二次确认
+    dangerous_actions = ["reboot", "shutdown"]
+    if action in dangerous_actions:
+        confirm = data.get("confirm", False)
+        if not confirm:
+            return jsonify({
+                "ok": False,
+                "confirm_required": True,
+                "error": f"危险操作 '{action}' 需要二次确认, 请设置 confirm=true"
+            }), 400
 
     actions = {
         "reboot": f"reboot",
@@ -162,7 +217,8 @@ def node_action(node_name):
 
     return jsonify({"ok": False, "error": f"未知操作: {action}"}), 400
 
-@app.route("/api/service/<node_name>/<svc_name>/<action>")
+@app.route("/api/service/<node_name>/<svc_name>/<action>", methods=["POST"])
+@require_auth
 def service_action(node_name, svc_name, action):
     config = load_config()
     node = next((n for n in config["nodes"] if n["name"] == node_name), None)
@@ -185,6 +241,7 @@ def service_action(node_name, svc_name, action):
     return jsonify({"ok": False, "error": f"未知操作: {action}"}), 400
 
 @app.route("/api/exec", methods=["POST"])
+@require_auth
 def exec_command():
     data = request.json or {}
     node_name = data.get("node")
@@ -195,16 +252,15 @@ def exec_command():
     if not node:
         return jsonify({"ok": False, "error": "节点未找到"}), 404
 
-    # 安全限制: 只允许非破坏性命令
-    dangerous = ["rm -rf", "mkfs", "dd if=", "shutdown", "reboot", "poweroff"]
-    for d in dangerous:
-        if d in command.lower():
-            return jsonify({"ok": False, "error": "危险命令被拒绝"}), 403
+    # 安全限制: 白名单机制（只允许预定义的安全命令）
+    if not is_command_safe(command):
+        return jsonify({"ok": False, "error": "命令不在白名单中, 已拒绝 (仅允许: free/df/ls/docker ps/uptime 等只读命令)"}), 403
 
     result = run_ssh(node["ip"], command, timeout=30)
     return jsonify({"ok": result["ok"], "output": result["stdout"], "error": result["stderr"]})
 
 @app.route("/api/topology")
+@require_auth
 def topology():
     config = load_config()
     return jsonify(config)
