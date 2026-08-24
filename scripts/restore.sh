@@ -101,7 +101,7 @@ case "$RESTORE_TARGET" in
 
     node)
         NODE_NAME="${3:-wk-edge-01}"
-        NODE_IP=$(grep "$NODE_NAME" "$(dirname "$0")/../inventory/nodes.yaml" 2>/dev/null | grep -oP 'ip: \K[0-9.]+' | head -1)
+        NODE_IP=$(grep -A5 "$NODE_NAME" "$(dirname "$0")/../inventory/nodes.yaml" 2>/dev/null | grep -oP 'ip: \K[0-9.]+' | head -1)
         # Fallback: 硬编码节点映射
         if [ -z "$NODE_IP" ]; then
             case "$NODE_NAME" in
@@ -112,7 +112,9 @@ case "$RESTORE_TARGET" in
         fi
         [ -z "$NODE_IP" ] && { log_error "未知节点: $NODE_NAME"; exit 1; }
 
-        BACKUP_SUBDIR=$(ls -d "${BACKUP_PATH}/${NODE_NAME}"* 2>/dev/null | head -1)
+        # 备份目录名: wk-edge-01 → edge-01, wk-iot-02 → iot-02, wk-storage-03 → storage-03
+        NODE_SHORT="${NODE_NAME#wk-}"
+        BACKUP_SUBDIR=$(ls -d "${BACKUP_PATH}/${NODE_SHORT}"* "${BACKUP_PATH}/${NODE_NAME}"* 2>/dev/null | head -1)
         [ -z "$BACKUP_SUBDIR" ] && { log_error "备份中未找到 $NODE_NAME"; exit 1; }
 
         restore_to_node "$NODE_IP" "$BACKUP_SUBDIR" "/mnt/sd/srv/${NODE_NAME}" "$NODE_NAME"

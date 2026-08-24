@@ -1126,9 +1126,9 @@ def generate_report():
     print(color(f"  警告: {WARNINGS}", YELLOW))
     
     if FAILED == 0:
-        print(f"\n  {color('✓ 所有关键测试通过！', GREEN)}")
+        print(f"\n  {color('[OK] 所有关键测试通过！', GREEN)}")
     else:
-        print(f"\n  {color(f'✗ 有 {FAILED} 项测试失败，需要修复', RED)}")
+        print(f"\n  {color(f'[FAIL] 有 {FAILED} 项测试失败，需要修复', RED)}")
     
     # 显示所有警告
     warnings = [(name, detail) for status, name, detail in TEST_RESULTS if status == "WARN"]

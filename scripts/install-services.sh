@@ -110,21 +110,21 @@ install_verysync() {
 start_edge() {
     log_info "启动 NODE-01 Docker 服务..."
     cd /mnt/sd/srv/wk-edge-01
-    docker-compose up -d
+    docker compose up -d
     docker ps --format "table {{.Names}}\t{{.Status}}"
 }
 
 start_iot() {
     log_info "启动 NODE-02 Docker 服务..."
     cd /mnt/sd/srv/wk-iot-02
-    docker-compose up -d
+    docker compose up -d
     docker ps --format "table {{.Names}}\t{{.Status}}"
 }
 
 start_storage() {
     log_info "启动 NODE-03 Docker 服务..."
     cd /mnt/sd/srv/wk-storage-03
-    docker-compose up -d
+    docker compose up -d
     docker ps --format "table {{.Names}}\t{{.Status}}"
 }
 

@@ -3,9 +3,11 @@ services:
     node: wk-edge-01
     container: true
     image: cloudflare/cloudflared:latest
+    command: tunnel --no-autoupdate run
     ports: []
     env:
       TZ: Asia/Shanghai
+      TUNNEL_TOKEN: ${CF_TUNNEL_TOKEN}
     volumes:
       - ./cloudflared:/etc/cloudflared
       - cloudflared-config:/root/.cloudflared
@@ -18,11 +20,11 @@ services:
   adguard:
     node: wk-edge-01
     container: true
-    image: 11notes/adguard:latest
-    ports:
-      - "53:53/tcp"
-      - "53:53/udp"
-      - "3000:3000"
+    image: adguard/adguardhome:latest
+    network_mode: host
+    ports: []
+    env:
+      TZ: Asia/Shanghai
     volumes:
       - ./adguard/work:/opt/adguardhome/work
       - ./adguard/conf:/opt/adguardhome/conf
@@ -42,10 +44,11 @@ services:
       TZ: Asia/Shanghai
       PUID: "1000"
       PGID: "1000"
-      SERVERURL: yourdomain.com
+      SERVERURL: ${DOMAIN}
       SERVERPORT: "51820"
       PEERS: "3"
-      ALLOWEDIPS: "0.0.0.0/0"
+      ALLOWEDIPS: "10.8.0.0/24,192.168.1.0/24"
+      LOG_CONFS: "true"
     volumes:
       - ./wireguard/config:/config
       - /lib/modules:/lib/modules
@@ -68,10 +71,14 @@ services:
     container: true
     image: neosmemo/memos:stable
     ports:
-      - "5230:5230"
+      - "${MEMOS_PORT}:${MEMOS_PORT}"
     volumes:
       - ./memos/data:/var/opt/memos
     restart: unless-stopped
+    env:
+      TZ: Asia/Shanghai
+      MEMOS_PORT: ${MEMOS_PORT}
+      MEMOS_DRIVER: sqlite
     public_access:
       type: cloudflare-tunnel
       hostname: memos.yourdomain.com
@@ -89,7 +96,7 @@ services:
       - ./homeassistant:/config
       - /run/dbus:/run/dbus:ro
     restart: unless-stopped
-    memory_limit: 512MB
+    memory_limit: 256MB
     public_access:
       type: cloudflare-tunnel
       hostname: home.yourdomain.com
@@ -137,6 +144,11 @@ services:
       - ./syncthing/config:/var/syncthing/config
       - ./syncthing/data:/var/syncthing/data
     restart: unless-stopped
+    env:
+      TZ: Asia/Shanghai
+      PUID: "1000"
+      PGID: "1000"
+      GUI_ADDRESS: 0.0.0.0:8384
 
   verysync:
     node: wk-storage-03
@@ -154,9 +166,14 @@ services:
       - "6888:6888"
       - "6888:6888/udp"
     env:
-      RPC_SECRET: "changeme_your_token"
+      TZ: Asia/Shanghai
+      PUID: "1000"
+      PGID: "1000"
+      RPC_SECRET: ${ARIA2_RPC_SECRET}
       RPC_PORT: "6800"
       LISTEN_PORT: "6888"
+      DISK_CACHE: 64M
+      UPDATE_TRACKERS: "true"
     volumes:
       - ./aria2/config:/config
       - ./aria2/downloads:/downloads
@@ -169,10 +186,13 @@ services:
     ports:
       - "631:631"
     env:
-      ADMIN_USER: admin
-      ADMIN_PASSWORD: "changeme_cups_password"
+      TZ: Asia/Shanghai
+      ADMIN_USER: ${CUPS_ADMIN_USER}
+      ADMIN_PASSWORD: ${CUPS_ADMIN_PASSWORD}
     volumes:
-      - ./cupsd:/etc/cups
+      - ./cupsd/config:/etc/cups
+      - ./cupsd/printers:/var/cups/printers
+      - ./cupsd/spool:/var/spool/cups
     restart: unless-stopped
 
   cups-web:
@@ -180,10 +200,13 @@ services:
     container: true
     image: nkn-ts/cups-web:armhf
     ports:
-      - "632:632"
+      - "632:80"
     env:
-      CUPS_HOST: "wk-storage-03"
+      TZ: Asia/Shanghai
+      CUPS_HOST: ${NODE_IP}
       CUPS_PORT: "631"
+      CUPS_USER: ${CUPS_ADMIN_USER}
+      CUPS_PASSWORD: ${CUPS_ADMIN_PASSWORD}
     restart: unless-stopped
 
   ariang:
@@ -192,6 +215,8 @@ services:
     image: p3terx/ariang:latest
     ports:
       - "6880:80"
+    env:
+      TZ: Asia/Shanghai
     restart: unless-stopped
 
   panel:
@@ -199,6 +224,8 @@ services:
     container: false
     language: python3-flask
     port: 9000
+    config_path: ./panel/config.json
+    install_path: /usr/bin/python3 app.py
     public_access:
       type: cloudflare-tunnel
       hostname: panel.yourdomain.com

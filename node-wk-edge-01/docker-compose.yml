@@ -21,7 +21,7 @@ services:
     mem_limit: 64m
 
   adguard:
-    image: 11notes/adguard:latest
+    image: adguard/adguardhome:latest
     container_name: adguard
     restart: unless-stopped
     network_mode: host
@@ -43,6 +43,8 @@ services:
     container_name: wireguard
     restart: unless-stopped
     env_file: .env
+    ports:
+      - "51820:51820/udp"
     environment:
       - TZ=${TZ}
       - PUID=${PUID}
