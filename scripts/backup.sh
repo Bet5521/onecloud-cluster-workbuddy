@@ -121,6 +121,8 @@ case "$BACKUP_TYPE" in
             backup_remote 192.168.1.102 "/mnt/sd/srv/wk-iot-02/homeassistant" "homeassistant" "Home Assistant"
         elif [ "$SVC" = "piwigo" ]; then
             backup_remote 192.168.1.102 "/mnt/sd/srv/wk-iot-02/piwigo" "piwigo" "Piwigo"
+        elif [ "$SVC" = "typecho" ]; then
+            backup_remote 192.168.1.102 "/mnt/sd/srv/wk-iot-02/typecho" "typecho" "Typecho"
         elif [ "$SVC" = "aria2" ]; then
             backup_remote 192.168.1.103 "/mnt/sd/srv/wk-storage-03/aria2" "aria2" "aria2"
         elif [ "$SVC" = "syncthing" ]; then

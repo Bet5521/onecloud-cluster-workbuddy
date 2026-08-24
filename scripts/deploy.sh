@@ -86,7 +86,7 @@ deploy_node() {
     fi
 
     # 确保远程目录存在
-    ssh "root@${NODE_IP}" "mkdir -p ${REMOTE_BASE}/{cloudflared,adguard/{work,conf},wireguard/config,clash,memos,homeassistant,piwigo/{config,gallery},xiaomusic,migpt,syncthing/{config,data},verysync,aria2/{config,downloads},cupsd/{config,printers,spool},cups-web,panel,gitea}"
+    ssh "root@${NODE_IP}" "mkdir -p ${REMOTE_BASE}/{cloudflared,adguard/{work,conf},wireguard/config,clash,memos,homeassistant,piwigo/{config,gallery},xiaomusic,migpt,typecho,syncthing/{config,data},verysync,aria2/{config,downloads},cupsd/{config,printers,spool},cups-web,panel,gitea}"
 
     # 分发配置文件
     if [ -d "$NODE_SRC" ]; then

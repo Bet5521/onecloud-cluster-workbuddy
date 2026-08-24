@@ -105,7 +105,9 @@ check_container 192.168.1.102 "Piwigo" "piwigo"
 check_port 192.168.1.102 8123 "Home Assistant"
 check_port 192.168.1.102 8080 "Piwigo"
 check_port 192.168.1.102 8081 "xiaomusic"
+check_container 192.168.1.102 "Typecho" "typecho"
 check_port 192.168.1.102 8082 "migpt"
+check_port 192.168.1.102 8083 "Typecho"
 
 # ---- NODE-03 ----
 check_system 192.168.1.103 "wk-storage-03"

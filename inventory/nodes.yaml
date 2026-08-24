@@ -27,7 +27,7 @@ nodes:
       data: /dev/mmcblk1p1
       data_mount: /mnt/sd
     sd_mount: /mnt/sd
-    services: [homeassistant, xiaomusic, migpt, piwigo]
+    services: [homeassistant, xiaomusic, migpt, piwigo, typecho]
 
   - name: wk-storage-03
     host: storage-03.lan

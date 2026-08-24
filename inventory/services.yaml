@@ -131,6 +131,22 @@ services:
       hostname: photos.yourdomain.com
       service: http://iot-02.lan:8080
 
+  typecho:
+    node: wk-iot-02
+    container: true
+    image: joyqi/typecho:latest
+    ports:
+      - "8083:80"
+    env:
+      TZ: Asia/Shanghai
+    volumes:
+      - ./typecho/usr:/app/usr
+    restart: unless-stopped
+    public_access:
+      type: cloudflare-tunnel
+      hostname: blog.yourdomain.com
+      service: http://iot-02.lan:8083
+
   syncthing:
     node: wk-storage-03
     container: true

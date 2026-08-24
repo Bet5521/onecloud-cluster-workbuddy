@@ -31,7 +31,8 @@
         {"name": "homeassistant", "display": "Home Assistant", "container": true},
         {"name": "piwigo", "display": "Piwigo", "container": true},
         {"name": "xiaomusic", "display": "xiaomusic", "container": false},
-        {"name": "migpt", "display": "migpt", "container": false}
+        {"name": "migpt", "display": "migpt", "container": false},
+        {"name": "typecho", "display": "Typecho", "container": true}
       ]
     },
     {

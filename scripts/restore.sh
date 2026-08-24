@@ -129,6 +129,9 @@ case "$RESTORE_TARGET" in
             piwigo)
                 restore_to_node 192.168.1.102 "${BACKUP_PATH}/piwigo" "/mnt/sd/srv/wk-iot-02/piwigo" "Piwigo"
                 ;;
+            typecho)
+                restore_to_node 192.168.1.102 "${BACKUP_PATH}/typecho" "/mnt/sd/srv/wk-iot-02/typecho" "Typecho"
+                ;;
             aria2)
                 restore_to_node 192.168.1.103 "${BACKUP_PATH}/aria2" "/mnt/sd/srv/wk-storage-03/aria2" "aria2"
                 ;;
