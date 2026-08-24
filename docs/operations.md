@@ -50,6 +50,8 @@ systemctl start mihomo
 ./scripts/backup.sh all
 ./scripts/backup.sh node edge-01
 ./scripts/backup.sh service homeassistant
+./scripts/backup.sh service typecho
+./scripts/backup.sh service gitea
 ```
 
 ### 3.2 定时备份

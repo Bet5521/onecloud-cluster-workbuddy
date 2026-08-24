@@ -25,12 +25,14 @@ graph TD
             XM["xiaomusic :8081"]
             MG["migpt :8082"]
             PIW["Piwigo :8080"]
+            TYP["Typecho :8083"]
         end
         subgraph Storage["NODE-03: Storage & Sync"]
             SYN["Syncthing :8384/:22000"]
             VSY["verysync :19900"]
             ARA["aria2 :6800/:6888"]
             CUPS["CUPS :631"]
+            GIT["Gitea :3000"]
         end
     end
     User --> Tunnel --> CF
@@ -72,7 +74,7 @@ graph LR
 ║   │ NODE-01: EDGE   │◄──────────►│ NODE-02: IOT    │              ║
 ║   │ .101 / 10.8.0.101│           │ .102 / 10.8.0.102│              ║
 ║   │ cloudflared      │           │ Home Assistant   │              ║
-║   │ AdGuard Home     │           │ Piwigo           │              ║
+║   │ AdGuard Home     │           │ Piwigo / Typecho │              ║
 ║   │ WireGuard        │           │ xiaomusic/migpt  │              ║
 ║   │ Memos/Clash      │           │                  │              ║
 ║   └────────┬─────────┘           └────────┬─────────┘              ║
@@ -82,7 +84,7 @@ graph LR
 ║           │ NODE-03: STORAGE & SYNC  │                          ║
 ║           │ .103 / 10.8.0.103        │                          ║
 ║           │ Syncthing / aria2        │                          ║
-║           │ CUPS / verysync          │                          ║
+║           │ CUPS / Gitea / verysync  │                          ║
 ║           └───────────────────────────┘                          ║
 ╚════════════════════════════════════════════════════════════════╝
 ```

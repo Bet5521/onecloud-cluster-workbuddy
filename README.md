@@ -21,8 +21,8 @@
 | 节点 | 主机名 | IP | 角色 | 服务 |
 |------|--------|----|------|------|
 | NODE-01 | wk-edge-01 | 192.168.1.101 | Edge Gateway | cloudflared, AdGuard Home, WireGuard, Memos, mihomo(Clash), Panel |
-| NODE-02 | wk-iot-02 | 192.168.1.102 | IoT Core | Home Assistant, Piwigo, xiaomusic, migpt |
-| NODE-03 | wk-storage-03 | 192.168.1.103 | Storage & Sync | Syncthing, aria2/AriaNg, CUPS/cups-web, verysync |
+| NODE-02 | wk-iot-02 | 192.168.1.102 | IoT Core | Home Assistant, Piwigo, xiaomusic, migpt, Typecho |
+| NODE-03 | wk-storage-03 | 192.168.1.103 | Storage & Sync | Syncthing, aria2/AriaNg, CUPS/cups-web, verysync, Gitea |
 
 ### 网络架构
 
@@ -54,14 +54,17 @@ wk-edge-01 (192.168.1.101)
 | Cluster Panel | edge-01 | 9000 | TCP | ✅ CF Tunnel |
 | Home Assistant | iot-02 | 8123 | TCP | ✅ CF Tunnel |
 | Piwigo | iot-02 | 8080 | TCP | ✅ CF Tunnel |
+| Typecho | iot-02 | 8083 | TCP | ✅ CF Tunnel |
+| xiaomusic | iot-02 | 8081 | TCP | ❌ 内网 |
+| migpt | iot-02 | 8082 | TCP | ❌ 内网 |
 | Syncthing | storage-03 | 8384/22000 | TCP | ❌ 内网 |
 | aria2 | storage-03 | 6800 | TCP | ❌ 内网 |
 | AriaNg | storage-03 | 6880 | TCP | ❌ 内网 |
 | CUPS | storage-03 | 631 | TCP | ❌ 内网 |
 | CUPS Web | storage-03 | 632 | TCP | ❌ 内网 |
-| xiaomusic | iot-02 | 8090 | TCP | ❌ 内网 |
-| migpt | iot-02 | 8180 | TCP | ❌ 内网 |
-| verysync | storage-03 | 1188 | TCP | ❌ 内网 |
+| Gitea | storage-03 | 3000 | TCP | ✅ CF Tunnel |
+| Gitea SSH | storage-03 | 222 | TCP | ❌ 内网 |
+| verysync | storage-03 | 19900 | TCP | ❌ 内网 |
 
 ---
 

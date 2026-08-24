@@ -19,12 +19,12 @@
 
 ### 2.2 NODE-02: IoT Core (192.168.1.102)
 - LAN: 192.168.1.102 / WG: 10.8.0.102
-- Docker: Home Assistant (host network), Piwigo
+- Docker: Home Assistant (host network), Piwigo, Typecho
 - 原生: xiaomusic, migpt
 
 ### 2.3 NODE-03: Storage & Sync (192.168.1.103)
 - LAN: 192.168.1.103 / WG: 10.8.0.103
-- Docker: Syncthing, aria2-pro, CUPS, CUPS Web
+- Docker: Syncthing, aria2-pro, CUPS, CUPS Web, Gitea
 - 原生: verysync
 
 ## 3. 网络架构
@@ -45,6 +45,8 @@ NODE-03 wg0: 10.8.0.103/32
 | memos.yourdomain.com | http://edge-01.lan:5230 |
 | home.yourdomain.com | http://iot-02.lan:8123 |
 | photos.yourdomain.com | http://iot-02.lan:8080 |
+| blog.yourdomain.com | http://iot-02.lan:8083 |
+| git.yourdomain.com | http://storage-03.lan:3000 |
 
 ### 3.3 端口分配总表
 | 端口 | 协议 | 服务 | 节点 |
@@ -57,10 +59,15 @@ NODE-03 wg0: 10.8.0.103/32
 | 9090 | TCP | Clash API | edge-01 |
 | 8123 | TCP | Home Assistant | iot-02 |
 | 8080 | TCP | Piwigo | iot-02 |
+| 8083 | TCP | Typecho | iot-02 |
+| 8081 | TCP | xiaomusic | iot-02 |
+| 8082 | TCP | migpt | iot-02 |
 | 631 | TCP | CUPS | storage-03 |
 | 6800 | TCP | aria2 RPC | storage-03 |
 | 8384 | TCP | Syncthing WebUI | storage-03 |
 | 22000 | TCP/UDP | Syncthing | storage-03 |
+| 3000 | TCP | Gitea Web | storage-03 |
+| 222 | TCP | Gitea SSH | storage-03 |
 
 ## 4. 存储架构
 
