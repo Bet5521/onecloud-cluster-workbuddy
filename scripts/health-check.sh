@@ -114,9 +114,11 @@ check_container 192.168.1.103 "aria2" "aria2"
 check_container 192.168.1.103 "CUPS" "cupsd"
 check_container 192.168.1.103 "CUPS Web" "cups-web"
 check_container 192.168.1.103 "AriaNg" "ariang"
+check_container 192.168.1.103 "Gitea" "gitea"
 check_port 192.168.1.103 8384 "Syncthing Web"
 check_port 192.168.1.103 6800 "aria2 RPC"
 check_port 192.168.1.103 631 "CUPS"
+check_port 192.168.1.103 3000 "Gitea Web"
 
 # ---- WireGuard Mesh ----
 echo -e "\n--- WireGuard Mesh ---"

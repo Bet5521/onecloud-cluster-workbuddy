@@ -42,7 +42,7 @@ nodes:
       data: /dev/mmcblk1p1
       data_mount: /mnt/sd
     sd_mount: /mnt/sd
-    services: [syncthing, verysync, aria2, cupsd, cups-web]
+    services: [syncthing, verysync, aria2, cupsd, cups-web, ariang, gitea]
 
 network:
   lan_subnet: 192.168.1.0/24

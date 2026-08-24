@@ -115,3 +115,29 @@ services:
         max-size: 2m
         max-file: "1"
     mem_limit: 24m
+
+  gitea:
+    image: gitea/gitea:latest
+    container_name: gitea
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - TZ=${TZ}
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - USER_UID=${PUID}
+      - USER_GID=${PGID}
+      - GITEA__server__SSH_PORT=222
+      - GITEA__server__ROOT_URL=http://storage-03.lan:3000
+    ports:
+      - "3000:3000"
+      - "222:22"
+    volumes:
+      - ./gitea:/data
+      - /etc/localtime:/etc/localtime:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "2"
+    mem_limit: 128m

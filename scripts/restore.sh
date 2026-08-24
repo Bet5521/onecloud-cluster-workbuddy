@@ -135,6 +135,9 @@ case "$RESTORE_TARGET" in
             syncthing)
                 restore_to_node 192.168.1.103 "${BACKUP_PATH}/syncthing" "/mnt/sd/srv/wk-storage-03/syncthing" "Syncthing"
                 ;;
+            gitea)
+                restore_to_node 192.168.1.103 "${BACKUP_PATH}/gitea" "/mnt/sd/srv/wk-storage-03/gitea" "Gitea"
+                ;;
             *)
                 log_error "未知服务: $SVC"
                 exit 1

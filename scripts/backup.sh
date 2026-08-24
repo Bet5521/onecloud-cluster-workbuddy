@@ -125,6 +125,8 @@ case "$BACKUP_TYPE" in
             backup_remote 192.168.1.103 "/mnt/sd/srv/wk-storage-03/aria2" "aria2" "aria2"
         elif [ "$SVC" = "syncthing" ]; then
             backup_remote 192.168.1.103 "/mnt/sd/srv/wk-storage-03/syncthing" "syncthing" "Syncthing"
+        elif [ "$SVC" = "gitea" ]; then
+            backup_remote 192.168.1.103 "/mnt/sd/srv/wk-storage-03/gitea" "gitea" "Gitea"
         else
             log_error "未知服务: $SVC"
             exit 1

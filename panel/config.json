@@ -47,7 +47,8 @@
         {"name": "ariang", "display": "AriaNg", "container": true},
         {"name": "cupsd", "display": "CUPS", "container": true},
         {"name": "cups-web", "display": "CUPS Web", "container": true},
-        {"name": "verysync", "display": "verysync", "container": false}
+        {"name": "verysync", "display": "verysync", "container": false},
+        {"name": "gitea", "display": "Gitea", "container": true}
       ]
     }
   ]

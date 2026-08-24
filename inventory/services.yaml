@@ -219,6 +219,30 @@ services:
       TZ: Asia/Shanghai
     restart: unless-stopped
 
+  gitea:
+    node: wk-storage-03
+    container: true
+    image: gitea/gitea:latest
+    ports:
+      - "3000:3000"
+      - "222:22"
+    env:
+      TZ: Asia/Shanghai
+      PUID: "1000"
+      PGID: "1000"
+      USER_UID: "1000"
+      USER_GID: "1000"
+      GITEA__server__SSH_PORT: "222"
+      GITEA__server__ROOT_URL: "http://storage-03.lan:3000"
+    volumes:
+      - ./gitea:/data
+      - /etc/localtime:/etc/localtime:ro
+    restart: unless-stopped
+    public_access:
+      type: cloudflare-tunnel
+      hostname: git.yourdomain.com
+      service: http://storage-03.lan:3000
+
   panel:
     node: wk-edge-01
     container: false
