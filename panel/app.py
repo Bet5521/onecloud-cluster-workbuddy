@@ -56,7 +56,7 @@ def load_config():
 def run_ssh(ip, command, timeout=3):
     try:
         result = subprocess.run(
-            ["ssh", "-o", f"ConnectTimeout={timeout}", "-o", "StrictHostKeyChecking=no",
+            ["ssh", "-o", f"ConnectTimeout={timeout}",
              f"root@{ip}", command],
             capture_output=True, text=True, timeout=timeout + 2
         )

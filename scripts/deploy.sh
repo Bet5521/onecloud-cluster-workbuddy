@@ -75,7 +75,7 @@ deploy_node() {
     echo "--- $NODE_NAME ($NODE_IP) ---"
 
     # 测试 SSH 连接
-    if ! ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no "root@${NODE_IP}" "echo ok" &>/dev/null; then
+    if ! ssh -o ConnectTimeout=5 "root@${NODE_IP}" "echo ok" &>/dev/null; then
         log_error "无法连接到 $NODE_NAME ($NODE_IP)"
         return 1
     fi
