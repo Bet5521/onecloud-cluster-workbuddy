@@ -112,7 +112,10 @@ function updateExecNodeSelect(nodes) {
 }
 
 async function serviceAction(node, svc, action) {
-    const res = await fetch(`/api/service/${node}/${svc}/${action}`);
+    const res = await fetch(`/api/service/${node}/${svc}/${action}`, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"}
+    });
     const data = await res.json();
     refresh();
     if (data.output || data.error) {
@@ -136,18 +139,30 @@ async function nodeAction(node, action) {
 
 async function clusterAction(action) {
     if (action === "health_check") {
-        const output = [];
-        const nodes = document.querySelectorAll(".node-card");
-        for (let i = 0; i < 3; i++) {
-            const nodeName = ["wk-edge-01", "wk-iot-02", "wk-storage-03"][i];
-            const res = await fetch(`/api/node/${nodeName}/action`, {
-                method: "POST",
-                headers: {"Content-Type": "application/json"},
-                body: JSON.stringify({action: "docker_up"})
-            }).catch(() => null);
+        showToast("正在执行健康检查...");
+        try {
+            const res = await fetch("/api/status");
+            const data = await res.json();
+            let summary = [];
+            for (const node of data.nodes) {
+                const status = node.online ? "✅ 在线" : "❌ 离线";
+                const svcRunning = (node.services || []).filter(s => s.running).length;
+                const svcTotal = (node.services || []).length;
+                const load = (node.system || {}).LOAD || "-";
+                summary.push(`${node.display_name}: ${status} | 服务 ${svcRunning}/${svcTotal} | 负载 ${load}`);
+            }
+            showToast(summary.join(" \n "), 5000);
+        } catch (e) {
+            showToast("健康检查失败: " + e.message);
         }
-        showToast("执行中...");
-        refresh();
+        return;
+    }
+    if (action === "backup") {
+        showToast("备份操作需在节点上执行: ./scripts/backup.sh all");
+        return;
+    }
+    if (action === "update") {
+        showToast("更新操作需在节点上执行: ./scripts/update-all.sh");
         return;
     }
     showToast(`集群操作 '${action}' 已触发`);
@@ -171,19 +186,22 @@ async function execCmd() {
     outputEl.textContent = (data.output || "") + (data.error ? "\n[错误] " + data.error : "") || "(无输出)";
 }
 
-function showToast(msg) {
+function showToast(msg, duration) {
+    duration = duration || 2500;
     const toast = document.createElement("div");
     toast.style.cssText = `
         position: fixed; bottom: 30px; right: 30px;
-        background: rgba(0,0,0,0.8); color: #fff;
+        background: rgba(0,0,0,0.85); color: #fff;
         padding: 12px 20px; border-radius: 8px;
         font-size: 0.9rem; z-index: 9999;
+        max-width: 400px; white-space: pre-line;
         animation: fadeIn 0.3s ease;
     `;
     toast.textContent = msg;
     document.body.appendChild(toast);
-    setTimeout(() => { toast.style.opacity = "0"; toast.style.transition = "0.3s"; }, 2000);
-    setTimeout(() => toast.remove(), 2500);
+    const fadeAt = duration - 500;
+    setTimeout(() => { toast.style.opacity = "0"; toast.style.transition = "0.3s"; }, fadeAt > 0 ? fadeAt : 1000);
+    setTimeout(() => toast.remove(), duration);
 }
 
 // 自动刷新

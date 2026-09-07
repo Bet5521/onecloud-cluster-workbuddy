@@ -45,6 +45,11 @@ BACKUP_ID="${1:-}"
 ARG2="${2:-all}"
 ARG3="${3:-}"
 
+# 提前处理 --help/-h, 避免误将参数当作备份 ID
+case "$BACKUP_ID" in
+    -h|--help) usage; exit 0 ;;
+esac
+
 # 节点名归一化: edge-01 -> wk-edge-01
 normalize_node() {
     case "$1" in

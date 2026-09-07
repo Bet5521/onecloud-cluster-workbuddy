@@ -45,6 +45,11 @@ EOF
 BACKUP_TYPE="${1:-all}"
 TARGET="${2:-}"
 
+# 提前处理 --help/-h, 避免 mkdir 失败
+case "$BACKUP_TYPE" in
+    -h|--help) usage; exit 0 ;;
+esac
+
 mkdir -p "$BACKUP_DIR/$TIMESTAMP"
 
 echo ""
