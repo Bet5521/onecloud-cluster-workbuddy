@@ -1,0 +1,44 @@
+# ============================================================
+# 本地环境覆盖文件 (不入库)
+#
+# 用法: 复制本文件为 nodes.local.yaml, 按你的实际网络修改后保存。
+#   cp inventory/nodes.local.yaml.example inventory/nodes.local.yaml
+#
+# 本文件中的值会覆盖 nodes.yaml 的同名字段。
+# 也可以新增节点 (见下方 wk-backup-04 示例)。
+#
+# 优先级: 环境变量 > nodes.local.yaml > nodes.yaml
+# ============================================================
+
+nodes:
+  # ---- 修改已有节点的 IP / 主机名 ----
+  # 只写要改的字段即可, 未写的沿用 nodes.yaml 的默认值
+  - name: wk-edge-01
+    ip: 192.168.1.101
+    wg_ip: 10.8.0.101
+    hostname: edge-01
+
+  # - name: wk-iot-02
+  #   ip: 192.168.1.102
+  #   wg_ip: 10.8.0.102
+  #   hostname: iot-02
+
+  # - name: wk-storage-03
+  #   ip: 192.168.1.103
+  #   wg_ip: 10.8.0.103
+  #   hostname: storage-03
+
+  # ---- 新增节点示例 (取消注释即可生效) ----
+  # - name: wk-backup-04
+  #   hostname: backup-04
+  #   ip: 192.168.1.104
+  #   wg_ip: 10.8.0.104
+  #   role: backup
+
+network:
+  gateway: 192.168.1.1
+  dns: 1.1.1.1
+  lan_subnet: 192.168.1.0/24
+  wg_subnet: 10.8.0.0/24
+  wg_port: 51820
+  domain: yourdomain.com

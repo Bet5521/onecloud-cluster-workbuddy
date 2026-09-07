@@ -1,56 +1,41 @@
 {
   "cluster_name": "OneCloud Cluster",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "update_interval": 10,
   "ssh_timeout": 3,
+  "generated_by": "scripts/gen-panel-config.sh",
   "nodes": [
-    {
-      "name": "wk-edge-01",
-      "display_name": "Edge Gateway",
-      "role": "edge",
-      "ip": "192.168.1.101",
-      "wg_ip": "10.8.0.101",
-      "color": "#4CAF50",
-      "services": [
-        {"name": "cloudflared", "display": "Cloudflare Tunnel", "container": true},
-        {"name": "adguard", "display": "AdGuard Home", "container": true},
-        {"name": "wireguard", "display": "WireGuard", "container": true},
-        {"name": "memos", "display": "Memos", "container": true},
-        {"name": "clash", "display": "Clash", "container": false},
-        {"name": "panel", "display": "OneCloud Panel", "container": false}
-      ]
-    },
-    {
-      "name": "wk-iot-02",
-      "display_name": "IoT Core",
-      "role": "iot",
-      "ip": "192.168.1.102",
-      "wg_ip": "10.8.0.102",
-      "color": "#2196F3",
-      "services": [
-        {"name": "homeassistant", "display": "Home Assistant", "container": true},
-        {"name": "piwigo", "display": "Piwigo", "container": true},
-        {"name": "xiaomusic", "display": "xiaomusic", "container": false},
-        {"name": "migpt", "display": "migpt", "container": false},
-        {"name": "typecho", "display": "Typecho", "container": true}
-      ]
-    },
-    {
-      "name": "wk-storage-03",
-      "display_name": "Storage & Sync",
-      "role": "storage",
-      "ip": "192.168.1.103",
-      "wg_ip": "10.8.0.103",
-      "color": "#FF9800",
-      "services": [
-        {"name": "syncthing", "display": "Syncthing", "container": true},
-        {"name": "aria2", "display": "aria2", "container": true},
-        {"name": "ariang", "display": "AriaNg", "container": true},
-        {"name": "cupsd", "display": "CUPS", "container": true},
-        {"name": "cups-web", "display": "CUPS Web", "container": true},
-        {"name": "verysync", "display": "verysync", "container": false},
-        {"name": "gitea", "display": "Gitea", "container": true}
-      ]
-    }
+  {
+    "name": "wk-edge-01",
+    "display_name": "Edge Gateway",
+    "role": "edge-gateway",
+    "ip": "192.168.1.101",
+    "wg_ip": "10.8.0.101",
+    "hostname": "edge-01",
+    "color": "#4CAF50",
+    "services": [{"name":"cloudflared","display":"Cloudflare Tunnel","container":true},{"name":"adguard","display":"AdGuard Home","container":true},{"name":"wireguard","display":"WireGuard","container":true},{"name":"clash","display":"Clash","container":false},{"name":"memos","display":"Memos","container":true},{"name":"panel","display":"OneCloud Panel","container":false}]
+  }
+  ,
+  {
+    "name": "wk-iot-02",
+    "display_name": "IoT Core",
+    "role": "iot-core",
+    "ip": "192.168.1.102",
+    "wg_ip": "10.8.0.102",
+    "hostname": "iot-02",
+    "color": "#2196F3",
+    "services": [{"name":"homeassistant","display":"Home Assistant","container":true},{"name":"xiaomusic","display":"xiaomusic","container":false},{"name":"migpt","display":"migpt","container":false},{"name":"piwigo","display":"Piwigo","container":true},{"name":"typecho","display":"Typecho","container":true}]
+  }
+  ,
+  {
+    "name": "wk-storage-03",
+    "display_name": "Storage & Sync",
+    "role": "storage-sync",
+    "ip": "192.168.1.103",
+    "wg_ip": "10.8.0.103",
+    "hostname": "storage-03",
+    "color": "#FF9800",
+    "services": [{"name":"syncthing","display":"Syncthing","container":true},{"name":"verysync","display":"verysync","container":false},{"name":"aria2","display":"aria2","container":true},{"name":"cupsd","display":"CUPS","container":true},{"name":"cups-web","display":"CUPS Web","container":true},{"name":"ariang","display":"AriaNg","container":true},{"name":"gitea","display":"Gitea","container":true}]
+  }
   ]
 }

@@ -146,7 +146,7 @@ sudo bash scripts/setup.sh
 
 ```bash
 cd panel && pip3 install -r requirements.txt && python3 app.py
-# 访问 http://192.168.1.101:9000
+# 访问 http://<edge节点IP>:9000
 ```
 
 面板已启用 HTTP Basic Auth 与命令白名单，默认账号 `admin` / `changeme`，
@@ -156,19 +156,65 @@ cd panel && pip3 install -r requirements.txt && python3 app.py
 PANEL_USER=admin PANEL_PASS='强密码' PANEL_PORT=9000 python3 app.py
 ```
 
+> 面板展示的节点 IP/主机名由 `panel/config.json` 驱动。该文件由
+> `scripts/gen-panel-config.sh` 从 `inventory/nodes.yaml` 生成，IP 改动后
+> 重新执行一次即可同步，无需手改。
+
+---
+
+## 🎛️ 节点 IP / 主机名自定义
+
+**所有节点的 IP、主机名、WireGuard 地址、网段参数都不再写死在脚本里**，
+统一由 `inventory/nodes.yaml` 提供，并支持三层覆盖（优先级从高到低）：
+
+| 层级 | 方式 | 适用场景 |
+|------|------|---------|
+| 1. 环境变量 | `ONECLOUD_<节点大写>_<字段>=值` | 临时覆盖 / CI 注入 |
+| 2. 本地覆盖文件 | `inventory/nodes.local.yaml`（参考 `nodes.local.yaml.example`） | 不想改动入库的默认清单 |
+| 3. 默认清单 | `inventory/nodes.yaml` | 集群的基准定义 |
+
+环境变量命名规则：节点名转大写、`-` 换 `_`，字段为 `IP` / `HOSTNAME` / `WG_IP` / `ROLE`；
+网络参数用 `ONECLOUD_GATEWAY` / `ONECLOUD_DNS` / `ONECLOUD_DOMAIN` / `ONECLOUD_WG_PORT` / `ONECLOUD_LAN_PREFIX` / `ONECLOUD_WG_SUBNET`。
+
+示例 —— 把 edge 节点部署到 `10.20.30.41`、主机名 `edge-hk`：
+
+```bash
+# 方式一: 环境变量 (对所有脚本全局生效)
+export ONECLOUD_WK_EDGE_01_IP=10.20.30.41
+export ONECLOUD_WK_EDGE_01_HOSTNAME=edge-hk
+./scripts/bootstrap.sh --node wk-edge-01 --yes
+./scripts/deploy.sh -t        # 巡检目标自动变成新 IP
+
+# 方式二: 本地覆盖文件 (推荐长期使用)
+cp inventory/nodes.local.yaml.example inventory/nodes.local.yaml
+vim inventory/nodes.local.yaml   # 填入你的 IP/主机名, 该文件已被 gitignore
+```
+
+要点：
+
+- `bootstrap.sh` 对已登记节点自动取清单中的 IP/主机名作为默认值，命令行
+  `--ip/--hostname` 可再覆盖；网关、DNS、`/etc/hosts` 全部参数化
+- 所有运维脚本（deploy / update-all / health-check / backup / restore /
+  wireguard-setup / setup / install-services）均从 `scripts/lib-nodes.sh`
+  动态读取节点，**功能脚本中无任何硬编码 IP**
+- `backup.sh` / `restore.sh` 的备份目录可用 `BACKUP_DIR` 环境变量自定义
+- 新增节点：写进 `nodes.local.yaml` 即被所有脚本识别，无需改代码
+
 ---
 
 ## 🔧 运维脚本
 
 | 脚本 | 作用 | 常用用法 |
 |------|------|---------|
-| `bootstrap.sh` | 新节点初始化（主机名/源/swap/SD卡/Docker/静态IP） | `--node <名> --ip <IP> --yes` |
+| `lib-nodes.sh` | 节点清单库（单一数据源，供所有脚本 source） | 被其他脚本引用 |
+| `gen-panel-config.sh` | 从清单生成 `panel/config.json` | 直接运行 |
+| `bootstrap.sh` | 新节点初始化（主机名/源/swap/SD卡/Docker/静态IP） | `--node <名> [--ip <IP>] --yes` |
 | `setup.sh` | 统一安装（端口检测 + 多选批量安装 + 磁盘挂载） | `sudo bash setup.sh` |
 | `wireguard-setup.sh` | WireGuard mesh 配置生成 | `gen` / `add peer` / `list` |
 | `deploy.sh` | rsync 分发配置到各节点 | `-n <节点>` / `--exec <命令>` / `-t` / `-d` |
 | `install-services.sh` | 安装原生二进制或启动节点容器 | `mihomo` / `edge` / `all-native` |
 | `health-check.sh` | 集群健康巡检（SSH/容器/端口/负载/OOM） | 直接运行 |
-| `backup.sh` | 备份配置与数据 | `all` / `config` / `node <名>` / `service <名>` |
+| `backup.sh` | 备份配置与数据（`BACKUP_DIR` 可自定义） | `all` / `config` / `node <名>` / `service <名>` |
 | `restore.sh` | 从备份恢复 | `<备份ID> <目标>` 或 `<备份ID> service <名>` |
 | `update-all.sh` | 批量更新镜像/系统包（不升 Docker Engine） | `-d` / `-s` / `-a` / `-n <节点>` |
 
@@ -178,8 +224,8 @@ PANEL_USER=admin PANEL_PASS='强密码' PANEL_PORT=9000 python3 app.py
 
 ## ✅ 功能验证
 
-项目自带验证套件，覆盖配置完整性、脚本语法、节点映射、服务一致性与
-**文档化 CLI 接口契约**（共 176 项）：
+项目自带验证套件，覆盖配置完整性、脚本语法、节点映射、服务一致性、
+**文档化 CLI 接口契约**与 **IP/主机名可自定义性**（共 184 项）：
 
 ```bash
 python3 test_validate.py
@@ -188,8 +234,8 @@ python3 test_validate.py
 输出示例：
 
 ```
-  总计: 176 项
-  通过: 176
+  总计: 184 项
+  通过: 184
   失败: 0
   警告: 0
 ```
@@ -207,6 +253,37 @@ python3 test_validate.py
 | [docs/topology.md](docs/topology.md) | 可视化拓扑图 (Mermaid + ASCII) |
 | [docs/operations.md](docs/operations.md) | 运维手册（备份/恢复/更新/故障排查） |
 | [docs/cloudflare-setup.md](docs/cloudflare-setup.md) | Cloudflare Tunnel 配置 |
+
+---
+
+## 🎛️ v1.2.0 变更说明
+
+### 节点 IP / 主机名全面可自定义
+
+此前节点 IP（`192.168.1.101-103`）与主机名散落硬编码在 9 个脚本与面板配置中，
+换网段必须改代码。本版本建立统一节点清单机制：
+
+- **新增 `scripts/lib-nodes.sh`**：从 `inventory/nodes.yaml` 解析节点
+  IP / 主机名 / WG 地址 / 角色与网络参数（网关、DNS、域名、WG 端口、子网），
+  提供三层覆盖：环境变量 > `inventory/nodes.local.yaml` > 默认清单
+- **`inventory/nodes.yaml`** 为每个节点显式增加 `hostname` 字段（默认
+  `edge-01` / `iot-02` / `storage-03`），并补充 `network` 段完整参数
+- **9 个运维脚本全部去硬编码**：`bootstrap.sh`（静态 IP/网关/DNS/hosts
+  参数化，已登记节点自动取默认值）、`deploy.sh`、`update-all.sh`、
+  `health-check.sh`（31 处）、`backup.sh`、`restore.sh`、`setup.sh`、
+  `wireguard-setup.sh`、`install-services.sh`
+- **新增 `scripts/gen-panel-config.sh`**：`panel/config.json` 改为由清单生成，
+  面板展示的节点 IP/主机名/服务列表始终跟随 inventory
+- **`cloudflared/config.yml`、`generate-keys.sh`** 改为引用清单值
+  （库不可用时保留原值作回退默认），`generate-keys.sh` 的监听端口同步参数化
+
+### 其他改进
+
+- `lib-nodes.sh` 内置 `set -u` 与通用日志函数，`load_nodes` 空值行守卫
+- `test_validate.py` 新增第 13 组测试「**IP/主机名可自定义性**」：
+  校验功能脚本无硬编码 IP、每个节点 hostname 字段齐全、环境变量覆盖真实生效
+- 验证项从 176 扩至 **184**（全部通过、0 警告）
+- 新增 `inventory/nodes.local.yaml.example` 覆盖模板（真实覆盖文件已 gitignore）
 
 ---
 

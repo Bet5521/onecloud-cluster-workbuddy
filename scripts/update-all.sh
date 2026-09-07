@@ -5,6 +5,12 @@
 # ============================================================
 set -e
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# 节点清单统一从 inventory 读取 (支持 nodes.local.yaml / 环境变量自定义)
+# shellcheck source=lib-nodes.sh
+source "${SCRIPT_DIR}/lib-nodes.sh"
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -43,11 +49,15 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-NODES=(
-    "wk-edge-01|192.168.1.101"
-    "wk-iot-02|192.168.1.102"
-    "wk-storage-03|192.168.1.103"
-)
+require_nodes
+
+# -n/--node 支持标准名 / 短名 / 主机名
+if [ -n "$TARGET" ]; then
+    if ! TARGET="$(node_resolve "$TARGET")"; then
+        log_error "未知节点: $TARGET (可用: $(node_names | tr '\n' ' '))"
+        exit 1
+    fi
+fi
 
 echo ""
 echo "=========================================="
@@ -56,15 +66,15 @@ echo "  模式: $MODE"
 echo "=========================================="
 echo ""
 
-for NODE in "${NODES[@]}"; do
-    IFS='|' read -r NAME IP <<< "$NODE"
+for NODE in "${ALL_NODES[@]}"; do
+    IFS='|' read -r NAME HOSTNAME IP WG_IP ROLE <<< "$NODE"
 
     if [ -n "$TARGET" ] && [ "$NAME" != "$TARGET" ]; then
         continue
     fi
 
     echo "=========================================="
-    echo "  $NAME ($IP)"
+    echo "  $NAME ($IP, $HOSTNAME)"
     echo "=========================================="
 
     if ! ssh -o ConnectTimeout=3 "root@${IP}" "echo ok" &>/dev/null; then

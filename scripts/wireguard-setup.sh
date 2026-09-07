@@ -25,24 +25,30 @@ log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
+# 节点清单统一从 inventory 读取 (支持 nodes.local.yaml / 环境变量自定义)
+# shellcheck source=lib-nodes.sh
+source "${SCRIPT_DIR}/lib-nodes.sh"
+require_nodes
+
 # 密钥与节点登记表的存放位置 (不入库)
 WG_DIR="${PROJECT_DIR}/wireguard"
 mkdir -p "$WG_DIR"
 PEERS_FILE="${WG_DIR}/peers.list"
 DOMAIN_FILE="${WG_DIR}/domain"
 
-# 内置节点 (集群固定成员)
-DEFAULT_NODES=(
-    "wk-edge-01|192.168.1.101|10.8.0.101|edge-01"
-    "wk-iot-02|192.168.1.102|10.8.0.102|iot-02"
-    "wk-storage-03|192.168.1.103|10.8.0.103|storage-03"
-)
+# Hub 节点: 承担外网端点与流量转发, 取 role=edge-gateway 的节点
+HUB_NODE="$(node_name_by_role edge-gateway 2>/dev/null || echo "${NODE_NAMES[0]}")"
 
-# 域名: 优先参数 > 状态文件 > 交互输入 > 默认值
+# WireGuard 监听端口与 DNS 均来自清单
+WG_PORT="$NET_WG_PORT"
+WG_DNS="$(node_wg_ip "$HUB_NODE" 2>/dev/null || true)"
+
+# 域名: 优先参数 > 状态文件 > 清单 > 默认值
 DOMAIN=""
 if [ -f "$DOMAIN_FILE" ]; then
     DOMAIN="$(head -1 "$DOMAIN_FILE" 2>/dev/null || true)"
 fi
+[ -z "$DOMAIN" ] && DOMAIN="$NET_DOMAIN"
 [ -z "$DOMAIN" ] && DOMAIN="yourdomain.com"
 
 usage() {
@@ -61,13 +67,25 @@ usage() {
 示例:
   $0
   $0 gen --domain example.com
-  $0 add peer wk-backup-04 192.168.1.104 10.8.0.104
+  $0 add peer wk-backup-04 <LAN_IP> <WG_IP>
 EOF
 }
 
-# 载入已登记节点: 内置节点 + peers.list 中新增的节点
-load_nodes() {
-    NODES=("${DEFAULT_NODES[@]}")
+# 载入节点: inventory 清单 + peers.list 中新增的节点
+# 注意: 函数名与 lib-nodes.sh 的 load_nodes 区分开, 避免覆盖
+# 格式为 name|lan_ip|wg_ip|hostname
+load_wg_nodes() {
+    NODES=()
+    local node name hostname lan_ip wg_ip
+    for node in "${ALL_NODES[@]}"; do
+        IFS='|' read -r name hostname lan_ip wg_ip _ <<< "$node"
+        # 注意: 用 if 而非 && 短路, 否则条件为假时返回非 0, 在 set -e 下会中断
+        if [ -z "$lan_ip" ] || [ -z "$wg_ip" ]; then
+            log_warn "跳过 $name: 缺少 ip 或 wg_ip 定义"
+            continue
+        fi
+        NODES+=("${name}|${lan_ip}|${wg_ip}|${hostname}")
+    done
     if [ -f "$PEERS_FILE" ]; then
         while IFS='|' read -r name lan_ip wg_ip hostname; do
             [ -z "${name:-}" ] && continue
@@ -75,6 +93,11 @@ load_nodes() {
             NODES+=("${name}|${lan_ip}|${wg_ip}|${hostname:-${name#wk-}}")
         done < "$PEERS_FILE"
     fi
+    if [ "${#NODES[@]}" -eq 0 ]; then
+        log_error "没有可用节点: 请检查 inventory/nodes.yaml 中的 ip / wg_ip 定义"
+        exit 1
+    fi
+    return 0
 }
 
 # 为单个节点生成密钥 (若不存在)
@@ -106,10 +129,10 @@ write_node_conf() {
 
     # 端点: edge 节点用域名 (可被外网访问), 其余用 LAN IP
     local endpoint
-    if [ "$name" = "wk-edge-01" ]; then
-        endpoint="${DOMAIN}:51820"
+    if [ "$name" = "$HUB_NODE" ]; then
+        endpoint="${DOMAIN}:${WG_PORT}"
     else
-        endpoint="${lan_ip}:51820"
+        endpoint="${lan_ip}:${WG_PORT}"
     fi
 
     {
@@ -120,13 +143,13 @@ write_node_conf() {
         echo "[Interface]"
         echo "Address = ${wg_ip}/32"
         echo "PrivateKey = ${PRIVATE_KEYS[$name]}"
-        echo "ListenPort = 51820"
-        echo "DNS = 10.8.0.101, 1.1.1.1"
+        echo "ListenPort = ${WG_PORT}"
+        echo "DNS = ${WG_DNS}, ${NET_DNS}"
         echo ""
-        if [ "$name" = "wk-edge-01" ]; then
+        if [ "$name" = "$HUB_NODE" ]; then
             echo "# 作为 Hub 转发流量 (PostUp/PostDown 各只允许出现一次)"
-            echo "PostUp = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -A FORWARD -o wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE; iptables -A INPUT -p udp --dport 51820 -j ACCEPT"
-            echo "PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -D FORWARD -o wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE; iptables -D INPUT -p udp --dport 51820 -j ACCEPT"
+            echo "PostUp = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -A FORWARD -o wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE; iptables -A INPUT -p udp --dport ${WG_PORT} -j ACCEPT"
+            echo "PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -D FORWARD -o wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE; iptables -D INPUT -p udp --dport ${WG_PORT} -j ACCEPT"
             echo ""
         fi
     } > "$conf"
@@ -137,10 +160,10 @@ write_node_conf() {
         [ "$peer_name" = "$name" ] && continue
 
         local peer_endpoint
-        if [ "$peer_name" = "wk-edge-01" ]; then
-            peer_endpoint="${DOMAIN}:51820"
+        if [ "$peer_name" = "$HUB_NODE" ]; then
+            peer_endpoint="${DOMAIN}:${WG_PORT}"
         else
-            peer_endpoint="${peer_lan}:51820"
+            peer_endpoint="${peer_lan}:${WG_PORT}"
         fi
 
         {
@@ -165,7 +188,7 @@ cmd_gen() {
     echo "=========================================="
     echo ""
 
-    load_nodes
+    load_wg_nodes
 
     declare -gA PRIVATE_KEYS PUBLIC_KEYS
 
@@ -200,7 +223,7 @@ cmd_gen() {
     log_warn "  1. 运行 ./scripts/deploy.sh 分发配置到各节点"
     log_warn "  2. 在节点上: cp wg0.conf /etc/wireguard/wg0.conf && chmod 600 /etc/wireguard/wg0.conf"
     log_warn "  3. systemctl enable --now wg-quick@wg0"
-    log_warn "  4. edge 节点放行 UDP 51820"
+    log_warn "  4. ${HUB_NODE} 节点放行 UDP ${WG_PORT}"
 }
 
 cmd_add_peer() {
@@ -209,11 +232,11 @@ cmd_add_peer() {
     if [ -z "$new_name" ] || [ -z "$new_lan" ] || [ -z "$new_wg" ]; then
         log_error "参数不足"
         echo "用法: $0 add peer <名称> <LAN_IP> <WG_IP>"
-        echo "示例: $0 add peer wk-backup-04 192.168.1.104 10.8.0.104"
+        echo "示例: $0 add peer wk-backup-04 <LAN_IP> <WG_IP>"
         exit 1
     fi
 
-    load_nodes
+    load_wg_nodes
 
     # 检查重名 / IP 冲突 (注意: 循环变量不可复用入参变量名)
     local node n_name n_lan n_wg
@@ -243,7 +266,7 @@ cmd_add_peer() {
 }
 
 cmd_list() {
-    load_nodes
+    load_wg_nodes
     echo ""
     echo "已登记节点:"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

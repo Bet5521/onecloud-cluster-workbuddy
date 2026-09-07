@@ -9,7 +9,7 @@ ingress:
   - hostname: memos.${DOMAIN}
     service: http://localhost:5230
   - hostname: home.${DOMAIN}
-    service: http://192.168.1.102:8123
+    service: http://iot-02.lan:8123
   - hostname: photos.${DOMAIN}
-    service: http://192.168.1.102:8080
+    service: http://iot-02.lan:8080
   - service: http_status:404

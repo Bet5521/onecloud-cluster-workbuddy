@@ -31,6 +31,26 @@ TZ="Asia/Shanghai"
 PUID=1000
 PGID=1000
 
+# ---- 节点清单库 (IP / 主机名 / WG IP 统一从 inventory/nodes.yaml 读取) ----
+SCRIPT_DIR_SETUP="$(cd "$(dirname "$0")" && pwd)"
+if [ -f "${SCRIPT_DIR_SETUP}/lib-nodes.sh" ]; then
+    # shellcheck disable=SC1090
+    source "${SCRIPT_DIR_SETUP}/lib-nodes.sh"
+fi
+
+# 当前机器所属节点: 用本机 IP 反查清单; 找不到时退化为本机主 IP
+current_node_ip() {
+    local lip
+    lip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    local n
+    n="$(node_by_ip "$lip" 2>/dev/null || true)"
+    if [ -n "$n" ]; then
+        node_ip "$n"
+    else
+        echo "$lip"
+    fi
+}
+
 # ============================================================
 # 工具函数
 # ============================================================
@@ -771,12 +791,12 @@ install_xiaomusic() {
 
     # 配置
     if [ ! -f "${DATA_DIR}/xiaomusic/config.json" ]; then
-        cat > "${DATA_DIR}/xiaomusic/config.json" << 'EOF'
+        cat > "${DATA_DIR}/xiaomusic/config.json" << EOF
 {
   "port": 8081,
   "music_path": "/mnt/sd/music",
   "download_path": "/mnt/sd/music/download",
-  "hostname": "192.168.1.102",
+  "hostname": "$(current_node_ip)",
   "account": "xiaomusic",
   "password": "xiaomusic"
 }
@@ -966,15 +986,22 @@ if __name__ == "__main__":
     app.run(host="0.0.0.0", port=9000)
 PYEOF
 
-        # 生成配置
+        # 生成配置 (从 inventory/nodes.yaml 动态读取, 支持自定义覆盖)
         if [ ! -f "${panel_dir}/config.json" ]; then
-            cat > "${panel_dir}/config.json" << 'EOF'
+            local fb_nodes=""
+            for n in $(node_names); do
+                local dn ip wg
+                dn="$(node_display_name "$n")"; [ -z "$dn" ] && dn="$(node_role "$n")"
+                ip="$(node_ip "$n")"
+                wg="$(node_wg_ip "$n")"
+                fb_nodes="${fb_nodes}{\"name\": \"$n\", \"display_name\": \"$dn\", \"ip\": \"$ip\", \"wg_ip\": \"$wg\"},"
+            done
+            fb_nodes="${fb_nodes%,}"
+            cat > "${panel_dir}/config.json" << EOF
 {
   "cluster_name": "OneCloud Cluster",
   "nodes": [
-    {"name": "wk-edge-01", "display_name": "Edge Gateway", "ip": "192.168.1.101", "wg_ip": "10.8.0.101"},
-    {"name": "wk-iot-02", "display_name": "IoT Core", "ip": "192.168.1.102", "wg_ip": "10.8.0.102"},
-    {"name": "wk-storage-03", "display_name": "Storage & Sync", "ip": "192.168.1.103", "wg_ip": "10.8.0.103"}
+    ${fb_nodes}
   ]
 }
 EOF

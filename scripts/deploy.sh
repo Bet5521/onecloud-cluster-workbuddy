@@ -8,6 +8,10 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
+# 节点清单统一从 inventory 读取 (支持 nodes.local.yaml / 环境变量自定义)
+# shellcheck source=lib-nodes.sh
+source "${SCRIPT_DIR}/lib-nodes.sh"
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -17,13 +21,9 @@ log_info() { echo -e "${GREEN}[INFO]${NC} $*"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
 
-# 默认节点列表
-# 格式: 节点名|IP|目录后缀(node-<suffix>)
-NODES=(
-    "wk-edge-01|192.168.1.101|wk-edge-01"
-    "wk-iot-02|192.168.1.102|wk-iot-02"
-    "wk-storage-03|192.168.1.103|wk-storage-03"
-)
+# 节点列表由 lib-nodes.sh 从 inventory/nodes.yaml 加载 (ALL_NODES)
+# 格式: 节点名|主机名|IP|WG_IP|角色
+require_nodes
 
 usage() {
     cat << EOF
@@ -72,11 +72,11 @@ echo ""
 deploy_node() {
     local NODE_NAME=$1
     local NODE_IP=$2
-    local NODE_ROLE=$3
-    local NODE_SRC="${PROJECT_DIR}/node-${NODE_ROLE}"
+    local NODE_HOSTNAME=$3
+    local NODE_SRC="${PROJECT_DIR}/node-${NODE_NAME}"
     local REMOTE_BASE="/mnt/sd/srv/${NODE_NAME}"
 
-    echo "--- $NODE_NAME ($NODE_IP) ---"
+    echo "--- $NODE_NAME ($NODE_IP, $NODE_HOSTNAME) ---"
 
     # 测试 SSH 连接
     if ! ssh -o ConnectTimeout=5 "root@${NODE_IP}" "echo ok" &>/dev/null; then
@@ -127,26 +127,24 @@ deploy_node() {
 }
 
 # 判断节点是否被 -n/--node 选中 (未指定则全部选中)
+# 支持标准名 / 短名 / 主机名三种写法
 node_selected() {
     local name=$1
     if [ ${#TARGET_NODES[@]} -eq 0 ]; then
         return 0
     fi
-    local t
+    local t resolved
     for t in "${TARGET_NODES[@]}"; do
-        [ "$t" = "$name" ] && return 0
-    done
-    # 兼容短名: edge-01 -> wk-edge-01
-    for t in "${TARGET_NODES[@]}"; do
-        [ "$t" = "${name#wk-}" ] && return 0
+        resolved=$(node_resolve "$t" 2>/dev/null) || continue
+        [ "$resolved" = "$name" ] && return 0
     done
     return 1
 }
 
-for NODE in "${NODES[@]}"; do
-    IFS='|' read -r NAME IP ROLE <<< "$NODE"
+for NODE in "${ALL_NODES[@]}"; do
+    IFS='|' read -r NAME HOSTNAME IP WG_IP ROLE <<< "$NODE"
     node_selected "$NAME" || continue
-    deploy_node "$NAME" "$IP" "$ROLE" || true
+    deploy_node "$NAME" "$IP" "$HOSTNAME" || true
 done
 
 echo "=========================================="

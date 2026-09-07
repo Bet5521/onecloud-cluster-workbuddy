@@ -25,12 +25,23 @@ NODE_DIRS = {
 INVENTORY_DIR = PROJECT_ROOT / "inventory"
 PANEL_DIR = PROJECT_ROOT / "panel"
 
-# 节点IP映射（硬编码fallback验证用）
-NODE_IP_MAP = {
-    "wk-edge-01": "192.168.1.101",
-    "wk-iot-02": "192.168.1.102",
-    "wk-storage-03": "192.168.1.103",
-}
+# 节点IP映射 —— 从 inventory/nodes.yaml 动态读取, 避免硬编码 (支持用户自定义 IP)
+def load_node_ip_map():
+    """读取 inventory/nodes.yaml, 返回 {节点名: IP} 映射"""
+    mapping = {}
+    try:
+        with open(INVENTORY_DIR / "nodes.yaml", encoding='utf-8') as f:
+            data = simple_yaml_parse(f.read())
+        for node in data.get("nodes", []):
+            if node.get("name"):
+                mapping[node["name"]] = node.get("ip", "")
+    except Exception:
+        pass
+    return mapping
+
+# 兼容旧引用的快捷别名 (调用即返回最新映射)
+def NODE_IP_MAP():  # noqa: N802 - 保留旧名, 但现在是函数
+    return load_node_ip_map()
 
 # 颜色支持（Windows兼容）
 try:
@@ -310,8 +321,8 @@ def test_config_files():
                 log_pass(f"节点 {name} WireGuard IP: {wg_ip}")
             
             # 验证 IP 映射一致性
-            if name in NODE_IP_MAP:
-                expected_ip = NODE_IP_MAP[name]
+            if name in NODE_IP_MAP():
+                expected_ip = NODE_IP_MAP()[name]
                 if ip == expected_ip:
                     log_pass(f"节点 {name} IP 与硬编码 fallback 一致")
                 else:
@@ -355,7 +366,7 @@ def test_config_files():
             node = svc_config.get("node", "")
             if not node:
                 log_fail(f"服务 {svc_name} 缺少 node 字段")
-            elif node not in NODE_IP_MAP:
+            elif node not in NODE_IP_MAP():
                 log_warn(f"服务 {svc_name} 绑定到未知节点: {node}")
             else:
                 log_pass(f"服务 {svc_name} 绑定到节点: {node}")
@@ -390,7 +401,7 @@ def test_config_files():
         
         # 验证面板节点与 inventory 节点一致性
         panel_node_names = {n["name"] for n in panel_data.get("nodes", [])}
-        inv_node_names = set(NODE_IP_MAP.keys())
+        inv_node_names = set(NODE_IP_MAP().keys())
         
         missing_in_panel = inv_node_names - panel_node_names
         extra_in_panel = panel_node_names - inv_node_names
@@ -619,7 +630,7 @@ def test_deploy_node_mapping():
             parts = entry.split("|")
             if len(parts) >= 3:
                 name, ip = parts[0], parts[1]
-                expected_ip = NODE_IP_MAP.get(name, "")
+                expected_ip = NODE_IP_MAP().get(name, "")
                 
                 if expected_ip and ip == expected_ip:
                     log_pass(f"节点 {name} IP {ip} 与 inventory 一致")
@@ -649,28 +660,26 @@ def test_fallback_mechanism():
             with open(script_path, encoding='utf-8') as f:
                 content = f.read()
             
-            # 检查 fallback 机制
-            has_case_fallback = "case \"$NODE_NAME\"" in content
-            has_hardcoded_ips = all(ip in content for ip in NODE_IP_MAP.values())
-            
-            if has_case_fallback:
-                log_pass(f"{script_name} 有 case 语句 fallback")
+            # 新设计: 节点 IP 应来自 inventory/nodes.yaml (经 lib-nodes.sh),
+            # 脚本内不得写死旧文档里的 192.168.1.10x 地址 (用户要求 IP 可自定义)
+            uses_lib = ("lib-nodes.sh" in content) or ("source " in content and "lib" in content)
+            hardcoded_hits = re.findall(r'192\.168\.1\.10[0-9]', content)
+            uses_node_func = ("node_ip" in content) or ("node_resolve" in content) or ("node_by_ip" in content)
+
+            if uses_lib:
+                log_pass(f"{script_name} 引用 lib-nodes.sh (IP 从清单动态读取)")
             else:
-                log_warn(f"{script_name} 缺少 case 语句 fallback")
-            
-            if has_hardcoded_ips:
-                log_pass(f"{script_name} 包含所有硬编码节点 IP")
+                log_warn(f"{script_name} 未发现 lib-nodes.sh 引用, 请确认节点解析来源")
+
+            if not hardcoded_hits:
+                log_pass(f"{script_name} 无硬编码节点 IP (符合自定义要求)")
             else:
-                missing = [ip for ip in NODE_IP_MAP.values() if ip not in content]
-                log_warn(f"{script_name} 缺少 IP fallback: {missing}")
-            
-            # 验证 fallback IP 与 inventory 一致
-            for name, ip in NODE_IP_MAP.items():
-                pattern = rf'{name}\)\s+NODE_IP="({re.escape(ip)})"'
-                if re.search(pattern, content):
-                    log_pass(f"{script_name} 节点 {name} fallback IP 正确")
-                elif ip in content:
-                    log_info(f"{script_name} 节点 {name} IP 在脚本中")
+                log_fail(f"{script_name} 仍硬编码 IP: {sorted(set(hardcoded_hits))}")
+
+            if uses_node_func:
+                log_pass(f"{script_name} 使用 node_* 函数解析节点")
+            else:
+                log_warn(f"{script_name} 未发现 node_* 节点解析调用")
                 
         except Exception as e:
             log_fail(f"{script_name} 解析错误: {str(e)}")
@@ -1281,6 +1290,74 @@ def test_cli_contract():
     log_info("CLI 契约检查完成")
 
 
+# ============ 测试13: 节点 IP 可自定义 / 主机名齐全 ============
+def test_ip_customizable():
+    """验证: 节点 IP 全部来自清单 (可自定义), 每个节点都有 hostname, 脚本无硬编码旧文档 IP"""
+    print("\n" + "="*60)
+    print("测试 13: 节点 IP 自定义与主机名完整性")
+    print("="*60)
+
+    # 1) 每个节点必须有 hostname (带默认值) 与 ip
+    try:
+        with open(INVENTORY_DIR / "nodes.yaml", encoding='utf-8') as f:
+            nodes_data = simple_yaml_parse(f.read())
+        nodes = nodes_data.get("nodes", [])
+        if not nodes:
+            log_fail("nodes.yaml 未解析出节点")
+        for node in nodes:
+            name = node.get("name", "?")
+            if not node.get("hostname"):
+                log_fail(f"节点 {name} 缺少 hostname 字段 (每个节点都必须设定 hostname)")
+            else:
+                log_pass(f"节点 {name} 主机名: {node['hostname']} (可自定义)")
+            if not node.get("ip"):
+                log_fail(f"节点 {name} 缺少 ip 字段")
+            else:
+                log_pass(f"节点 {name} IP: {node['ip']} (来自清单, 可覆盖)")
+    except Exception as e:
+        log_fail(f"解析 nodes.yaml 失败: {str(e)}")
+
+    # 2) 核心功能脚本不得硬编码旧文档里的 192.168.1.10x / 10.8.0.10x
+    core_scripts = [
+        "deploy.sh", "update-all.sh", "health-check.sh", "backup.sh",
+        "restore.sh", "bootstrap.sh", "setup.sh", "install-services.sh",
+        "wireguard-setup.sh",
+    ]
+    import subprocess
+    for script in core_scripts:
+        path = SCRIPTS_DIR / script
+        if not path.exists():
+            continue
+        content = path.read_text(encoding='utf-8')
+        # 去掉注释行后再查 (避免 help/示例注释误报)
+        code_lines = [
+            ln for ln in content.splitlines()
+            if not ln.strip().startswith("#")
+        ]
+        code = "\n".join(code_lines)
+        hits = re.findall(r'(?:192\.168\.1\.10[0-9]|10\.8\.0\.10[0-9])', code)
+        if hits:
+            log_fail(f"{script} 仍硬编码旧 IP: {sorted(set(hits))}",
+                     "节点 IP 应从 inventory/nodes.yaml 读取, 以支持自定义网络")
+        else:
+            log_pass(f"{script} 无硬编码节点 IP (IP 全部来自清单)")
+
+    # 3) 库能反映环境变量覆盖 (证明 IP 确实可自定义)
+    probe = subprocess.run(
+        ["bash", "-c",
+         'ONECLOUD_WK_EDGE_01_IP=10.99.0.5 ONECLOUD_WK_EDGE_01_HOSTNAME=edge99 '
+         'source "$(dirname "$0")/lib-nodes.sh" 2>/dev/null; '
+         'echo "$(node_ip wk-edge-01)"; echo "$(node_hostname wk-edge-01)"'],
+        cwd=str(SCRIPTS_DIR),
+        capture_output=True, text=True
+    )
+    out = probe.stdout.strip().splitlines()
+    if len(out) >= 2 and out[0] == "10.99.0.5" and out[1] == "edge99":
+        log_pass("lib-nodes.sh 支持环境变量覆盖 IP/主机名 (自定义生效)")
+    else:
+        log_fail(f"环境变量覆盖未生效, 输出: {out}")
+
+
 # ============ 主程序 ============
 def main():
     print("=" * 60)
@@ -1302,6 +1379,7 @@ def main():
         ("panel install-service", test_panel_install_service),
         ("服务一致性", test_service_consistency),
         ("文档化 CLI 接口契约", test_cli_contract),
+        ("节点 IP 自定义与主机名", test_ip_customizable),
     ]
     
     for test_name, test_func in tests:

@@ -6,8 +6,13 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-BACKUP_DIR="/mnt/sd/backups"
+BACKUP_DIR="${BACKUP_DIR:-/mnt/sd/backups}"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+
+# 节点清单统一从 inventory 读取 (支持 nodes.local.yaml / 环境变量自定义)
+# shellcheck source=lib-nodes.sh
+source "${SCRIPT_DIR}/lib-nodes.sh"
+require_nodes
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -68,15 +73,13 @@ case "$BACKUP_TYPE" in
     all)
         log_info "全量备份开始..."
 
-        # Edge Gateway
-        backup_remote 192.168.1.101 "/mnt/sd/srv/wk-edge-01" "edge-01" "NODE-01 全部"
-        backup_remote 192.168.1.101 "/etc/wireguard" "edge-01-wg" "WireGuard 配置"
-
-        # IoT Core
-        backup_remote 192.168.1.102 "/mnt/sd/srv/wk-iot-02" "iot-02" "NODE-02 全部"
-
-        # Storage
-        backup_remote 192.168.1.103 "/mnt/sd/srv/wk-storage-03" "storage-03" "NODE-03 全部"
+        # 遍历 inventory 中登记的全部节点
+        for NODE in "${ALL_NODES[@]}"; do
+            IFS='|' read -r NAME HOSTNAME IP WG_IP ROLE <<< "$NODE"
+            [ -z "$IP" ] && { log_warn "跳过 $NAME (未配置 IP)"; continue; }
+            backup_remote "$IP" "/mnt/sd/srv/${NAME}" "$HOSTNAME" "$NAME 全部"
+            backup_remote "$IP" "/etc/wireguard" "${HOSTNAME}-wg" "WireGuard 配置"
+        done
 
         # 本地项目
         if [ -d "$SCRIPT_DIR/.." ]; then
@@ -89,55 +92,46 @@ case "$BACKUP_TYPE" in
     config)
         log_info "仅备份配置文件..."
 
-        for NODE_IP in 192.168.1.101 192.168.1.102 192.168.1.103; do
-            backup_remote $NODE_IP "/mnt/sd/srv/*/docker-compose.yml" "config-$NODE_IP" "docker-compose"
-            backup_remote $NODE_IP "/mnt/sd/srv/*/.env" "config-$NODE_IP-env" "env文件"
-            backup_remote $NODE_IP "/etc/wireguard" "config-wg-$NODE_IP" "WireGuard"
-            backup_remote $NODE_IP "/etc/systemd/system/mihomo.service" "config-svc-$NODE_IP" "systemd服务"
+        for NODE in "${ALL_NODES[@]}"; do
+            IFS='|' read -r NAME HOSTNAME IP WG_IP ROLE <<< "$NODE"
+            [ -z "$IP" ] && continue
+            backup_remote "$IP" "/mnt/sd/srv/*/docker-compose.yml" "config-${HOSTNAME}" "docker-compose"
+            backup_remote "$IP" "/mnt/sd/srv/*/.env" "config-${HOSTNAME}-env" "env文件"
+            backup_remote "$IP" "/etc/wireguard" "config-wg-${HOSTNAME}" "WireGuard"
+            backup_remote "$IP" "/etc/systemd/system/mihomo.service" "config-svc-${HOSTNAME}" "systemd服务"
         done
         ;;
 
     node)
-        NODE_NAME="${TARGET:-wk-edge-01}"
-        # 兼容简写: edge-01 -> wk-edge-01
-        case "$NODE_NAME" in
-            wk-*) : ;;
-            *)    NODE_NAME="wk-${NODE_NAME}" ;;
-        esac
-        NODE_IP=$(grep -A5 "$NODE_NAME" "$SCRIPT_DIR/../inventory/nodes.yaml" 2>/dev/null | grep -oP 'ip: \K[0-9.]+' | head -1 || true)
-        # Fallback: 硬编码节点映射
-        if [ -z "$NODE_IP" ]; then
-            case "$NODE_NAME" in
-                wk-edge-01)   NODE_IP="192.168.1.101" ;;
-                wk-iot-02)    NODE_IP="192.168.1.102" ;;
-                wk-storage-03) NODE_IP="192.168.1.103" ;;
-            esac
+        NODE_NAME="${TARGET:-}"
+        if [ -z "$NODE_NAME" ]; then
+            NODE_NAME="${NODE_NAMES[0]}"
+            log_info "未指定节点, 默认使用: $NODE_NAME"
         fi
-        [ -z "$NODE_IP" ] && { log_error "未知节点: $NODE_NAME"; exit 1; }
+        # 支持标准名 / 短名 / 主机名
+        if ! NODE_NAME="$(node_resolve "$NODE_NAME")"; then
+            log_error "未知节点: $TARGET (可用: $(node_names | tr '\n' ' '))"
+            exit 1
+        fi
+        NODE_IP="$(node_ip "$NODE_NAME")"
+        NODE_HOST="$(node_hostname "$NODE_NAME")"
+        [ -z "$NODE_IP" ] && { log_error "节点 $NODE_NAME 未配置 IP"; exit 1; }
 
-        backup_remote "$NODE_IP" "/mnt/sd/srv/$NODE_NAME" "${NODE_NAME}" "$NODE_NAME 全部"
-        backup_remote "$NODE_IP" "/etc/wireguard" "${NODE_NAME}-wg" "WireGuard"
+        backup_remote "$NODE_IP" "/mnt/sd/srv/$NODE_NAME" "${NODE_HOST}" "$NODE_NAME 全部"
+        backup_remote "$NODE_IP" "/etc/wireguard" "${NODE_HOST}-wg" "WireGuard"
         ;;
 
     service)
         SVC="${TARGET:-homeassistant}"
-        # Home Assistant 在 NODE-02
-        if [ "$SVC" = "homeassistant" ]; then
-            backup_remote 192.168.1.102 "/mnt/sd/srv/wk-iot-02/homeassistant" "homeassistant" "Home Assistant"
-        elif [ "$SVC" = "piwigo" ]; then
-            backup_remote 192.168.1.102 "/mnt/sd/srv/wk-iot-02/piwigo" "piwigo" "Piwigo"
-        elif [ "$SVC" = "typecho" ]; then
-            backup_remote 192.168.1.102 "/mnt/sd/srv/wk-iot-02/typecho" "typecho" "Typecho"
-        elif [ "$SVC" = "aria2" ]; then
-            backup_remote 192.168.1.103 "/mnt/sd/srv/wk-storage-03/aria2" "aria2" "aria2"
-        elif [ "$SVC" = "syncthing" ]; then
-            backup_remote 192.168.1.103 "/mnt/sd/srv/wk-storage-03/syncthing" "syncthing" "Syncthing"
-        elif [ "$SVC" = "gitea" ]; then
-            backup_remote 192.168.1.103 "/mnt/sd/srv/wk-storage-03/gitea" "gitea" "Gitea"
-        else
-            log_error "未知服务: $SVC"
+        # 服务所在节点从 inventory/services.yaml 查询, 不硬编码
+        if ! SVC_NODE="$(node_of_service "$SVC")"; then
+            log_error "未知服务: $SVC (可用: $(service_names | tr '\n' ' '))"
             exit 1
         fi
+        SVC_IP="$(node_ip "$SVC_NODE")"
+        [ -z "$SVC_IP" ] && { log_error "服务 $SVC 所在节点 $SVC_NODE 未配置 IP"; exit 1; }
+        log_info "服务 $SVC 位于 $SVC_NODE ($SVC_IP)"
+        backup_remote "$SVC_IP" "/mnt/sd/srv/${SVC_NODE}/${SVC}" "${SVC}" "${SVC}"
         ;;
 
     *)

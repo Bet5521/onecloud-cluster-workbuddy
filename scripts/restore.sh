@@ -5,7 +5,14 @@
 # ============================================================
 set -e
 
-BACKUP_DIR="/mnt/sd/backups"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# 节点清单统一从 inventory 读取 (支持 nodes.local.yaml / 环境变量自定义)
+# shellcheck source=lib-nodes.sh
+source "${SCRIPT_DIR}/lib-nodes.sh"
+require_nodes
+
+BACKUP_DIR="${BACKUP_DIR:-/mnt/sd/backups}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -140,65 +147,56 @@ restore_to_node() {
 
 case "$RESTORE_TARGET" in
     all)
-        restore_to_node 192.168.1.101 "${BACKUP_PATH}/edge-01"    "/mnt/sd/srv/wk-edge-01"    "NODE-01"
-        restore_to_node 192.168.1.102 "${BACKUP_PATH}/iot-02"     "/mnt/sd/srv/wk-iot-02"     "NODE-02"
-        restore_to_node 192.168.1.103 "${BACKUP_PATH}/storage-03" "/mnt/sd/srv/wk-storage-03" "NODE-03"
-        restore_to_node 192.168.1.101 "${BACKUP_PATH}/edge-01-wg" "/etc/wireguard"            "WireGuard"
+        # 遍历 inventory 中登记的全部节点; 备份子目录名 = 主机名
+        for NODE in "${ALL_NODES[@]}"; do
+            IFS='|' read -r NAME HOSTNAME IP WG_IP ROLE <<< "$NODE"
+            [ -z "$IP" ] && { log_warn "跳过 $NAME (未配置 IP)"; continue; }
+            restore_to_node "$IP" "${BACKUP_PATH}/${HOSTNAME}"    "/mnt/sd/srv/${NAME}" "${NAME}"
+            restore_to_node "$IP" "${BACKUP_PATH}/${HOSTNAME}-wg" "/etc/wireguard"      "${NAME} WireGuard"
+        done
         ;;
 
     config)
-        restore_to_node 192.168.1.101 "${BACKUP_PATH}/edge-01/config"       "/mnt/sd/srv/wk-edge-01" "Edge 配置"
-        restore_to_node 192.168.1.102 "${BACKUP_PATH}/iot-02/config"        "/mnt/sd/srv/wk-iot-02"  "IoT 配置"
-        restore_to_node 192.168.1.103 "${BACKUP_PATH}/storage-03/config"    "/mnt/sd/srv/wk-storage-03" "Storage 配置"
+        for NODE in "${ALL_NODES[@]}"; do
+            IFS='|' read -r NAME HOSTNAME IP WG_IP ROLE <<< "$NODE"
+            [ -z "$IP" ] && continue
+            restore_to_node "$IP" "${BACKUP_PATH}/${HOSTNAME}/config" "/mnt/sd/srv/${NAME}" "${NAME} 配置"
+        done
         ;;
 
     node)
-        NODE_NAME=$(normalize_node "${RESTORE_NAME:-wk-edge-01}")
-        NODE_IP=$(grep -A5 "$NODE_NAME" "$(dirname "$0")/../inventory/nodes.yaml" 2>/dev/null | grep -oP 'ip: \K[0-9.]+' | head -1 || true)
-        # Fallback: 硬编码节点映射
-        if [ -z "$NODE_IP" ]; then
-            case "$NODE_NAME" in
-                wk-edge-01)   NODE_IP="192.168.1.101" ;;
-                wk-iot-02)    NODE_IP="192.168.1.102" ;;
-                wk-storage-03) NODE_IP="192.168.1.103" ;;
-            esac
+        NODE_NAME=$(normalize_node "${RESTORE_NAME:-}")
+        if [ -z "$NODE_NAME" ]; then
+            NODE_NAME="${NODE_NAMES[0]}"
+            log_info "未指定节点, 默认使用: $NODE_NAME"
         fi
-        [ -z "$NODE_IP" ] && { log_error "未知节点: $NODE_NAME"; exit 1; }
+        # 支持标准名 / 短名 / 主机名
+        if ! NODE_NAME="$(node_resolve "$NODE_NAME")"; then
+            log_error "未知节点: ${RESTORE_NAME} (可用: $(node_names | tr '\n' ' '))"
+            exit 1
+        fi
+        NODE_IP="$(node_ip "$NODE_NAME")"
+        NODE_HOST="$(node_hostname "$NODE_NAME")"
+        [ -z "$NODE_IP" ] && { log_error "节点 $NODE_NAME 未配置 IP"; exit 1; }
 
-        # 备份目录名: wk-edge-01 → edge-01, wk-iot-02 → iot-02, wk-storage-03 → storage-03
-        NODE_SHORT="${NODE_NAME#wk-}"
-        BACKUP_SUBDIR=$(ls -d "${BACKUP_PATH}/${NODE_SHORT}"* "${BACKUP_PATH}/${NODE_NAME}"* 2>/dev/null | head -1 || true)
-        [ -z "$BACKUP_SUBDIR" ] && { log_error "备份中未找到 $NODE_NAME"; exit 1; }
+        # 备份目录名用主机名 (与 backup.sh 保持一致); 兼容旧备份的短名
+        BACKUP_SUBDIR=$(ls -d "${BACKUP_PATH}/${NODE_HOST}"* "${BACKUP_PATH}/${NODE_NAME#wk-}"* "${BACKUP_PATH}/${NODE_NAME}"* 2>/dev/null | head -1 || true)
+        [ -z "$BACKUP_SUBDIR" ] && { log_error "备份中未找到 $NODE_NAME (查找: ${NODE_HOST} / ${NODE_NAME})"; exit 1; }
 
         restore_to_node "$NODE_IP" "$BACKUP_SUBDIR" "/mnt/sd/srv/${NODE_NAME}" "$NODE_NAME"
         ;;
 
     service)
         SVC="${RESTORE_NAME:-homeassistant}"
-        case "$SVC" in
-            homeassistant)
-                restore_to_node 192.168.1.102 "${BACKUP_PATH}/homeassistant" "/mnt/sd/srv/wk-iot-02/homeassistant" "Home Assistant"
-                ;;
-            piwigo)
-                restore_to_node 192.168.1.102 "${BACKUP_PATH}/piwigo" "/mnt/sd/srv/wk-iot-02/piwigo" "Piwigo"
-                ;;
-            typecho)
-                restore_to_node 192.168.1.102 "${BACKUP_PATH}/typecho" "/mnt/sd/srv/wk-iot-02/typecho" "Typecho"
-                ;;
-            aria2)
-                restore_to_node 192.168.1.103 "${BACKUP_PATH}/aria2" "/mnt/sd/srv/wk-storage-03/aria2" "aria2"
-                ;;
-            syncthing)
-                restore_to_node 192.168.1.103 "${BACKUP_PATH}/syncthing" "/mnt/sd/srv/wk-storage-03/syncthing" "Syncthing"
-                ;;
-            gitea)
-                restore_to_node 192.168.1.103 "${BACKUP_PATH}/gitea" "/mnt/sd/srv/wk-storage-03/gitea" "Gitea"
-                ;;
-            *)
-                log_error "未知服务: $SVC"
-                exit 1
-                ;;
-        esac
+        # 服务所在节点从 inventory/services.yaml 查询, 不硬编码
+        if ! SVC_NODE="$(node_of_service "$SVC")"; then
+            log_error "未知服务: $SVC (可用: $(service_names | tr '\n' ' '))"
+            exit 1
+        fi
+        SVC_IP="$(node_ip "$SVC_NODE")"
+        [ -z "$SVC_IP" ] && { log_error "服务 $SVC 所在节点 $SVC_NODE 未配置 IP"; exit 1; }
+        log_info "服务 $SVC 位于 $SVC_NODE ($SVC_IP)"
+        restore_to_node "$SVC_IP" "${BACKUP_PATH}/${SVC}" "/mnt/sd/srv/${SVC_NODE}/${SVC}" "${SVC}"
         ;;
 
     *)

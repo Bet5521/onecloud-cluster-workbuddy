@@ -1,9 +1,38 @@
+# ============================================================
+# 节点清单 (单一数据源)
+#
+# 所有脚本的 IP / 主机名 / WireGuard IP 都从这里读取。
+# 要改成你自己的网络环境, 有两种方式 (都不需要改动脚本):
+#
+#   1. 复制覆盖文件并修改:
+#        cp inventory/nodes.local.yaml.example inventory/nodes.local.yaml
+#      nodes.local.yaml 不入库, 优先级高于本文件。
+#
+#   2. 用环境变量临时覆盖 (节点名中的 - 和 . 写成 _):
+#        ONECLOUD_WK_EDGE_01_IP=10.0.0.5 ./scripts/deploy.sh
+#        ONECLOUD_WK_EDGE_01_HOSTNAME=edge02 ./scripts/bootstrap.sh ...
+#        ONECLOUD_GATEWAY=10.0.0.1 ONECLOUD_DOMAIN=lab.example.com ...
+#
+# 优先级: 环境变量 > nodes.local.yaml > 本文件
+#
+# 字段说明:
+#   name      节点名, 同时是 node-<name>/ 目录名 (必填, 唯一)
+#   hostname  系统主机名, 会写入 /etc/hostname (必填, 唯一)
+#   host      FQDN, 用于 /etc/hosts 与访问 (可选, 默认 hostname.lan)
+#   ip        LAN 静态 IP (必填)
+#   wg_ip     WireGuard 隧道 IP (必填)
+#   role      角色标识, 仅用于展示与筛选
+# ============================================================
+
 nodes:
   - name: wk-edge-01
+    display_name: Edge Gateway
+    hostname: edge-01
     host: edge-01.lan
     ip: 192.168.1.101
     wg_ip: 10.8.0.101
     role: edge-gateway
+    color: "#4CAF50"
     arch: armv7l
     cpu: Amlogic S805
     memory: 1024MB
@@ -15,10 +44,13 @@ nodes:
     services: [cloudflared, adguard, wireguard, clash, memos, panel]
 
   - name: wk-iot-02
+    display_name: IoT Core
+    hostname: iot-02
     host: iot-02.lan
     ip: 192.168.1.102
     wg_ip: 10.8.0.102
     role: iot-core
+    color: "#2196F3"
     arch: armv7l
     cpu: Amlogic S805
     memory: 1024MB
@@ -30,10 +62,13 @@ nodes:
     services: [homeassistant, xiaomusic, migpt, piwigo, typecho]
 
   - name: wk-storage-03
+    display_name: Storage & Sync
+    hostname: storage-03
     host: storage-03.lan
     ip: 192.168.1.103
     wg_ip: 10.8.0.103
     role: storage-sync
+    color: "#FF9800"
     arch: armv7l
     cpu: Amlogic S805
     memory: 1024MB
@@ -44,8 +79,12 @@ nodes:
     sd_mount: /mnt/sd
     services: [syncthing, verysync, aria2, cupsd, cups-web, ariang, gitea]
 
+# ---- 网络参数 ----
+# 以下均为默认值, 可按实际环境修改 (或用 nodes.local.yaml / 环境变量覆盖)
 network:
   lan_subnet: 192.168.1.0/24
   wg_subnet: 10.8.0.0/24
   gateway: 192.168.1.1
+  dns: 1.1.1.1
+  wg_port: 51820
   domain: yourdomain.com
