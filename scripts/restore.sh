@@ -105,6 +105,12 @@ fi
 # 解析 'latest'
 if [ "$BACKUP_ID" = "latest" ]; then
     BACKUP_ID=$(ls -1t "$BACKUP_DIR" 2>/dev/null | head -1)
+    # 无任何备份时 BACKUP_ID 会解析为空, 若不拦住, BACKUP_PATH 会退化成
+    # 备份根目录, 从而把整个备份目录当作一次备份 rsync 出去
+    if [ -z "$BACKUP_ID" ]; then
+        log_error "没有可用备份: $BACKUP_DIR"
+        exit 1
+    fi
 fi
 
 BACKUP_PATH="${BACKUP_DIR}/${BACKUP_ID}"

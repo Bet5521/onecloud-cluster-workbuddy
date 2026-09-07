@@ -132,8 +132,15 @@ ensure_tools() {
 # 获取 GitHub 最新版本号
 get_latest_release() {
     local repo=$1
-    curl -sL "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null \
+    curl -fsSL "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null \
         | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/'
+}
+
+# 校验下载产物确实是 ELF 可执行文件 (防止把 404 页面/空文件当成安装成功)
+is_elf_binary() {
+    local f=${1:-}
+    [ -n "$f" ] && [ -s "$f" ] || return 1
+    [ "$(head -c 4 "$f" 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' \n')" = "7f454c46" ]
 }
 
 # ============================================================
@@ -721,9 +728,22 @@ install_clash() {
         x86_64)        arch="amd64" ;;
     esac
 
-    curl -sL "https://github.com/MetaCubeX/mihomo/releases/download/${ver}/mihomo-linux-${arch}-${ver}.gz" \
-        | gunzip > /usr/local/bin/mihomo
-    chmod +x /usr/local/bin/mihomo
+    local tmpbin
+    tmpbin=$(mktemp)
+    if ! curl -fsSL "https://github.com/MetaCubeX/mihomo/releases/download/${ver}/mihomo-linux-${arch}-${ver}.gz" \
+            -o "${tmpbin}.gz"; then
+        log_error "mihomo 下载失败: ${ver} (${arch})"
+        rm -f "$tmpbin" "${tmpbin}.gz"
+        return 1
+    fi
+    if ! gunzip -c "${tmpbin}.gz" > "$tmpbin" 2>/dev/null || ! is_elf_binary "$tmpbin"; then
+        log_error "mihomo 下载产物无效 (非 gzip 包或非可执行文件), 已中止"
+        rm -f "$tmpbin" "${tmpbin}.gz"
+        return 1
+    fi
+    mkdir -p /usr/local/bin
+    install -m 0755 "$tmpbin" /usr/local/bin/mihomo
+    rm -f "$tmpbin" "${tmpbin}.gz"
 
     # 生成最小配置
     if [ ! -f "${DATA_DIR}/clash/config.yaml" ]; then
@@ -781,9 +801,15 @@ install_xiaomusic() {
         | sed -E 's/.*"([^"]+)".*/\1/')
 
     if [ -n "$url" ]; then
-        curl -sL "$url" | tar xz -C /tmp
-        mv /tmp/xiaomusic /usr/local/bin/
-        chmod +x /usr/local/bin/xiaomusic
+        rm -f /tmp/xiaomusic
+        if ! curl -fsSL "$url" | tar xz -C /tmp || ! is_elf_binary /tmp/xiaomusic; then
+            log_error "xiaomusic 下载或解压失败 (产物不是可执行文件), 已中止"
+            rm -f /tmp/xiaomusic
+            return 1
+        fi
+        mkdir -p /usr/local/bin
+        install -m 0755 /tmp/xiaomusic /usr/local/bin/xiaomusic
+        rm -f /tmp/xiaomusic
     else
         log_error "下载失败, 请手动安装: https://github.com/hanxi/xiaomusic/releases"
         return 1

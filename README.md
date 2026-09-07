@@ -197,6 +197,15 @@ vim inventory/nodes.local.yaml   # 填入你的 IP/主机名, 该文件已被 gi
 - 所有运维脚本（deploy / update-all / health-check / backup / restore /
   wireguard-setup / setup / install-services）均从 `scripts/lib-nodes.sh`
   动态读取节点，**功能脚本中无任何硬编码 IP**
+- **改完 IP 记得重新渲染面板配置与节点 `.env`**（两个生成脚本）：
+
+  ```bash
+  ./scripts/gen-panel-config.sh   # 面板展示的节点 IP
+  ./scripts/gen-node-env.sh       # 各节点 .env 的 NODE_IP/WG_IP/DOMAIN
+  ```
+
+  `gen-node-env.sh` 只覆盖 `NODE_NAME/NODE_IP/WG_IP/DOMAIN` 四个托管键，
+  **已填写的密钥等其它值原样保留**，可放心重复执行
 - `backup.sh` / `restore.sh` 的备份目录可用 `BACKUP_DIR` 环境变量自定义
 - 新增节点：写进 `nodes.local.yaml` 即被所有脚本识别，无需改代码
 
@@ -208,6 +217,7 @@ vim inventory/nodes.local.yaml   # 填入你的 IP/主机名, 该文件已被 gi
 |------|------|---------|
 | `lib-nodes.sh` | 节点清单库（单一数据源，供所有脚本 source） | 被其他脚本引用 |
 | `gen-panel-config.sh` | 从清单生成 `panel/config.json` | 直接运行 |
+| `gen-node-env.sh` | 从清单渲染各节点 `.env`（保留已填密钥） | `[节点名]` / `--dry-run` |
 | `bootstrap.sh` | 新节点初始化（主机名/源/swap/SD卡/Docker/静态IP） | `--node <名> [--ip <IP>] --yes` |
 | `setup.sh` | 统一安装（端口检测 + 多选批量安装 + 磁盘挂载） | `sudo bash setup.sh` |
 | `wireguard-setup.sh` | WireGuard mesh 配置生成 | `gen` / `add peer` / `list` |
@@ -225,7 +235,8 @@ vim inventory/nodes.local.yaml   # 填入你的 IP/主机名, 该文件已被 gi
 ## ✅ 功能验证
 
 项目自带验证套件，覆盖配置完整性、脚本语法、节点映射、服务一致性、
-**文档化 CLI 接口契约**与 **IP/主机名可自定义性**（共 184 项）：
+**文档化 CLI 接口契约**、**IP/主机名可自定义性**与**安全健壮性回归**
+（共 194 项）：
 
 ```bash
 python3 test_validate.py
@@ -234,8 +245,8 @@ python3 test_validate.py
 输出示例：
 
 ```
-  总计: 184 项
-  通过: 184
+  总计: 194 项
+  通过: 194
   失败: 0
   警告: 0
 ```
@@ -284,6 +295,33 @@ python3 test_validate.py
   校验功能脚本无硬编码 IP、每个节点 hostname 字段齐全、环境变量覆盖真实生效
 - 验证项从 176 扩至 **184**（全部通过、0 警告）
 - 新增 `inventory/nodes.local.yaml.example` 覆盖模板（真实覆盖文件已 gitignore）
+
+---
+
+## 🔍 v1.2.1 变更说明
+
+对 v1.2.0 做了一轮完整回归验证，修复验证中发现的问题：
+
+### 修复
+
+| 问题 | 影响 | 修复 |
+|------|------|------|
+| `restore.sh latest` 在无任何备份时，`BACKUP_ID` 解析为空 | `BACKUP_PATH` 退化成备份根目录并通过存在性检查，会把**整个备份目录**当作一次备份 rsync 出去 | 加空值守卫，直接报错退出 |
+| `install_mihomo` 架构写死 `armv7` | 非 armv7 设备会装错二进制 | 按 `uname -m` 自动识别 armv7/arm64/amd64 |
+| 二进制下载不校验产物 | 网络失败或 404 时，`gunzip`/`tar` 仍会写出空文件或错误页面，`chmod +x` 后照常打印「安装成功」 | 下载后校验 ELF 魔数，非可执行文件即中止 |
+| 原生安装缺少 root 检查 | 非 root 运行时报「No such file or directory」，原因不明 | 增加 `require_root`，给出明确提示 |
+| `all-native` 无容错 | `set -e` 下任一原生服务失败会中断后续安装 | 与 `all-docker` 一致，改为 `|| log_warn` |
+| 节点内 `clash/install-binary.sh`、`xiaomusic/install.sh` 重复实现安装逻辑 | 与 `install-services.sh` 行为分叉，且仍带着上面几个缺陷 | 改为委派统一脚本的兼容入口（保留原路径与目录初始化） |
+| 面板命令白名单只做前缀匹配 | `free; cat /etc/shadow` 会以 `free` 开头被放行，黑名单拦不住 | 拦截 `;` `&&` `\|\|` `\|` 反引号 `$(` 等元字符 |
+| 自定义 IP 无法贯通到容器运行时 | 节点 `.env` 是静态模板，改了清单后容器内 `NODE_IP` 仍是旧值 | 新增 `scripts/gen-node-env.sh` 从清单渲染 `.env` |
+
+### 验证
+
+- `test_validate.py` 184 → **194 项**（新增第 14 组「安全与健壮性回归」，
+  把本轮修复全部固化为回归用例）
+- 27 个 shell 脚本 `bash -n` 通过；JSON/YAML 全过
+- 文档中所有脚本路径与参数形式逐一实测（backup/restore/install-services/
+  update-all/wireguard 各分支），无「文档写了但跑不通」的项
 
 ---
 

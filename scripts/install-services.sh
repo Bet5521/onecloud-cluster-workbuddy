@@ -40,22 +40,72 @@ Docker 服务:
 EOF
 }
 
+# 原生二进制安装需要写 /usr/local/bin, 必须 root
+require_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        log_error "需要 root 权限 (请用 sudo $0 <服务名> 运行)"
+        return 1
+    fi
+    return 0
+}
+
+# 校验下载产物确实是 ELF 可执行文件, 防止把 404 页面/空文件当成安装成功
+is_elf_binary() {
+    local f=${1:-}
+    [ -n "$f" ] && [ -s "$f" ] || return 1
+    [ "$(head -c 4 "$f" 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' \n')" = "7f454c46" ]
+}
+
 install_mihomo() {
     log_info "安装 mihomo (Clash Meta)..."
-    local VER
-    VER=$(curl -sL https://api.github.com/repos/MetaCubeX/mihomo/releases/latest | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/')
-    if [ -n "$VER" ]; then
-        curl -sL "https://github.com/MetaCubeX/mihomo/releases/download/${VER}/mihomo-linux-armv7-${VER}.gz" \
-            | gunzip > /usr/local/bin/mihomo
-        chmod +x /usr/local/bin/mihomo
-        log_info "mihomo 版本: $($(which mihomo) -v 2>&1 | head -1 || echo 'ok')"
+    require_root || return 1
+    local VER arch url tmpdir
+
+    VER=$(curl -fsSL https://api.github.com/repos/MetaCubeX/mihomo/releases/latest \
+          | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/')
+    if [ -z "$VER" ]; then
+        log_error "获取版本号失败 (网络不通或 GitHub API 限流)"
+        return 1
+    fi
+
+    case "$(uname -m)" in
+        aarch64|arm64)        arch="arm64" ;;
+        x86_64|amd64)         arch="amd64" ;;
+        armv7l|armv6l|armhf)  arch="armv7" ;;
+        *) log_error "不支持的架构: $(uname -m)"; return 1 ;;
+    esac
+    log_info "最新版本: $VER (${arch})"
+
+    url="https://github.com/MetaCubeX/mihomo/releases/download/${VER}/mihomo-linux-${arch}-${VER}.gz"
+    tmpdir=$(mktemp -d)
+    if ! curl -fsSL "$url" -o "${tmpdir}/mihomo.gz"; then
+        log_error "下载失败: $url"
+        rm -rf "$tmpdir"; return 1
+    fi
+    if ! gunzip -c "${tmpdir}/mihomo.gz" > "${tmpdir}/mihomo" 2>/dev/null; then
+        log_error "解压失败, 下载内容不是有效的 gzip 包"
+        rm -rf "$tmpdir"; return 1
+    fi
+    if ! is_elf_binary "${tmpdir}/mihomo"; then
+        log_error "下载产物不是可执行文件 (可能是 404 页面), 已中止"
+        rm -rf "$tmpdir"; return 1
+    fi
+
+    mkdir -p /usr/local/bin
+    install -m 0755 "${tmpdir}/mihomo" /usr/local/bin/mihomo
+    rm -rf "$tmpdir"
+
+    if command -v mihomo >/dev/null 2>&1; then
+        log_info "mihomo 已安装: $(mihomo -v 2>&1 | head -1)"
     else
-        log_error "下载失败, 请手动安装"
+        log_error "安装后未在 PATH 中找到 mihomo"
+        return 1
     fi
 }
 
 install_xiaomusic() {
     log_info "安装 xiaomusic..."
+    require_root || return 1
     local ver
     ver=$(curl -sL https://api.github.com/repos/hanxi/xiaomusic/releases/latest | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/')
     if [ -z "$ver" ]; then
@@ -85,12 +135,14 @@ install_xiaomusic() {
     tmpdir=$(mktemp -d)
     curl -sL "$url" -o "$tmpdir/xiaomusic.tar.gz"
     tar xzf "$tmpdir/xiaomusic.tar.gz" -C "$tmpdir"
-    if [ -f "$tmpdir/xiaomusic" ]; then
-        mv "$tmpdir/xiaomusic" /usr/local/bin/
-        chmod +x /usr/local/bin/xiaomusic
+    if [ -f "$tmpdir/xiaomusic" ] && is_elf_binary "$tmpdir/xiaomusic"; then
+        mkdir -p /usr/local/bin
+        install -m 0755 "$tmpdir/xiaomusic" /usr/local/bin/xiaomusic
         log_info "xiaomusic 已安装"
     else
-        log_error "下载包结构异常, 请手动安装"
+        log_error "下载包结构异常或不是可执行文件, 请手动安装"
+        rm -rf "$tmpdir"
+        return 1
     fi
     rm -rf "$tmpdir"
 }
@@ -149,9 +201,10 @@ case "${1:-}" in
     migpt)       install_migpt ;;
     verysync)    install_verysync ;;
     all-native)
-        install_mihomo
-        install_xiaomusic
-        install_migpt
+        # 单个原生服务失败不应中断其余安装 (set -e 下需显式容错)
+        install_mihomo    || log_warn "mihomo 安装失败"
+        install_xiaomusic || log_warn "xiaomusic 安装失败"
+        install_migpt     || log_warn "migpt 依赖安装失败"
         install_verysync
         ;;
     edge)        start_edge ;;

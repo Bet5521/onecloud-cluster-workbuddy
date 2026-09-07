@@ -34,6 +34,13 @@ ALLOWED_CMD_PREFIXES = (
 def is_command_safe(command: str) -> bool:
     """白名单校验：只允许预定义的安全命令"""
     cmd = command.strip().lower()
+
+    # 禁止 shell 元字符: 白名单只匹配前缀, 若不拦住连接符,
+    # "free; cat /etc/shadow" 这类命令会以 free 开头而整条被放行
+    for meta in (";", "&&", "||", "|", "`", "$(", "\n", "\r", ">"):
+        if meta in cmd:
+            return False
+
     # 先做基础黑名单拦截（双保险）
     blocked = ("rm -rf", "mkfs", "dd if=", "shutdown", "reboot", "poweroff",
               ":(){", "fork bomb", "wget http", "curl http", ">/dev/sd")
