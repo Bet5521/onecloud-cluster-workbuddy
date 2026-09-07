@@ -1170,6 +1170,117 @@ def generate_report():
     
     return FAILED == 0
 
+# ============ 测试12: 文档化 CLI 接口契约验证 ============
+def test_cli_contract():
+    """验证 README / 运维手册中记载的命令行接口确实被实现
+
+    之前的验证只检查语法和字符串存在性, 导致"文档写了但脚本没实现"
+    的问题无法被发现 (例如 deploy.sh --exec、wireguard-setup.sh add peer)。
+    本测试专门守住这些契约。
+    """
+    print("\n" + "="*60)
+    print("测试 12: 文档化 CLI 接口契约验证")
+    print("="*60)
+
+    def read(path):
+        p = Path(path)
+        return p.read_text(encoding="utf-8", errors="ignore") if p.exists() else ""
+
+    # ---- bootstrap.sh: --node/--ip/--hostname/--sd/--yes ----
+    boot = read(SCRIPTS_DIR / "bootstrap.sh")
+    for opt in ("--node", "--ip", "--hostname", "--sd", "--yes"):
+        if re.search(rf'^\s*-[a-zA-Z\|]*{re.escape(opt.lstrip("-")[0])}\|--?{re.escape(opt.lstrip("-"))}\b', boot, re.M) or opt in boot:
+            log_pass(f"bootstrap.sh 支持 {opt}")
+        else:
+            log_fail(f"bootstrap.sh 缺少 {opt}", "README 记载的初始化用法会失效")
+
+    # ---- deploy.sh ----
+    dep = read(SCRIPTS_DIR / "deploy.sh")
+    for opt in ("--exec", "--node", "--test", "--dry-run"):
+        if opt in dep:
+            log_pass(f"deploy.sh 支持 {opt}")
+        else:
+            log_fail(f"deploy.sh 缺少 {opt}", f"README 记载的 {opt} 会报'未知选项'")
+
+    # -n 必须按节点表查找, 而不是把参数直接当 NAME|IP|ROLE 记录解析
+    if "node_selected" in dep:
+        log_pass("deploy.sh -n 按节点表解析节点名")
+    else:
+        log_fail("deploy.sh -n 未做节点名映射", "-n wk-edge-01 会解析出空 IP")
+
+    # ---- wireguard-setup.sh ----
+    wg = read(SCRIPTS_DIR / "wireguard-setup.sh")
+    if "cmd_add_peer" in wg and re.search(r'^\s*peer\)', wg, re.M):
+        log_pass("wireguard-setup.sh 实现 'add peer' 子命令")
+    else:
+        log_fail("wireguard-setup.sh 缺少 'add peer'", "运维手册 5.2 的用法不可用")
+    if re.search(r'^\s*list\|ls\)', wg, re.M):
+        log_pass("wireguard-setup.sh 实现 'list' 子命令")
+    else:
+        log_fail("wireguard-setup.sh 缺少 'list'")
+    # 产物必须落到 deploy.sh 能分发的 node-<name>/wireguard/
+    if "node-${name}/wireguard/wg0.conf" in wg:
+        log_pass("wireguard-setup.sh 输出到 node-<name>/wireguard/wg0.conf")
+    else:
+        log_fail("wireguard-setup.sh 输出目录与 deploy.sh 分发路径不一致")
+
+    # ---- restore.sh: 支持 <备份ID> <节点名或服务名> 简写 ----
+    rst = read(SCRIPTS_DIR / "restore.sh")
+    if "RESTORE_TARGET" in rst and "无法识别的恢复目标" in rst:
+        log_pass("restore.sh 支持 <备份ID> <目标> 简写形式")
+    else:
+        log_fail("restore.sh 不支持简写形式", "运维手册 3.3 的用法会落到 usage")
+    if "normalize_node" in rst:
+        log_pass("restore.sh 支持节点简写 (edge-01 -> wk-edge-01)")
+    else:
+        log_fail("restore.sh 未做节点名归一化")
+
+    # ---- update-all.sh: 必须过滤 apt list 的 "Listing..." 表头 ----
+    upd = read(SCRIPTS_DIR / "update-all.sh")
+    if "upgradable from" in upd and ("awk -F'/'" in upd or "NF>1" in upd):
+        log_pass("update-all.sh 过滤 apt list 表头")
+    else:
+        log_fail("update-all.sh 会把 'Listing... Done' 当包名传给 apt upgrade")
+
+    # ---- install-services.sh: PEP 668 兼容 ----
+    ins = read(SCRIPTS_DIR / "install-services.sh")
+    if "--break-system-packages" in ins:
+        log_pass("install-services.sh 兼容 PEP 668 (externally-managed)")
+    else:
+        log_fail("install-services.sh 在 Debian 12+ 上 pip3 安装会失败")
+
+    # ---- generate-keys.sh: PostUp/PostDown 各只能有一条 ----
+    gk = read(NODE_DIRS["wk-edge-01"] / "wireguard" / "generate-keys.sh")
+    n_up = len([l for l in gk.splitlines() if l.strip().startswith("PostUp")])
+    n_down = len([l for l in gk.splitlines() if l.strip().startswith("PostDown")])
+    if n_up <= 1 and n_down <= 1:
+        log_pass(f"generate-keys.sh PostUp/PostDown 各 {n_up}/{n_down} 条 (无覆盖)")
+    else:
+        log_fail(
+            f"generate-keys.sh PostUp/PostDown 重复 ({n_up}/{n_down})",
+            "wg-quick 只保留最后一条, NAT 规则会被静默丢弃"
+        )
+
+    # ---- services.yaml: 不得同时声明 ports 与 network_mode: host ----
+    svc_text = read(INVENTORY_DIR / "services.yaml")
+    blocks = re.split(r'\n(?=  [a-z0-9_-]+:\s*$)', svc_text)
+    conflict_found = False
+    for b in blocks:
+        m = re.match(r'\s{2}([a-z0-9_-]+):', b)
+        if not m:
+            continue
+        name = m.group(1)
+        has_ports = re.search(r'^\s{4}ports:\s*$', b, re.M) is not None
+        has_host = re.search(r'^\s{4}network_mode:\s*host\s*$', b, re.M) is not None
+        if has_ports and has_host:
+            log_fail(f"services.yaml: {name} 同时声明 ports 与 network_mode: host", "docker compose 会拒绝")
+            conflict_found = True
+    if not conflict_found:
+        log_pass("services.yaml 无 ports/network_mode 冲突")
+
+    log_info("CLI 契约检查完成")
+
+
 # ============ 主程序 ============
 def main():
     print("=" * 60)
@@ -1190,6 +1301,7 @@ def main():
         ("xiaomusic 下载", test_xiaomusic_download),
         ("panel install-service", test_panel_install_service),
         ("服务一致性", test_service_consistency),
+        ("文档化 CLI 接口契约", test_cli_contract),
     ]
     
     for test_name, test_func in tests:

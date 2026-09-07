@@ -14,6 +14,26 @@ log_info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
 log_warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
 
+usage() {
+    cat << EOF
+用法: $0 [选项]
+
+选项:
+  -n, --node NAME       节点名称 (如 wk-edge-01)
+  -i, --ip IP           静态 IP (如 192.168.1.101)
+  -H, --hostname NAME   主机名 (如 edge-01)
+  -s, --sd DEV          SD 卡设备名 (如 mmcblk1, 不含 /dev/)
+  -y, --yes             跳过交互确认 (非交互/自动化场景必填)
+  -h, --help            显示帮助
+
+未通过参数提供的选项, 会在终端可用时以交互方式询问。
+非交互环境 (无 TTY) 下缺失的参数将使用默认值。
+
+示例:
+  $0 --node wk-edge-01 --ip 192.168.1.101 --hostname edge-01 --yes
+EOF
+}
+
 echo ""
 echo "=========================================="
 echo "  OneCloud Cluster - Node Bootstrap"
@@ -21,14 +41,35 @@ echo "=========================================="
 echo ""
 
 # ---- 1. 基本信息采集 ----
-read -p "请输入节点名称 (如 wk-edge-01): " NODE_NAME
-read -p "请输入静态IP (如 192.168.1.101): " NODE_IP
-read -p "请输入主机名 (如 edge-01): " HOSTNAME
-read -p "请输入 SD 卡设备名 (如 mmcblk1): " SD_DEV
+NODE_NAME=""
+NODE_IP=""
+HOSTNAME=""
+SD_DEV=""
+ASSUME_YES=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -n|--node)      NODE_NAME="$2"; shift 2 ;;
+        -i|--ip)        NODE_IP="$2";   shift 2 ;;
+        -H|--hostname)  HOSTNAME="$2";  shift 2 ;;
+        -s|--sd)        SD_DEV="$2";    shift 2 ;;
+        -y|--yes)       ASSUME_YES=true; shift ;;
+        -h|--help)      usage; exit 0 ;;
+        *) log_error "未知选项: $1"; usage; exit 1 ;;
+    esac
+done
+
+# 交互补全: 仅在有终端时询问未提供的参数
+if [ -t 0 ]; then
+    if [ -z "$NODE_NAME" ]; then read -r -p "请输入节点名称 (如 wk-edge-01): " NODE_NAME || true; fi
+    if [ -z "$NODE_IP" ];   then read -r -p "请输入静态IP (如 192.168.1.101): " NODE_IP   || true; fi
+    if [ -z "$HOSTNAME" ];  then read -r -p "请输入主机名 (如 edge-01): " HOSTNAME        || true; fi
+    if [ -z "$SD_DEV" ];    then read -r -p "请输入 SD 卡设备名 (如 mmcblk1): " SD_DEV   || true; fi
+fi
 
 [ -z "$NODE_NAME" ] && NODE_NAME="wk-node-01"
 [ -z "$NODE_IP" ]   && NODE_IP="192.168.1.101"
-[ -z "$HOSTNAME" ]  && HOSTNAME="wk-node"
+[ -z "$HOSTNAME" ]  && HOSTNAME="${NODE_NAME#wk-}"
 [ -z "$SD_DEV" ]    && SD_DEV="mmcblk1"
 
 echo ""
@@ -38,7 +79,15 @@ echo "  静态IP:   $NODE_IP"
 echo "  主机名:   $HOSTNAME"
 echo "  SD设备:   /dev/${SD_DEV}"
 echo ""
-read -p "确认无误? [y/N] " CONFIRM
+
+if [ "$ASSUME_YES" = true ]; then
+    CONFIRM="y"
+elif [ -t 0 ]; then
+    read -r -p "确认无误? [y/N] " CONFIRM || true
+else
+    log_warn "非交互环境且未指定 --yes, 已取消"
+    exit 0
+fi
 [[ "$CONFIRM" =~ ^[Yy]$ ]] || { log_warn "已取消"; exit 0; }
 
 # ---- 2. 设置主机名 ----
@@ -172,9 +221,15 @@ EOF
     netplan apply 2>/dev/null || true
 fi
 
-# ---- 12. 配置 /etc/hosts ----
+# ---- 12. 配置 /etc/hosts (幂等: 避免重复追加) ----
 log_info "配置 hosts..."
-cat >> /etc/hosts << EOF
+while read -r host_ip host_alias; do
+    for alias in $host_alias; do
+        if ! grep -qE "[[:space:]]${alias}([[:space:]]|$)" /etc/hosts 2>/dev/null; then
+            echo "${host_ip}  ${alias}" >> /etc/hosts
+        fi
+    done
+done << EOF
 192.168.1.101  wk-edge-01 edge-01.lan
 192.168.1.102  wk-iot-02 iot-02.lan
 192.168.1.103  wk-storage-03 storage-03.lan

@@ -10,6 +10,10 @@ wireguard/*.key
 wireguard/*.privkey
 wireguard/peer-*/config/*.client.conf
 
+# WireGuard 密钥库与生成产物 (由 scripts/wireguard-setup.sh 生成, 含私钥)
+wireguard/
+node-*/wireguard/wg0.conf
+
 # Cloudflare 凭据
 cloudflared/credentials.json
 cloudflared/tunnel-token
@@ -54,3 +58,10 @@ Thumbs.db
 
 # Docker volumes
 docker-compose.override.yml
+
+# 验证脚本输出
+test_report.txt
+
+# Python 缓存
+__pycache__/
+*.pyc

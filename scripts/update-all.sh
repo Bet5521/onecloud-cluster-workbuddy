@@ -94,11 +94,15 @@ ENDSSH
 set -e
 apt update -qq
 # 获取可升级包, 排除 docker 相关
-UPGRADABLE=$(apt list --upgradable 2>/dev/null | grep -v docker | grep -v docker-ce)
-if [ -n "$UPGRADABLE" ]; then
+# 注意: apt list 首行是 "Listing... Done" 表头, 必须过滤掉,
+#       否则会被当作包名传给 apt upgrade 导致报错
+UPGRADABLE=$(apt list --upgradable 2>/dev/null | grep -vi docker | grep 'upgradable from' || true)
+# 只取包名: 以 / 分隔的第一段, 无 / 的行(表头)会被丢弃
+PKGS=$(echo "$UPGRADABLE" | awk -F'/' 'NF>1{print $1}' | tr '\n' ' ')
+if [ -n "${PKGS// /}" ]; then
     echo "  可升级包:"
     echo "$UPGRADABLE"
-    apt upgrade -y --no-install-recommends $(echo "$UPGRADABLE" | cut -d/ -f1)
+    apt upgrade -y --no-install-recommends $PKGS
 else
     echo "  无需更新"
 fi

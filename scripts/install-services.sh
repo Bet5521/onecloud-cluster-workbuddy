@@ -96,9 +96,14 @@ install_xiaomusic() {
 }
 
 install_migpt() {
-    log_info "安装 migpt 轻量代理..."
-    pip3 install flask flask-cors pyyaml requests 2>/dev/null || \
-        apt install -y python3-flask python3-pip
+    log_info "安装 migpt 轻量代理依赖..."
+    local pkgs="flask flask-cors pyyaml requests"
+    # Debian 12+ 默认启用 PEP 668 (externally-managed), 普通 pip3 install 会失败,
+    # 因此依次尝试: 普通安装 -> --break-system-packages -> apt 包
+    pip3 install $pkgs 2>/dev/null \
+        || pip3 install --break-system-packages $pkgs 2>/dev/null \
+        || apt-get install -y python3-flask python3-yaml python3-requests 2>/dev/null \
+        || { log_error "依赖安装失败, 请手动执行: pip3 install $pkgs"; return 1; }
     log_info "migpt proxy.py 已就绪, 使用 systemd 运行"
 }
 
@@ -107,25 +112,35 @@ install_verysync() {
     log_warn "访问 https://www.verysync.com/download 获取 Linux ARM 版本"
 }
 
+# 在指定节点目录启动 compose (兼容 docker compose / docker-compose)
+start_compose() {
+    local node=$1
+    local dir="${DATA_ROOT:-/mnt/sd/srv}/${node}"
+    if [ ! -d "$dir" ]; then
+        log_error "目录不存在: $dir (请先运行 ./scripts/deploy.sh 分发配置)"
+        return 1
+    fi
+    if [ ! -f "${dir}/docker-compose.yml" ]; then
+        log_error "未找到 docker-compose.yml: ${dir}"
+        return 1
+    fi
+    ( cd "$dir" && { docker compose up -d 2>/dev/null || docker-compose up -d; } )
+    docker ps --format "table {{.Names}}\t{{.Status}}"
+}
+
 start_edge() {
     log_info "启动 NODE-01 Docker 服务..."
-    cd /mnt/sd/srv/wk-edge-01
-    docker compose up -d
-    docker ps --format "table {{.Names}}\t{{.Status}}"
+    start_compose "wk-edge-01"
 }
 
 start_iot() {
     log_info "启动 NODE-02 Docker 服务..."
-    cd /mnt/sd/srv/wk-iot-02
-    docker compose up -d
-    docker ps --format "table {{.Names}}\t{{.Status}}"
+    start_compose "wk-iot-02"
 }
 
 start_storage() {
     log_info "启动 NODE-03 Docker 服务..."
-    cd /mnt/sd/srv/wk-storage-03
-    docker compose up -d
-    docker ps --format "table {{.Names}}\t{{.Status}}"
+    start_compose "wk-storage-03"
 }
 
 case "${1:-}" in
@@ -143,9 +158,10 @@ case "${1:-}" in
     iot)         start_iot ;;
     storage)     start_storage ;;
     all-docker)
-        start_edge
-        start_iot
-        start_storage
+        # 单个节点通常只跑其中一个, 任一失败不应中断其余
+        start_edge    || log_warn "NODE-01 启动失败"
+        start_iot     || log_warn "NODE-02 启动失败"
+        start_storage || log_warn "NODE-03 启动失败"
         ;;
     *)           usage ;;
 esac

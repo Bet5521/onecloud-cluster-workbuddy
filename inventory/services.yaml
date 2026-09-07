@@ -88,8 +88,7 @@ services:
     node: wk-iot-02
     container: true
     image: ghcr.io/adyoull/ha-armv7:latest
-    ports:
-      - "8123:8123"
+    # 使用 host 网络时不能声明 ports, 两者互斥
     network_mode: host
     privileged: true
     volumes:

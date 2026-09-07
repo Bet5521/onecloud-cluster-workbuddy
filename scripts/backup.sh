@@ -99,7 +99,12 @@ case "$BACKUP_TYPE" in
 
     node)
         NODE_NAME="${TARGET:-wk-edge-01}"
-        NODE_IP=$(grep "$NODE_NAME" "$SCRIPT_DIR/../inventory/nodes.yaml" 2>/dev/null | grep -oP 'ip: \K[0-9.]+' | head -1)
+        # 兼容简写: edge-01 -> wk-edge-01
+        case "$NODE_NAME" in
+            wk-*) : ;;
+            *)    NODE_NAME="wk-${NODE_NAME}" ;;
+        esac
+        NODE_IP=$(grep -A5 "$NODE_NAME" "$SCRIPT_DIR/../inventory/nodes.yaml" 2>/dev/null | grep -oP 'ip: \K[0-9.]+' | head -1 || true)
         # Fallback: 硬编码节点映射
         if [ -z "$NODE_IP" ]; then
             case "$NODE_NAME" in

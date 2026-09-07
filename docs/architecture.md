@@ -82,10 +82,10 @@ Docker 数据迁到 /mnt/sd/docker
 ```
 /mnt/sd/
 ├── docker/                    # Docker 数据目录
-├── srv/                       # 应用数据
-│   ├── edge-01/
-│   ├── iot-02/
-│   └── storage-03/
+├── srv/                       # 应用数据 (目录名与节点名一致)
+│   ├── wk-edge-01/
+│   ├── wk-iot-02/
+│   └── wk-storage-03/
 ├── backups/
 └── logs/
 ```

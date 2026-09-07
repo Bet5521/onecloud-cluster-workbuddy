@@ -35,7 +35,60 @@ EOF
 }
 
 BACKUP_ID="${1:-}"
-RESTORE_TARGET="${2:-all}"
+ARG2="${2:-all}"
+ARG3="${3:-}"
+
+# 节点名归一化: edge-01 -> wk-edge-01
+normalize_node() {
+    case "$1" in
+        wk-*) echo "$1" ;;
+        *)    echo "wk-$1" ;;
+    esac
+}
+
+# 兼容三种写法:
+#   $0 <备份ID> all|config
+#   $0 <备份ID> node    <节点名>
+#   $0 <备份ID> service <服务名>
+#   $0 <备份ID> <节点名或服务名>        (自动识别, 运维手册中的简写形式)
+RESTORE_TARGET=""
+RESTORE_NAME=""
+KNOWN_SERVICES="homeassistant piwigo typecho aria2 syncthing gitea"
+
+case "$ARG2" in
+    all|config)
+        RESTORE_TARGET="$ARG2"
+        ;;
+    node|service)
+        RESTORE_TARGET="$ARG2"
+        RESTORE_NAME="${ARG3:-}"
+        ;;
+    "")
+        RESTORE_TARGET="all"
+        ;;
+    *)
+        NODE_CANDIDATE=$(normalize_node "$ARG2")
+        case "$NODE_CANDIDATE" in
+            wk-edge-01|wk-iot-02|wk-storage-03)
+                RESTORE_TARGET="node"
+                RESTORE_NAME="$NODE_CANDIDATE"
+                ;;
+            *)
+                if echo " $KNOWN_SERVICES " | grep -q " $ARG2 "; then
+                    RESTORE_TARGET="service"
+                    RESTORE_NAME="$ARG2"
+                else
+                    log_error "无法识别的恢复目标: $ARG2"
+                    echo ""
+                    echo "  可选: all | config | node <节点名> | service <服务名>"
+                    echo "  已知节点: wk-edge-01 wk-iot-02 wk-storage-03 (可简写 edge-01)"
+                    echo "  已知服务: $KNOWN_SERVICES"
+                    exit 1
+                fi
+                ;;
+        esac
+        ;;
+esac
 
 if [ -z "$BACKUP_ID" ]; then
     usage
@@ -100,8 +153,8 @@ case "$RESTORE_TARGET" in
         ;;
 
     node)
-        NODE_NAME="${3:-wk-edge-01}"
-        NODE_IP=$(grep -A5 "$NODE_NAME" "$(dirname "$0")/../inventory/nodes.yaml" 2>/dev/null | grep -oP 'ip: \K[0-9.]+' | head -1)
+        NODE_NAME=$(normalize_node "${RESTORE_NAME:-wk-edge-01}")
+        NODE_IP=$(grep -A5 "$NODE_NAME" "$(dirname "$0")/../inventory/nodes.yaml" 2>/dev/null | grep -oP 'ip: \K[0-9.]+' | head -1 || true)
         # Fallback: 硬编码节点映射
         if [ -z "$NODE_IP" ]; then
             case "$NODE_NAME" in
@@ -114,14 +167,14 @@ case "$RESTORE_TARGET" in
 
         # 备份目录名: wk-edge-01 → edge-01, wk-iot-02 → iot-02, wk-storage-03 → storage-03
         NODE_SHORT="${NODE_NAME#wk-}"
-        BACKUP_SUBDIR=$(ls -d "${BACKUP_PATH}/${NODE_SHORT}"* "${BACKUP_PATH}/${NODE_NAME}"* 2>/dev/null | head -1)
+        BACKUP_SUBDIR=$(ls -d "${BACKUP_PATH}/${NODE_SHORT}"* "${BACKUP_PATH}/${NODE_NAME}"* 2>/dev/null | head -1 || true)
         [ -z "$BACKUP_SUBDIR" ] && { log_error "备份中未找到 $NODE_NAME"; exit 1; }
 
         restore_to_node "$NODE_IP" "$BACKUP_SUBDIR" "/mnt/sd/srv/${NODE_NAME}" "$NODE_NAME"
         ;;
 
     service)
-        SVC="${3:-homeassistant}"
+        SVC="${RESTORE_NAME:-homeassistant}"
         case "$SVC" in
             homeassistant)
                 restore_to_node 192.168.1.102 "${BACKUP_PATH}/homeassistant" "/mnt/sd/srv/wk-iot-02/homeassistant" "Home Assistant"

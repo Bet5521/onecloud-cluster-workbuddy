@@ -29,7 +29,7 @@ dmesg -T | tail -50
 
 ### 2.1 Docker Compose
 ```bash
-cd /mnt/sd/<node-name>/
+cd /mnt/sd/srv/<node-name>/    # 如 /mnt/sd/srv/wk-edge-01
 docker-compose up -d
 docker-compose down
 docker-compose restart <svc>
@@ -62,15 +62,30 @@ crontab -e
 
 ### 3.3 恢复
 ```bash
-./scripts/restore.sh 20260814_030000 homeassistant
+./scripts/restore.sh 20260814_030000 homeassistant     # 简写: 自动识别为服务
+./scripts/restore.sh 20260814_030000 iot-02            # 简写: 自动识别为节点
+./scripts/restore.sh 20260814_030000 service homeassistant
+./scripts/restore.sh 20260814_030000 node wk-iot-02
+./scripts/restore.sh latest all
 ```
+> 备份 ID 是 `backup.sh` 生成的时间戳目录名 (如 `20260814_030000`),
+> 位于各节点的 `/mnt/sd/backups/` 下, `latest` 表示最新一份。
 
 ## 4. 更新策略
 
 ### 4.1 Docker 镜像更新
 ```bash
-cd /mnt/sd/<node-name>/
-docker-compose pulldocker-compose up -d
+cd /mnt/sd/srv/<node-name>/
+docker-compose pull
+docker-compose up -d
+```
+
+也可直接批量更新所有节点:
+```bash
+./scripts/update-all.sh            # 仅更新镜像 (默认)
+./scripts/update-all.sh --system   # 仅更新系统包 (排除 Docker Engine)
+./scripts/update-all.sh --all      # 两者都更新
+./scripts/update-all.sh -n wk-iot-02
 ```
 
 ### 4.2 系统更新（注意不要升级 Docker 到 v29+）
@@ -90,6 +105,17 @@ watch -n 1 wg show
 ### 5.2 添加新节点
 ```bash
 ./scripts/wireguard-setup.sh add peer wk-backup-04 192.168.1.104 10.8.0.104
+./scripts/wireguard-setup.sh list          # 查看已登记节点
+./scripts/wireguard-setup.sh               # 重新生成全部节点 wg0.conf
+```
+> 生成的配置写入各 `node-<名称>/wireguard/wg0.conf` (含私钥, 已被 .gitignore 忽略),
+> 运行 `./scripts/deploy.sh` 即可分发到对应节点。
+
+### 5.3 部署配置到节点
+```bash
+cp node-<名称>/wireguard/wg0.conf /etc/wireguard/wg0.conf
+chmod 600 /etc/wireguard/wg0.conf
+systemctl enable --now wg-quick@wg0
 ```
 
 ## 6. 常见故障排查
@@ -144,6 +170,7 @@ fsck.ext4 /dev/mmcblk1p1
 ```bash
 git clone <your-repo> onecloud-cluster
 cd onecloud-cluster
-./scripts/bootstrap.sh --node wk-edge-01 --ip 192.168.1.101
-./scripts/restore.sh latest.tar.gz
+./scripts/bootstrap.sh --node wk-edge-01 --ip 192.168.1.101 --hostname edge-01 --yes
+./scripts/deploy.sh -n wk-edge-01
+./scripts/restore.sh latest all
 ```

@@ -1181,6 +1181,12 @@ main() {
         fi
     done
 
+    # 未选择任何服务时直接退出 (避免 set -u 下展开空数组出错)
+    if [ ${#selected_ids[@]} -eq 0 ]; then
+        log_warn "未选择任何服务, 退出"
+        exit 0
+    fi
+
     # 创建数据目录
     mkdir -p "$DATA_DIR"
 

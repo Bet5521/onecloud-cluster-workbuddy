@@ -30,9 +30,10 @@ usage() {
 用法: $0 [选项]
 
 选项:
-  -n, --node NAME    指定节点名称 (如 wk-edge-01)
+  -n, --node NAME    指定节点名称 (如 wk-edge-01), 可多次指定
   -a, --all          分发到所有节点 (默认)
   -t, --test         仅测试连接, 不分发
+  -e, --exec CMD     分发完成后在节点上远程执行命令
   -d, --dry-run      显示将要传输的内容, 不实际传输
   -h, --help         显示帮助
 
@@ -41,11 +42,13 @@ usage() {
   $0 -n wk-edge-01        # 仅分发到边缘网关
   $0 -t                   # 测试所有节点 SSH 连接
   $0 -d                   # 预览将传输的文件
+  $0 --exec "docker-compose up -d"   # 分发后启动所有服务
 EOF
 }
 
 DRY_RUN=""
 TEST_ONLY=false
+EXEC_CMD=""
 TARGET_NODES=()
 
 while [[ $# -gt 0 ]]; do
@@ -53,6 +56,7 @@ while [[ $# -gt 0 ]]; do
         -n|--node)  TARGET_NODES+=("$2"); shift 2 ;;
         -a|--all)   TARGET_NODES=(); shift ;;
         -t|--test)  TEST_ONLY=true; shift ;;
+        -e|--exec)  EXEC_CMD="$2"; shift 2 ;;
         -d|--dry-run) DRY_RUN="--dry-run"; shift ;;
         -h|--help)  usage; exit 0 ;;
         *) log_error "未知选项: $1"; usage; exit 1 ;;
@@ -107,16 +111,41 @@ deploy_node() {
         rsync -avz $DRY_RUN "${PROJECT_DIR}/inventory/" "root@${NODE_IP}:/mnt/sd/inventory/"
     fi
 
+    # 远程执行命令 (--exec), 在节点服务目录下运行
+    if [ -n "$EXEC_CMD" ] && [ "$DRY_RUN" != "--dry-run" ]; then
+        log_info "在 $NODE_NAME 执行: $EXEC_CMD"
+        if ssh "root@${NODE_IP}" "cd ${REMOTE_BASE} 2>/dev/null && ${EXEC_CMD}"; then
+            log_info "$NODE_NAME 命令执行成功"
+        else
+            log_error "$NODE_NAME 命令执行失败: $EXEC_CMD"
+            return 1
+        fi
+    fi
+
     log_info "$NODE_NAME 完成 ✓"
     echo ""
 }
 
-if [ ${#TARGET_NODES[@]} -eq 0 ]; then
-    TARGET_NODES=("${NODES[@]}")
-fi
+# 判断节点是否被 -n/--node 选中 (未指定则全部选中)
+node_selected() {
+    local name=$1
+    if [ ${#TARGET_NODES[@]} -eq 0 ]; then
+        return 0
+    fi
+    local t
+    for t in "${TARGET_NODES[@]}"; do
+        [ "$t" = "$name" ] && return 0
+    done
+    # 兼容短名: edge-01 -> wk-edge-01
+    for t in "${TARGET_NODES[@]}"; do
+        [ "$t" = "${name#wk-}" ] && return 0
+    done
+    return 1
+}
 
-for NODE in "${TARGET_NODES[@]}"; do
+for NODE in "${NODES[@]}"; do
     IFS='|' read -r NAME IP ROLE <<< "$NODE"
+    node_selected "$NAME" || continue
     deploy_node "$NAME" "$IP" "$ROLE" || true
 done
 
