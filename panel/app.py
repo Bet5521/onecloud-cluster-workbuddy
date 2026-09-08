@@ -24,7 +24,7 @@ PANEL_PASS = os.environ.get("PANEL_PASS", "changeme")
 
 # 白名单命令前缀（只允许执行这些开头的命令）
 ALLOWED_CMD_PREFIXES = (
-    "free", "df", "ls ", "cat /proc", "uptime", "hostname",
+    "free", "df", "ls", "cat /proc", "uptime", "hostname",
     "docker ps", "docker stats", "docker inspect", "docker logs",
     "systemctl status", "systemctl is-active",
     "ip a", "ip addr", "ss -", "netstat",

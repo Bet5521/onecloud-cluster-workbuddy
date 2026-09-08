@@ -1428,6 +1428,65 @@ def test_safety_regression():
             log_fail(f"面板白名单校验失败: {e}")
 
 
+def test_panel_frontend_contract():
+    """测试 15: 面板前端与后端契约 (前端调用必须真实存在, 且方法/参数匹配)"""
+    print("\n" + "="*60)
+    print("测试 15: 面板前端与后端契约")
+    print("="*60)
+
+    js = PANEL_DIR / "static" / "js" / "app.js"
+    app = PANEL_DIR / "app.py"
+    if not js.exists() or not app.exists():
+        log_fail("面板前端或后端文件缺失")
+        return
+
+    js_src = js.read_text(encoding="utf-8")
+    py_src = app.read_text(encoding="utf-8")
+
+    # 1) 前端引用的 API 端点必须在后端有定义
+    endpoints = sorted(set(re.findall(r'fetch\(\s*[`"\'](/api/[a-zA-Z_/]*)', js_src)))
+    missing = [ep for ep in endpoints if ep.rstrip("/") not in py_src]
+    if missing:
+        log_fail(f"前端调用了后端不存在的接口: {missing}")
+    else:
+        log_pass(f"前端引用的 {len(endpoints)} 个 API 端点后端均已定义")
+
+    # 2) 服务操作必须是 POST (后端 methods=["POST"], 用 GET 会 405)
+    sidx = js_src.find("async function serviceAction")
+    sbody = js_src[sidx:js_src.find("async function nodeAction")] if sidx >= 0 else ""
+    if 'method: "POST"' in sbody:
+        log_pass('serviceAction 使用 POST (与后端 methods=["POST"] 匹配)')
+    else:
+        log_fail("serviceAction 未使用 POST", "后端只接受 POST, 否则启停/重启/日志全部 405")
+
+    # 3) 集群 docker_* 操作必须真正下发请求, 不能只弹提示
+    cidx = js_src.find("async function clusterAction")
+    cbody = js_src[cidx:js_src.find("async function execCmd")] if cidx >= 0 else ""
+    if "/api/node/" in cbody and "JSON.stringify({action})" in cbody:
+        log_pass("集群 docker_up/down/pull 会对各节点真实下发请求")
+    else:
+        log_fail("集群批量操作只弹提示未调用 API", "按钮点了没有任何实际效果")
+
+    # 4) 日志操作必须把内容展示出来, 而不是只提示成功
+    if '"logs"' in sbody and "execOutput" in sbody:
+        log_pass("服务日志操作会输出日志内容 (而非只提示成功)")
+    else:
+        log_fail("日志操作未展示输出", "点击日志按钮看不到任何内容")
+
+    # 5) 白名单必须允许裸 ls (曾写成 'ls ' 带尾空格, 导致 ls 被拒)
+    try:
+        seg = py_src[py_src.index("ALLOWED_CMD_PREFIXES"):py_src.index("def load_config")]
+        ns = {}
+        exec(seg, ns)
+        safe = ns["is_command_safe"]
+        if safe("ls") and safe("ls /mnt/sd") and not safe("ls && rm -rf /"):
+            log_pass("命令白名单允许裸 ls 且仍拦截拼接命令")
+        else:
+            log_fail("白名单对 ls 的判定不符合预期")
+    except Exception as e:
+        log_fail(f"白名单 ls 校验失败: {e}")
+
+
 # ============ 主程序 ============
 def main():
     print("=" * 60)
@@ -1451,6 +1510,7 @@ def main():
         ("文档化 CLI 接口契约", test_cli_contract),
         ("节点 IP 自定义与主机名", test_ip_customizable),
         ("安全与健壮性回归", test_safety_regression),
+        ("面板前后端契约", test_panel_frontend_contract),
     ]
     
     for test_name, test_func in tests:

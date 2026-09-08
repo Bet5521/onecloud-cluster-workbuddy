@@ -2,6 +2,7 @@
 
 let autoRefreshTimer = null;
 const REFRESH_INTERVAL = 10000;
+let currentNodes = [];
 
 async function refresh() {
     try {
@@ -15,6 +16,7 @@ async function refresh() {
 }
 
 function renderStatus(data) {
+    currentNodes = data.nodes || [];
     document.getElementById("clusterName").textContent = data.cluster_name;
     document.getElementById("updateTime").textContent = `更新: ${data.timestamp}`;
 
@@ -118,7 +120,17 @@ async function serviceAction(node, svc, action) {
     });
     const data = await res.json();
     refresh();
-    if (data.output || data.error) {
+    const output = Array.isArray(data.output) ? data.output.join("\n") : (data.output || "");
+    if (action === "logs") {
+        const el = document.getElementById("execOutput");
+        if (el) {
+            el.textContent = (output || "(无日志输出)") + (data.error ? "\n[错误] " + data.error : "");
+            if (el.scrollIntoView) el.scrollIntoView({behavior: "smooth", block: "nearest"});
+        }
+        showToast(`[日志] ${svc}: 已输出到下方命令输出区`, 3000);
+        return;
+    }
+    if (output || data.error) {
         showToast(`[${action}] ${svc}: ${data.ok ? '成功' : '失败'}`);
     }
 }
@@ -163,6 +175,36 @@ async function clusterAction(action) {
     }
     if (action === "update") {
         showToast("更新操作需在节点上执行: ./scripts/update-all.sh");
+        return;
+    }
+    // docker_up / docker_down / docker_pull: 对所有节点逐个执行
+    if (action.indexOf("docker_") === 0) {
+        if (action === "docker_down") {
+            if (!confirm("确定要停止所有节点上的全部容器吗?")) return;
+        }
+        let nodes = currentNodes || [];
+        if (!nodes.length) {
+            const res = await fetch("/api/status").catch(() => null);
+            const d = res ? await res.json().catch(() => ({})) : {};
+            nodes = d.nodes || [];
+        }
+        if (!nodes.length) {
+            showToast("未获取到节点列表, 无法执行集群操作");
+            return;
+        }
+        showToast(`正在对 ${nodes.length} 个节点执行 ${action}...`);
+        const results = [];
+        for (const node of nodes) {
+            const res = await fetch(`/api/node/${node.name}/action`, {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({action})
+            }).catch(() => null);
+            const d = res ? await res.json().catch(() => ({})) : {};
+            results.push(`${node.display_name || node.name}: ${d.ok ? "✓" : "✗"}`);
+        }
+        showToast(`${action} 执行完毕\n` + results.join("\n"), 5000);
+        refresh();
         return;
     }
     showToast(`集群操作 '${action}' 已触发`);
