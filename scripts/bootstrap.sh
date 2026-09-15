@@ -67,20 +67,20 @@ detect_current_network() {
     CUR_IP=""; CUR_PREFIX=""; CUR_GW=""
     local _cidr
     if command -v ip >/dev/null 2>&1; then
-        _cidr="$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4; exit}')"
+        _cidr="$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4; exit}')" || true
         if [ -n "$_cidr" ]; then
             CUR_IP="${_cidr%%/*}"
             CUR_PREFIX="${_cidr##*/}"
         fi
         CUR_GW="$(ip route show default 2>/dev/null \
-                  | awk '{for (i = 1; i <= NF; i++) if ($i == "via") {print $(i+1); exit}}')"
+                  | awk '{for (i = 1; i <= NF; i++) if ($i == "via") {print $(i+1); exit}}')" || true
     fi
     # 兜底: net-tools 的 route
     if [ -z "$CUR_GW" ] && command -v route >/dev/null 2>&1; then
-        CUR_GW="$(route -n 2>/dev/null | awk '$1 == "0.0.0.0" {print $2; exit}')"
+        CUR_GW="$(route -n 2>/dev/null | awk '$1 == "0.0.0.0" {print $2; exit}')" || true
     fi
     if [ -z "$CUR_IP" ] && command -v hostname >/dev/null 2>&1; then
-        CUR_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+        CUR_IP="$(hostname -I 2>/dev/null | awk '{print $1}')" || true
     fi
     case "$CUR_PREFIX" in
         ''|*[!0-9]*) CUR_PREFIX="" ;;
@@ -94,6 +94,85 @@ detect_current_network() {
     esac
 }
 
+# ------------------------------------------------------------
+# 探测可移动存储 (SD 卡 / U 盘): 结果写入 SD_CANDIDATES 数组
+# 判据 (任一满足即视为候选): lsblk removable=1 / 传输层 usb /
+# 非根分区的 mmcblk 设备 (玩客云 eMMC 常为 mmcblk0, SD 为 mmcblk1)
+# ------------------------------------------------------------
+DETECTED_SD_REASON=""
+detect_sd_cards() {
+    SD_CANDIDATES=()
+    DETECTED_SD_REASON=""
+    local _root_src _root_dev _name _rm _type _tran _d
+    _root_src="$(findmnt -n -o SOURCE / 2>/dev/null | awk '{print $1}')" || true
+    _root_dev="$(basename "${_root_src:-}" 2>/dev/null || true)"
+    # 分区后缀处理: mmcblk0p1 -> mmcblk0 ; sda1 -> sda
+    case "$_root_dev" in
+        mmcblk*p[0-9]*)     _root_dev="${_root_dev%p[0-9]*}" ;;
+        [shv]d[a-z][0-9]*)  _root_dev="${_root_dev%[0-9]}" ;;
+    esac
+
+    # 第一轮: 高置信度 (可移动标记 / USB 通道)
+    if command -v lsblk >/dev/null 2>&1; then
+        while read -r _name _rm _type _tran; do
+            [ -n "$_name" ] || continue
+            [ "$_type" = "disk" ] || continue
+            case "$_name" in
+                mmcblk*|sd[a-z]) ;;
+                *) continue ;;
+            esac
+            if [ "$_name" = "$_root_dev" ]; then continue; fi
+            if [ "$_rm" = "1" ]; then
+                SD_CANDIDATES+=("$_name"); DETECTED_SD_REASON="可移动设备"
+            elif [ "$_tran" = "usb" ]; then
+                SD_CANDIDATES+=("$_name"); DETECTED_SD_REASON="USB 存储"
+            fi
+        done < <(lsblk -dno NAME,RM,TYPE,TRAN 2>/dev/null || true)
+    fi
+
+    # 第二轮: /sys/block 兜底 (无 lsblk 的精简系统)
+    if [ "${#SD_CANDIDATES[@]}" -eq 0 ] && [ -d /sys/block ]; then
+        for _d in /sys/block/*; do
+            [ -d "$_d" ] || continue
+            _name="$(basename "$_d")"
+            case "$_name" in
+                mmcblk*|sd[a-z]) ;;
+                *) continue ;;
+            esac
+            if [ "$_name" = "$_root_dev" ]; then continue; fi
+            if [ "$(cat "$_d/removable" 2>/dev/null || echo 0)" = "1" ]; then
+                SD_CANDIDATES+=("$_name"); DETECTED_SD_REASON="可移动设备"
+            fi
+        done
+    fi
+
+    # 第三轮: 低置信度启发式 —— 非根分区的 mmcblk 视为 SD
+    # (玩客云 eMMC 一般是 mmcblk0, 插卡为 mmcblk1; 仅在无更可靠线索时启用)
+    if [ "${#SD_CANDIDATES[@]}" -eq 0 ] && [ -d /sys/block ]; then
+        for _d in /sys/block/*; do
+            [ -d "$_d" ] || continue
+            _name="$(basename "$_d")"
+            case "$_name" in
+                mmcblk*) ;;
+                *) continue ;;
+            esac
+            if [ "$_name" = "$_root_dev" ]; then continue; fi
+            SD_CANDIDATES+=("$_name"); DETECTED_SD_REASON="非系统 eMMC/SD (启发式)"
+        done
+    fi
+}
+
+# ping 可达性探测 (兼容 Linux/Windows 两套参数)
+ping_ok() {
+    local _target="$1" _count="${2:-1}"
+    [ -n "$_target" ] || return 1
+    command -v ping >/dev/null 2>&1 || return 1
+    if ping -c "$_count" -W 2 "$_target" >/dev/null 2>&1; then
+        return 0
+    fi
+    ping -n "$_count" -w 2000 "$_target" >/dev/null 2>&1
+}
+
 usage() {
     cat << EOF
 用法: $0 [选项]
@@ -102,26 +181,31 @@ usage() {
   -n, --node NAME       节点名称 (如 wk-edge-01)
   -i, --ip IP           静态 IP (清单中已登记的节点可省略)
   -H, --hostname NAME   主机名 (默认: 清单值, 或节点名去掉 wk- 前缀)
-  -g, --gateway IP      网关 (默认: 清单 network.gateway)
+  -g, --gateway IP      网关 (默认: 由最终 IP 推导)
   -D, --dns IP          DNS (默认: 清单 network.dns, 多个用逗号分隔)
-  -s, --sd DEV          SD 卡设备名 (如 mmcblk1, 不含 /dev/)
+  -s, --sd DEV          SD 卡设备名 (如 mmcblk1, 不含 /dev/; 默认自动探测)
+  -m, --sd-mount DIR    SD 卡挂载点 (默认 /mnt/sd)
+      --no-sd           完全跳过 SD 卡挂载与 Docker 数据迁移
+      --no-sd-automount 挂载 SD 卡但不写入 fstab (不自动挂载)
   -y, --yes             跳过交互确认 (非交互/自动化场景必填)
       --dry-run         只打印将要应用的配置, 不修改系统 (可单独使用)
-      --no-detect       禁用本机网络探测 (不自动获取当前 IP/网关)
+      --no-detect       不自动采用本机探测到的 IP/网关 (仍会探测并用于风险提示)
   -h, --help            显示帮助
 
-未通过参数提供的选项, 会在终端可用时以交互方式询问。
-已在 inventory/nodes.yaml 登记的节点, IP/主机名/网关/DNS 自动取清单值。
+参数与询问的关系:
+  传入的参数一律直接生效, 不会被询问覆盖;
+  只有"未提供且无法从清单/探测推断"的项, 才在终端可用时交互询问。
+  非交互环境 (cron/CI) 请配合 --yes, 否则缺失项会直接报错而不是干等输入。
 
 网络取值优先级:
-  IP     命令行 --ip  >  本机探测(询问)  >  清单
-  网关   命令行 --gateway  >  由最终 IP 自动推导  >  本机探测  >  清单
+  IP     命令行 --ip  >  本机探测(询问/--yes 采用)  >  清单
+  网关   命令行 --gateway  >  由最终 IP 推导  >  本机探测  >  清单
 
-关键行为:
-  * 指定 --ip 后, 会自动按同网段推导网关 (网络地址+1);
-    与现网关不在同一网段时提示并询问是否调整, --yes 下自动调整。
-  * 未指定 --ip 时, 先探测本机当前 IP/网关, 询问是否直接采用;
-    --yes 下自动采用。用 --no-detect 可关闭该行为。
+执行前的安全检查 (防止配完静态 IP 后失联):
+  * 新 IP 与本机当前 IP 不同网段 -> 告警并要求确认
+  * 新 IP 已被占用 (ping 有响应) -> 告警并要求确认
+  * 网关 ping 不可达 -> 告警并要求确认
+  --yes 下仅告警后继续; --dry-run 下只提示不改动。
 
 环境变量 (优先级最高):
   ONECLOUD_WK_EDGE_01_IP / _HOSTNAME / _WG_IP
@@ -131,6 +215,7 @@ usage() {
   $0 --node wk-edge-01 --yes                                  # 全部取清单值
   $0 --node wk-edge-01 --ip 10.0.0.5 --hostname edge-01 --yes  # 覆盖 IP 与主机名
   $0 --node wk-new --ip 10.0.0.9 --hostname new --gateway 10.0.0.1 --yes
+  $0                                                          # 无参数: 全交互询问
 EOF
 }
 
@@ -140,15 +225,42 @@ echo "  OneCloud Cluster - Node Bootstrap"
 echo "=========================================="
 echo ""
 
+# 帮助优先: 直接输出用法, 不做任何探测
+for _a in "$@"; do
+    case "$_a" in
+        -h|--help) usage; exit 0 ;;
+    esac
+done
+
+# ============================================================
+# 0. 立即探测本机现状 (IP / 网关 / 可移动存储)
+#    放在最前, 供后续网段比对与风险提示使用; 只读, 不改系统
+# ============================================================
+detect_current_network
+if [ -n "$CUR_IP" ] || [ -n "$CUR_GW" ]; then
+    log_info "本机当前网络: IP=${CUR_IP:-未获取}${CUR_PREFIX:+/$CUR_PREFIX} 网关=${CUR_GW:-未获取}"
+else
+    log_warn "未能探测到本机当前 IP/网关 (缺少 ip 命令或网络未就绪)"
+fi
+detect_sd_cards
+if [ "${#SD_CANDIDATES[@]}" -gt 0 ]; then
+    log_info "检测到可移动存储: /dev/${SD_CANDIDATES[*]} (${DETECTED_SD_REASON})"
+else
+    log_info "未检测到 SD 卡 / USB 存储"
+fi
+
 NODE_NAME=""
 NODE_IP=""
 HOSTNAME=""
 SD_DEV=""
 GATEWAY=""
 DNS_SERVERS=""
+SD_MOUNT="/mnt/sd"
 ASSUME_YES=false
 NO_DETECT=false
 DRY_RUN=false
+NO_SD=false
+NO_SD_AUTOMOUNT=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -158,6 +270,9 @@ while [[ $# -gt 0 ]]; do
         -g|--gateway)   GATEWAY="$2";      shift 2 ;;
         -D|--dns)       DNS_SERVERS="$2";  shift 2 ;;
         -s|--sd)        SD_DEV="$2";       shift 2 ;;
+        -m|--sd-mount)  SD_MOUNT="$2";     shift 2 ;;
+        --no-sd)        NO_SD=true;        shift ;;
+        --no-sd-automount) NO_SD_AUTOMOUNT=true; shift ;;
         -y|--yes)       ASSUME_YES=true;   shift ;;
         --dry-run)      DRY_RUN=true;      shift ;;
         --no-detect)    NO_DETECT=true;    shift ;;
@@ -166,10 +281,31 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# 交互判定: 默认看是否有 TTY; 自动化场景可用 ONECLOUD_BOOTSTRAP_TTY=1/0 强制指定
+if [ -n "${ONECLOUD_BOOTSTRAP_TTY:-}" ]; then
+    if [ "${ONECLOUD_BOOTSTRAP_TTY}" = "1" ]; then
+        INTERACTIVE=true
+    else
+        INTERACTIVE=false
+    fi
+elif [ -t 0 ]; then
+    INTERACTIVE=true
+else
+    INTERACTIVE=false
+fi
+# 参数已给定或 --yes 时不必交互
+if [ "$ASSUME_YES" = true ] || [ "$DRY_RUN" = true ]; then
+    INTERACTIVE=false
+fi
+
+DETECT_IP="$CUR_IP"; DETECT_GW="$CUR_GW"; DETECT_PREFIX="$CUR_PREFIX"
+
 # ---- 1a. 用清单填充未显式给出的参数 (清单只作为默认值, 命令行优先) ----
 INVENTORY_HIT=false
 IP_SOURCE="命令行"
+[ -z "$NODE_IP" ] && IP_SOURCE=""
 GW_SOURCE="命令行"
+[ -z "$GATEWAY" ] && GW_SOURCE=""
 if [ "$HAVE_INVENTORY" = true ] && [ -n "$NODE_NAME" ]; then
     if RESOLVED="$(node_resolve "$NODE_NAME" 2>/dev/null)"; then
         INVENTORY_HIT=true
@@ -197,28 +333,6 @@ if [ -z "$DNS_SERVERS" ]; then
     DNS_SERVERS="${ONECLOUD_DNS:-${NET_DNS:-}}"
 fi
 
-# ---- 1b. 探测本机当前网络 (IP / 前缀 / 网关) ----
-# 交互判定: 默认看是否有 TTY; 自动化场景可用 ONECLOUD_BOOTSTRAP_TTY=1/0 强制指定
-if [ -n "${ONECLOUD_BOOTSTRAP_TTY:-}" ]; then
-    if [ "${ONECLOUD_BOOTSTRAP_TTY}" = "1" ]; then
-        INTERACTIVE=true
-    else
-        INTERACTIVE=false
-    fi
-elif [ -t 0 ]; then
-    INTERACTIVE=true
-else
-    INTERACTIVE=false
-fi
-DETECT_IP=""; DETECT_GW=""; DETECT_PREFIX=""
-if [ "$NO_DETECT" != true ]; then
-    detect_current_network
-    DETECT_IP="$CUR_IP"; DETECT_GW="$CUR_GW"; DETECT_PREFIX="$CUR_PREFIX"
-    if [ -n "$DETECT_IP" ] || [ -n "$DETECT_GW" ]; then
-        log_info "探测到本机当前网络: IP=${DETECT_IP:-未获取}/${DETECT_PREFIX:-?} 网关=${DETECT_GW:-未获取}"
-    fi
-fi
-
 # 前缀: 本机探测 > 清单 > 24
 if [ -n "$DETECT_PREFIX" ]; then
     LAN_PREFIX="$DETECT_PREFIX"
@@ -226,8 +340,8 @@ else
     LAN_PREFIX="${NET_LAN_PREFIX:-24}"
 fi
 
-# ---- 1c. 未指定 IP 时: 询问是否直接采用本机当前 IP / 网关 ----
-if [ -z "$NODE_IP" ] && [ -n "$DETECT_IP" ]; then
+# ---- 1b. 未指定 IP 时: 询问是否直接采用本机当前 IP / 网关 ----
+if [ -z "$NODE_IP" ] && [ -n "$DETECT_IP" ] && [ "$NO_DETECT" != true ]; then
     _take_ip=""
     if [ "$ASSUME_YES" = true ]; then
         _take_ip="y"
@@ -257,7 +371,7 @@ if [ -z "$NODE_IP" ] && [ -n "$DETECT_IP" ]; then
     fi
 fi
 
-# 交互补全: 仅在有终端时询问仍未提供的参数
+# ---- 1c. 交互补全: 只询问仍未提供的项 (按依赖顺序) ----
 if [ "$INTERACTIVE" = true ]; then
     if [ -z "$NODE_NAME" ]; then
         read -r -p "请输入节点名称 (如 wk-edge-01): " NODE_NAME || true
@@ -272,8 +386,8 @@ if [ "$INTERACTIVE" = true ]; then
     if [ -z "$HOSTNAME" ]; then
         read -r -p "请输入主机名 (如 edge-01): " HOSTNAME || true
     fi
-    if [ -z "$SD_DEV" ]; then
-        read -r -p "请输入 SD 卡设备名 (如 mmcblk1): " SD_DEV || true
+    if [ -z "$DNS_SERVERS" ]; then
+        read -r -p "请输入 DNS (默认 1.1.1.1, 多个用逗号分隔): " DNS_SERVERS || true
     fi
 fi
 
@@ -283,9 +397,6 @@ if [ -z "$NODE_NAME" ]; then
 fi
 if [ -z "$HOSTNAME" ]; then
     HOSTNAME="${NODE_NAME#wk-}"
-fi
-if [ -z "$SD_DEV" ]; then
-    SD_DEV="mmcblk1"
 fi
 if [ -z "$DNS_SERVERS" ]; then
     DNS_SERVERS="1.1.1.1"
@@ -341,17 +452,151 @@ if [ "$GW_SOURCE" != "命令行" ]; then
     fi
 fi
 
+# 交互补全网关 (推导失败且未提供时才问)
+if [ -z "$GATEWAY" ] && [ "$INTERACTIVE" = true ]; then
+    read -r -p "请输入网关 (如 192.168.1.1): " GATEWAY || true
+    if [ -n "$GATEWAY" ]; then GW_SOURCE="交互输入"; fi
+fi
+
 if [ -z "$GATEWAY" ]; then
     log_error "未指定网关 (--gateway 或 ONECLOUD_GATEWAY 或清单 network.gateway)"
     exit 1
 fi
+# 来源标注必须有值, 否则配置确认页会显示空来源
+if [ -z "$IP_SOURCE" ]; then IP_SOURCE="默认"; fi
+if [ -z "$GW_SOURCE" ]; then GW_SOURCE="默认"; fi
 
-# ---- 1f. 最终一致性检查: 网关与 IP 不同网段时明确告警 ----
+# ---- 1f. SD 卡决策: 无卡则跳过; 有卡则询问挂载/挂载点/自动挂载 ----
+SD_ENABLE=false
+SD_AUTOMOUNT=true
+SD_ASKED=false
+
+if [ "$NO_SD" = true ]; then
+    log_info "已指定 --no-sd: 跳过 SD 卡挂载与 Docker 数据迁移"
+elif [ -n "$SD_DEV" ]; then
+    if [ -b "/dev/${SD_DEV}" ]; then
+        SD_ENABLE=true
+    else
+        log_warn "--sd 指定的设备 /dev/${SD_DEV} 不存在"
+    fi
+fi
+
+if [ "$NO_SD" != true ] && [ -n "$SD_DEV" ] && [ "$SD_ENABLE" = false ]; then
+    log_warn "回退为自动探测 SD 卡"
+    SD_DEV=""
+fi
+
+if [ "$NO_SD" != true ] && [ -z "$SD_DEV" ]; then
+    detect_sd_cards
+    case "${#SD_CANDIDATES[@]}" in
+        0)
+            log_warn "未检测到 SD 卡 / USB 存储: 跳过挂载与 Docker 数据迁移"
+            ;;
+        1)
+            SD_DEV="${SD_CANDIDATES[0]}"
+            SD_ENABLE=true
+            log_info "检测到 SD 卡设备: /dev/${SD_DEV}"
+            ;;
+        *)
+            if [ "$INTERACTIVE" = true ]; then
+                echo "检测到多个可移动存储:"
+                _i=1
+                for _c in "${SD_CANDIDATES[@]}"; do
+                    echo "  ${_i}) /dev/${_c}"
+                    _i=$((_i + 1))
+                done
+                read -r -p "请选择要挂载的设备编号 (回车跳过): " _sdc || true
+                case "$_sdc" in
+                    ''|*[!0-9]*) log_info "未选择, 跳过 SD 卡挂载" ;;
+                    *)
+                        if [ "$_sdc" -ge 1 ] && [ "$_sdc" -le "${#SD_CANDIDATES[@]}" ]; then
+                            SD_DEV="${SD_CANDIDATES[$((_sdc - 1))]}"
+                            SD_ENABLE=true
+                        else
+                            log_warn "编号超出范围, 跳过 SD 卡挂载"
+                        fi
+                        ;;
+                esac
+            else
+                SD_DEV="${SD_CANDIDATES[0]}"
+                SD_ENABLE=true
+                log_warn "检测到多个可移动存储, 默认使用 /dev/${SD_DEV}"
+            fi
+            ;;
+    esac
+fi
+
+# 有卡: 询问是否挂载 / 挂载点 / 是否自动挂载
+if [ "$SD_ENABLE" = true ]; then
+    if [ "$INTERACTIVE" = true ]; then
+        SD_ASKED=true
+        read -r -p "是否挂载 SD 卡 /dev/${SD_DEV}? [Y/n] " _do_mount || true
+        if [[ "$_do_mount" =~ ^[Nn]$ ]]; then
+            SD_ENABLE=false
+            log_info "已选择不挂载 SD 卡"
+        else
+            read -r -p "挂载点 [${SD_MOUNT}]: " _mp || true
+            if [ -n "$_mp" ]; then SD_MOUNT="$_mp"; fi
+            if [ "$NO_SD_AUTOMOUNT" = true ]; then
+                SD_AUTOMOUNT=false
+            else
+                read -r -p "是否写入 /etc/fstab 开机自动挂载? [Y/n] " _auto || true
+                if [[ "$_auto" =~ ^[Nn]$ ]]; then SD_AUTOMOUNT=false; fi
+            fi
+        fi
+    fi
+fi
+
+if [ "$SD_ENABLE" = true ] && [ "$NO_SD_AUTOMOUNT" = true ]; then
+    SD_AUTOMOUNT=false
+fi
+
+if [ "$SD_ENABLE" = true ] && [ "$SD_MOUNT" != "/mnt/sd" ]; then
+    log_warn "挂载点 ${SD_MOUNT} 与集群脚本约定的 /mnt/sd 不一致"
+    log_warn "      deploy.sh / backup.sh / setup.sh 等默认读写 /mnt/sd, 建议保持默认"
+fi
+
+# ---- 1g. 变更前安全检查: 网段 / IP 冲突 / 网关连通性 ----
+NET_RISK=false
+NET_RISK_REASONS=""
+add_risk() {
+    NET_RISK=true
+    NET_RISK_REASONS="${NET_RISK_REASONS}  - $1
+"
+}
+
+if [ -n "$DETECT_IP" ] || [ -n "$DETECT_GW" ]; then
+    # 1) 新 IP 与本机当前 IP 是否同网段
+    if [ -n "$DETECT_IP" ] && [ "$DETECT_IP" != "$NODE_IP" ]; then
+        _cur_net="$(ip_net_addr "$DETECT_IP" "$LAN_PREFIX" 2>/dev/null || true)"
+        _new_net="$(ip_net_addr "$NODE_IP" "$LAN_PREFIX" 2>/dev/null || true)"
+        if [ -n "$_cur_net" ] && [ -n "$_new_net" ] && [ "$_cur_net" != "$_new_net" ]; then
+            add_risk "新 IP ${NODE_IP}/${LAN_PREFIX} 与本机当前 IP ${DETECT_IP} 不在同一网段 (${_new_net} vs ${_cur_net})"
+        fi
+    fi
+    # 2) 目标 IP 是否已被占用 (换 IP 时才检测, 避免 ping 到自己)
+    if [ "$NODE_IP" != "$DETECT_IP" ] && ping_ok "$NODE_IP"; then
+        add_risk "IP ${NODE_IP} 已被占用 (ping 有响应), 继续配置会造成 IP 冲突"
+    fi
+    # 3) 网关是否可达
+    if [ -n "$GATEWAY" ] && ! ping_ok "$GATEWAY"; then
+        add_risk "网关 ${GATEWAY} 当前 ping 不可达"
+    fi
+fi
+
+# ---- 1h. 最终一致性检查: 网关与 IP 不同网段时明确告警 ----
 FINAL_IP_NET="$(ip_net_addr "$NODE_IP" "$LAN_PREFIX" 2>/dev/null || true)"
 FINAL_GW_NET="$(ip_net_addr "$GATEWAY" "$LAN_PREFIX" 2>/dev/null || true)"
 if [ -n "$FINAL_IP_NET" ] && [ -n "$FINAL_GW_NET" ] && [ "$FINAL_IP_NET" != "$FINAL_GW_NET" ]; then
-    log_warn "注意: 网关 ${GATEWAY} 与 IP ${NODE_IP} 不在同一网段 (/${LAN_PREFIX})"
-    log_warn "      网关不可直达时, 配置静态 IP 后将无法联网; 确认无误可忽略"
+    add_risk "网关 ${GATEWAY} 与 IP ${NODE_IP} 不在同一网段 (/${LAN_PREFIX})"
+fi
+
+if [ "$NET_RISK" = true ]; then
+    echo ""
+    log_warn "网络变更风险提示 (配置静态 IP 后可能无法联网):"
+    printf '%s' "$NET_RISK_REASONS"
+    log_warn "如确为跨网段迁移, 请确认目标网段有对应网关/路由后再执行"
+    echo ""
 fi
 
 # DNS 支持逗号分隔多个
@@ -369,7 +614,12 @@ echo "  静态IP:   $NODE_IP/${LAN_PREFIX}    (来源: ${IP_SOURCE})"
 echo "  主机名:   $HOSTNAME"
 echo "  网关:     $GATEWAY    (来源: ${GW_SOURCE})"
 echo "  DNS:      $DNS_LIST"
-echo "  SD设备:   /dev/${SD_DEV}"
+if [ "$SD_ENABLE" = true ]; then
+    echo "  SD设备:   /dev/${SD_DEV}"
+    echo "  挂载点:   ${SD_MOUNT}    (自动挂载: $([ "$SD_AUTOMOUNT" = true ] && echo 是 || echo 否))"
+else
+    echo "  SD设备:   未启用 (跳过挂载与 Docker 数据迁移)"
+fi
 if [ -n "$DETECT_IP" ] || [ -n "$DETECT_GW" ]; then
     echo "  本机现状: IP=${DETECT_IP:-未获取} 网关=${DETECT_GW:-未获取}"
 fi
@@ -381,14 +631,33 @@ if [ "$DRY_RUN" = true ]; then
     echo ""
     echo "  将写入: /etc/network/interfaces 或 /etc/netplan/99-static.yaml"
     echo "  将设置: hostname=${HOSTNAME}, address=${NODE_IP}/${LAN_PREFIX}, gateway=${GATEWAY}"
+    if [ "$SD_ENABLE" = true ]; then
+        if [ "$SD_AUTOMOUNT" = true ]; then
+            echo "  将挂载: /dev/${SD_DEV} -> ${SD_MOUNT} (并写入 /etc/fstab 自动挂载)"
+        else
+            echo "  将挂载: /dev/${SD_DEV} -> ${SD_MOUNT} (不写入 fstab)"
+        fi
+        echo "  将迁移: Docker 数据目录 -> ${SD_MOUNT}/docker"
+    else
+        echo "  将跳过: SD 卡挂载与 Docker 数据迁移"
+    fi
     echo ""
     exit 0
 fi
 
 if [ "$ASSUME_YES" = true ]; then
     CONFIRM="y"
+    if [ "$NET_RISK" = true ]; then
+        log_warn "--yes 已指定: 存在网络风险但继续执行 (请自行确认不会失联)"
+    fi
 elif [ "$INTERACTIVE" = true ]; then
-    read -r -p "确认无误? [y/N] " CONFIRM || true
+    if [ "$NET_RISK" = true ]; then
+        read -r -p "存在网络风险, 确认继续? 输入 yes 继续, 其他任意键取消: " CONFIRM || true
+        [[ "$CONFIRM" = "yes" ]] || { log_warn "已取消"; exit 0; }
+        CONFIRM="y"
+    else
+        read -r -p "确认无误? [y/N] " CONFIRM || true
+    fi
 else
     log_warn "非交互环境且未指定 --yes, 已取消"
     exit 0
@@ -438,43 +707,64 @@ if [ ! -f /swapfile ]; then
     sysctl vm.swappiness=10
 fi
 
-# ---- 8. SD 卡分区和挂载 ----
-SD_PATH="/dev/${SD_DEV}"
-if [ -b "$SD_PATH" ]; then
-    SD_PART="${SD_PATH}p1"
-    if ! grep -q "/mnt/sd" /etc/fstab 2>/dev/null; then
-        log_info "挂载 SD 卡 ${SD_PART}..."
-        mkdir -p /mnt/sd
-        if ! mountpoint -q /mnt/sd; then
-            mount "${SD_PART}" /mnt/sd 2>/dev/null || {
-                log_warn "SD 卡可能未格式化, 尝试创建分区..."
-                parted -s "$SD_PATH" mklabel gpt mkpart primary ext4 1MiB 100%
-                sleep 2
-                mkfs.ext4 -F "${SD_PART}"
-                mount "${SD_PART}" /mnt/sd
-            }
-        fi
-        echo "${SD_PART} /mnt/sd ext4 defaults,noatime 0 2" >> /etc/fstab
-    fi
+# ---- 8. SD 卡分区和挂载 (无卡/未选择挂载则跳过) ----
+SD_MOUNTED=false
+if [ "$SD_ENABLE" != true ]; then
+    log_info "跳过 SD 卡挂载 (未检测到 SD 卡或已选择跳过)"
 else
-    log_error "未找到 SD 卡设备 ${SD_PATH}, 跳过挂载"
+    SD_PATH="/dev/${SD_DEV}"
+    if [ ! -b "$SD_PATH" ]; then
+        log_error "未找到 SD 卡设备 ${SD_PATH}, 跳过挂载"
+    else
+        SD_PART="${SD_PATH}p1"
+        # 无分区表时, 可能是整卡直挂
+        [ -b "$SD_PART" ] || SD_PART="$SD_PATH"
+        log_info "挂载 SD 卡 ${SD_PART} -> ${SD_MOUNT}..."
+        mkdir -p "$SD_MOUNT"
+        if mountpoint -q "$SD_MOUNT"; then
+            SD_MOUNTED=true
+            log_info "${SD_MOUNT} 已挂载, 复用"
+        elif mount "$SD_PART" "$SD_MOUNT" 2>/dev/null; then
+            SD_MOUNTED=true
+        else
+            log_warn "SD 卡可能未格式化, 尝试创建分区并格式化..."
+            parted -s "$SD_PATH" mklabel gpt mkpart primary ext4 1MiB 100%
+            sleep 2
+            SD_PART="${SD_PATH}p1"
+            [ -b "$SD_PART" ] || SD_PART="$SD_PATH"
+            if mkfs.ext4 -F "$SD_PART" && mount "$SD_PART" "$SD_MOUNT"; then
+                SD_MOUNTED=true
+            else
+                log_error "SD 卡挂载失败, 跳过 (Docker 数据将保留在默认位置)"
+            fi
+        fi
+        # 自动挂载: 幂等写入 fstab
+        if [ "$SD_MOUNTED" = true ] && [ "$SD_AUTOMOUNT" = true ]; then
+            if ! grep -qE "[[:space:]]${SD_MOUNT}[[:space:]]" /etc/fstab 2>/dev/null; then
+                echo "${SD_PART} ${SD_MOUNT} ext4 defaults,noatime 0 2" >> /etc/fstab
+                log_info "已写入 /etc/fstab, 开机自动挂载"
+            fi
+        elif [ "$SD_MOUNTED" = true ]; then
+            log_info "未启用自动挂载 (本次挂载在重启后失效)"
+        fi
+    fi
 fi
 
-# ---- 9. 迁移 Docker 数据到 SD 卡 ----
-log_info "迁移 Docker 数据到 SD 卡..."
-mkdir -p /mnt/sd/docker /mnt/sd/srv /mnt/sd/backups
+# ---- 9. 迁移 Docker 数据 (仅在 SD 卡挂载成功时) ----
+if [ "$SD_MOUNTED" = true ]; then
+    log_info "迁移 Docker 数据到 ${SD_MOUNT}..."
+    mkdir -p "${SD_MOUNT}/docker" "${SD_MOUNT}/srv" "${SD_MOUNT}/backups"
 
-if ! grep -q "DOCKER_OPTS" /etc/default/docker 2>/dev/null; then
-    mkdir -p /mnt/sd/docker
-    if [ -d /var/lib/docker ] && [ "$(ls -A /var/lib/docker 2>/dev/null)" ]; then
-        systemctl stop docker 2>/dev/null || true
-        rsync -avhP /var/lib/docker/ /mnt/sd/docker/ || true
-    fi
-    echo 'DOCKER_OPTS="-g /mnt/sd/docker --log-driver=json-file --log-opt max-size=5m --log-opt max-file=2"' >> /etc/default/docker
-    mkdir -p /etc/docker
-    cat > /etc/docker/daemon.json << 'EOF'
+    if ! grep -q "DOCKER_OPTS" /etc/default/docker 2>/dev/null; then
+        if [ -d /var/lib/docker ] && [ "$(ls -A /var/lib/docker 2>/dev/null)" ]; then
+            systemctl stop docker 2>/dev/null || true
+            rsync -avhP /var/lib/docker/ "${SD_MOUNT}/docker/" || true
+        fi
+        echo "DOCKER_OPTS=\"-g ${SD_MOUNT}/docker --log-driver=json-file --log-opt max-size=5m --log-opt max-file=2\"" >> /etc/default/docker
+        mkdir -p /etc/docker
+        cat > /etc/docker/daemon.json << EOF
 {
-  "data-root": "/mnt/sd/docker",
+  "data-root": "${SD_MOUNT}/docker",
   "log-driver": "json-file",
   "log-opts": {
     "max-size": "5m",
@@ -486,8 +776,12 @@ if ! grep -q "DOCKER_OPTS" /etc/default/docker 2>/dev/null; then
   ]
 }
 EOF
-    systemctl start docker
-    log_info "Docker 已迁移到 /mnt/sd/docker"
+        systemctl start docker
+        log_info "Docker 已迁移到 ${SD_MOUNT}/docker"
+    fi
+else
+    log_warn "SD 卡未挂载: 保留 Docker 默认数据目录 /var/lib/docker"
+    log_warn "      集群脚本默认读写 /mnt/sd, 若未插卡请确认 eMMC 空间充足"
 fi
 
 # ---- 10. 固定 Docker 版本 ----
@@ -571,13 +865,19 @@ done <<< "$HOST_ENTRIES"
 
 # ---- 13. 启用 IP 转发 ----
 log_info "启用 IP 转发..."
-echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
-echo 'net.ipv4.conf.all.src_valid_mark=1' >> /etc/sysctl.conf
+grep -q '^net.ipv4.ip_forward=1' /etc/sysctl.conf 2>/dev/null || \
+    echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
+grep -q '^net.ipv4.conf.all.src_valid_mark=1' /etc/sysctl.conf 2>/dev/null || \
+    echo 'net.ipv4.conf.all.src_valid_mark=1' >> /etc/sysctl.conf
 sysctl -p 2>/dev/null || true
 
 # ---- 14. 创建目录结构 ----
-log_info "创建目录结构..."
-mkdir -p /mnt/sd/srv/${NODE_NAME}/{cloudflared,adguard/{work,conf},wireguard/config,
+DATA_ROOT="${SD_MOUNT}"
+if [ "$SD_MOUNTED" != true ]; then
+    DATA_ROOT="/mnt/sd"
+fi
+log_info "创建目录结构: ${DATA_ROOT}/srv/${NODE_NAME}"
+mkdir -p "${DATA_ROOT}/srv/${NODE_NAME}"/{cloudflared,adguard/{work,conf},wireguard/config,
     clash,memos/data,homeassistant,piwigo/{config,gallery},xiaomusic,
     migpt,syncthing/{config,data},verysync/{temp},aria2/{config,downloads},
     cupsd/{config,printers,spool},cups-web/config,panel}
@@ -598,15 +898,19 @@ echo ""
 echo "节点信息:"
 echo "  主机名: $HOSTNAME"
 echo "  IP:     $NODE_IP"
-echo "  存储:   /mnt/sd (SD卡)"
+if [ "$SD_MOUNTED" = true ]; then
+    echo "  存储:   ${SD_MOUNT} (SD卡, 自动挂载: $([ "$SD_AUTOMOUNT" = true ] && echo 是 || echo 否))"
+else
+    echo "  存储:   未挂载 SD 卡 (数据位于 eMMC ${DATA_ROOT})"
+fi
 echo "  Swap:   2GB"
 echo ""
 echo "下一步:"
 echo "  1. 将此节点的 SSH 公钥添加到其他节点的 authorized_keys"
-echo "  2. 克隆 onecloud-cluster 仓库到 /mnt/sd/"
-echo "  3. 复制对应 node-xxx 目录的 docker-compose.yml 到 /mnt/sd/srv/${NODE_NAME}/"
+echo "  2. 克隆 onecloud-cluster 仓库到 ${SD_MOUNT}/"
+echo "  3. 复制对应 node-xxx 目录的 docker-compose.yml 到 ${DATA_ROOT}/srv/${NODE_NAME}/"
 echo "  4. 运行 ./scripts/deploy.sh 分发配置"
-echo "  5. 启动服务: cd /mnt/sd/srv/${NODE_NAME} && docker-compose up -d"
+echo "  5. 启动服务: cd ${DATA_ROOT}/srv/${NODE_NAME} && docker-compose up -d"
 echo ""
 echo "SSH 公钥:"
 cat /root/.ssh/id_ed25519.pub

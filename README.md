@@ -119,12 +119,42 @@ onecloud-cluster/
 
 关键行为：
 
+- **脚本一启动就探测本机现状。** 在解析参数之前先读取本机当前 IP / 前缀 / 默认网关
+  以及可移动存储，用于后续比对与风险提示。`--no-detect` 只是不自动采用这些值，
+  探测本身仍会执行（否则无法做网段比对）。
 - **换了网段，网关会跟着变。** 指定 `--ip 192.168.6.101` 后，脚本按同网段推导出
   `192.168.6.1`；与现网关不在同一网段时会提示并询问是否调整，`--yes` 下自动调整。
   显式给了 `--gateway` 则不推导（尊重明确意图），但若网段对不上仍会告警。
 - **自动探测当前设备的网络。** 未指定 `--ip` 时先读取本机当前的 IP/前缀/默认网关，
-  询问是否直接采用；`--yes` 下自动采用。不想探测加 `--no-detect`。
+  询问是否直接采用；`--yes` 下自动采用。不想采用加 `--no-detect`。
 - 配置确认页会标注每个值的来源（命令行 / 本机探测 / 清单 / 由IP推导）。
+
+#### SD 卡处理
+
+启动时自动探测可移动存储（`lsblk` 的 removable/USB 通道，退化时按"非系统 eMMC"启发式判断）：
+
+| 情况 | 行为 |
+|---|---|
+| 未插卡 | 打印提示后**跳过**挂载与 Docker 数据迁移，Docker 保留 `/var/lib/docker` |
+| 检测到（或 `--sd` 指定） | 询问：是否挂载 → 挂载点（默认 `/mnt/sd`）→ 是否写入 fstab 开机自动挂载 |
+| `--yes` | 按默认值自动执行（挂载 `/mnt/sd` + 写 fstab） |
+| `--no-sd` | 完全跳过 SD 相关步骤 |
+| `--sd-mount DIR` | 改用其它挂载点（会告警：集群脚本默认读写 `/mnt/sd`） |
+| `--no-sd-automount` | 挂载但不写 fstab，重启后失效 |
+
+> 挂载点不是 `/mnt/sd` 时，`deploy.sh` / `backup.sh` / `setup.sh` 等仍按 `/mnt/sd`
+> 读写，需自行同步修改，否则数据会落到不同位置。
+
+#### 执行前的网络安全检查
+
+配静态 IP 是容易把机器"配失联"的操作，脚本在写入前会做三项检查并汇总告警：
+
+1. **网段比对** —— 新 IP 与本机当前 IP 不在同一网段
+2. **IP 冲突** —— 目标 IP 已被占用（ping 有响应）
+3. **网关可达性** —— 网关当前 ping 不通
+
+存在任一风险时：交互模式要求输入 `yes` 才继续（其余按键取消）；`--yes` 下仅告警后
+继续；`--dry-run` 只提示不改动。
 
 ```bash
 # 换网段部署: 网关自动算成 192.168.6.1
@@ -135,6 +165,13 @@ onecloud-cluster/
 
 # 网关不是 .1 的网段: 显式指定, 不会被推导覆盖
 ./scripts/bootstrap.sh --node wk-edge-01 --ip 192.168.6.101 --gateway 192.168.6.254 --yes
+
+# 先预览不落盘 (含 SD 挂载计划与网络风险提示)
+./scripts/bootstrap.sh --node wk-edge-01 --ip 192.168.6.101 --dry-run
+
+# 不插 SD 卡 / 挂载到别处且不自动挂载
+./scripts/bootstrap.sh --node wk-edge-01 --ip 192.168.6.101 --no-sd --yes
+./scripts/bootstrap.sh --node wk-edge-01 --ip 192.168.6.101 --sd-mount /mnt/data --no-sd-automount --yes
 
 # 自动化场景可强制指定是否当作交互终端 (1=交互 0=非交互)
 ONECLOUD_BOOTSTRAP_TTY=0 ./scripts/bootstrap.sh --node wk-edge-01 --ip 192.168.6.101 --yes
@@ -250,7 +287,7 @@ vim inventory/nodes.local.yaml   # 填入你的 IP/主机名, 该文件已被 gi
 | `lib-nodes.sh` | 节点清单库（单一数据源，供所有脚本 source） | 被其他脚本引用 |
 | `gen-panel-config.sh` | 从清单生成 `panel/config.json` | 直接运行 |
 | `gen-node-env.sh` | 从清单渲染各节点 `.env`（保留已填密钥） | `[节点名]` / `--dry-run` |
-| `bootstrap.sh` | 新节点初始化（主机名/源/swap/SD卡/Docker/静态IP） | `--node <名> [--ip <IP>] [--gateway <IP>] [--no-detect] --yes` |
+| `bootstrap.sh` | 新节点初始化（主机名/源/swap/SD卡/Docker/静态IP） | `--node <名> [--ip <IP>] [--gateway <IP>] [--sd <DEV>] [--no-sd] [--dry-run] --yes` |
 | `setup.sh` | 统一安装（端口检测 + 多选批量安装 + 磁盘挂载） | `sudo bash setup.sh` |
 | `wireguard-setup.sh` | WireGuard mesh 配置生成 | `gen` / `add peer` / `list` |
 | `deploy.sh` | rsync 分发配置到各节点 | `-n <节点>` / `--exec <命令>` / `-t` / `-d` |

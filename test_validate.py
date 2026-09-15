@@ -10,7 +10,9 @@ import os
 import sys
 import json
 import re
+import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
 
@@ -1586,6 +1588,194 @@ def test_bootstrap_network_resolution():
         log_fail("README 未说明新的取值规则", "文档与实际行为会漂移")
 
 
+def test_bootstrap_sd_and_risk():
+    """测试 17: bootstrap 启动探测 / SD 卡决策 / 写入前网络风险提示"""
+    print("\n" + "=" * 60)
+    print("测试 17: bootstrap SD 卡决策与网络风险提示")
+    print("=" * 60)
+
+    boot = PROJECT_ROOT / "scripts" / "bootstrap.sh"
+    if not boot.exists():
+        log_fail("scripts/bootstrap.sh 缺失")
+        return
+    src = boot.read_text(encoding="utf-8")
+
+    # 1) 探测必须发生在参数解析之前 (否则无法用于后续比对)
+    i_detect = src.find("detect_current_network\n")
+    i_args = src.find("while [[ $# -gt 0 ]]")
+    if 0 <= i_detect < i_args:
+        log_pass("启动即探测本机 IP/网关 (早于参数解析)")
+    else:
+        log_fail("本机探测未放在参数解析之前", "后续网段比对会拿不到当前网络")
+
+    # 2) SD 探测函数与"无卡跳过"路径存在
+    needed = ["detect_sd_cards()", "未检测到 SD 卡", "SD_CANDIDATES"]
+    missing = [n for n in needed if n not in src]
+    if not missing:
+        log_pass("具备 SD 卡探测与无卡跳过逻辑")
+    else:
+        log_fail(f"缺少 SD 卡处理: {missing}")
+
+    # ---- 用 mock 环境做行为验证 ----
+    # 注意: Git Bash 的 PATH 查找只认 POSIX 路径 (/c/...), 不认 C:/...
+    def _posix(p):
+        s = Path(p).as_posix()
+        m = re.match(r"^([A-Za-z]):/(.*)$", s)
+        return f"/{m.group(1).lower()}/{m.group(2)}" if m else s
+
+    tmpdir = Path(tempfile.mkdtemp(prefix="oc_t17_"))
+    probe = SCRIPTS_DIR / "_probe_t17.sh"
+    harness = tmpdir / "harness.sh"
+
+    harness.write_text(f"""#!/bin/bash
+set -u
+BOOT="{_posix(boot)}"
+PROBE="{_posix(probe)}"
+M="{_posix(tmpdir)}/mockbin"
+mkdir -p "$M"
+
+cat > "$M/ip" << 'MOCKEOF'
+#!/bin/bash
+if [ "$1" = "-4" ] && [ "$2" = "-o" ]; then
+    echo "2: eth0    inet 192.168.6.50/24 brd 192.168.6.255 scope global eth0"
+    exit 0
+fi
+if [ "$1" = "route" ]; then
+    echo "default via 192.168.6.1 dev eth0 proto dhcp src 192.168.6.50 metric 100"
+    exit 0
+fi
+exit 0
+MOCKEOF
+
+cat > "$M/findmnt" << 'MOCKEOF'
+#!/bin/bash
+echo "/dev/mmcblk0p1"
+MOCKEOF
+
+cat > "$M/lsblk" << 'MOCKEOF'
+#!/bin/bash
+echo "mmcblk0  0 disk"
+[ "${{MOCK_NO_SD:-0}}" = "1" ] || echo "mmcblk1  1 disk"
+exit 0
+MOCKEOF
+
+cat > "$M/ping" << 'MOCKEOF'
+#!/bin/bash
+t="${{@: -1}}"
+case "${{MOCK_PING_MODE:-gw}}" in
+    all)  exit 0 ;;
+    none) exit 1 ;;
+    gw)   [ "$t" = "192.168.6.1" ] && exit 0 || exit 1 ;;
+esac
+MOCKEOF
+chmod +x "$M"/*
+
+# 截取到"设置主机名"之前: 只跑参数/探测/SD决策/风险提示, 绝不改动系统
+LN=$(grep -n '^# ---- 2\\. 设置主机名 ----' "$BOOT" | cut -d: -f1)
+sed -n "1,${{LN}}p" "$BOOT" > "$PROBE"
+
+run() {{
+    local tag="$1" nose="$2" ping="$3"
+    shift 3
+    echo "###CASE:$tag"
+    ( cd "$(dirname "$PROBE")" \\
+      && MOCK_NO_SD="$nose" MOCK_PING_MODE="$ping" PATH="$M:$PATH" \\
+         bash "$(basename "$PROBE")" "$@" </dev/null 2>&1 )
+}}
+
+run sd_no_card 1 gw --node wk-edge-01 --ip 192.168.6.101 --dry-run
+run sd_present 0 gw --node wk-edge-01 --ip 192.168.6.101 --dry-run
+run sd_disabled 0 gw --node wk-edge-01 --ip 192.168.6.101 --no-sd --dry-run
+run sd_noauto 0 gw --node wk-edge-01 --ip 192.168.6.101 --no-sd-automount --dry-run
+run cross_seg 0 gw --node wk-edge-01 --ip 10.0.0.9 --dry-run
+run ip_clash 0 all --node wk-edge-01 --ip 192.168.6.101 --dry-run
+run nodetect 0 gw --node wk-edge-01 --ip 10.0.0.9 --no-detect --dry-run
+
+rm -f "$PROBE"
+""", encoding="utf-8")
+
+    try:
+        r = subprocess.run(["bash", str(harness)], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace",
+                           stdin=subprocess.DEVNULL, timeout=180)
+        out = r.stdout
+
+        def case(tag):
+            m = re.search(rf"###CASE:{tag}\n(.*?)(?=\n###CASE:|\Z)", out, re.S)
+            return m.group(1) if m else ""
+
+        c = case("sd_no_card")
+        if "未检测到 SD 卡" in c and "将跳过" in c and "将迁移" not in c:
+            log_pass("未插卡时跳过 SD 挂载与 Docker 迁移")
+        else:
+            log_fail("未插卡仍执行了 SD 相关步骤", c[:200])
+
+        c = case("sd_present")
+        if "将挂载" in c and "将迁移" in c and "/mnt/sd/docker" in c:
+            log_pass("检测到 SD 卡后展示挂载与 Docker 迁移计划")
+        else:
+            log_fail("有卡时未展示挂载计划", c[:200])
+
+        c = case("sd_disabled")
+        if "已指定 --no-sd" in c and "将跳过" in c:
+            log_pass("--no-sd 完全跳过 SD 相关步骤")
+        else:
+            log_fail("--no-sd 未生效", c[:200])
+
+        c = case("sd_noauto")
+        if "不写入 fstab" in c and "(自动挂载: 否)" in c:
+            log_pass("--no-sd-automount 挂载但不写 fstab")
+        else:
+            log_fail("--no-sd-automount 未生效", c[:200])
+
+        c = case("cross_seg")
+        if "不在同一网段" in c and "风险" in c:
+            log_pass("新 IP 与当前 IP 跨网段时告警")
+        else:
+            log_fail("跨网段未告警", "配完静态 IP 可能直接失联")
+
+        c = case("cross_seg")
+        if "不可达" in c:
+            log_pass("网关 ping 不通时告警")
+        else:
+            log_fail("网关不可达未告警", c[:200])
+
+        c = case("ip_clash")
+        if "已被占用" in c:
+            log_pass("目标 IP 已被占用时告警")
+        else:
+            log_fail("IP 冲突未告警", c[:200])
+
+        c = case("nodetect")
+        if "10.0.0.9" in c and "不在同一网段" in c:
+            log_pass("--no-detect 仅停用自动采用, 仍做网段比对")
+        else:
+            log_fail("--no-detect 关闭了风险比对", c[:200])
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        if probe.exists():
+            probe.unlink()
+
+    # 3) --help 不应触发探测
+    r = subprocess.run(["bash", str(boot), "--help"], capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL)
+    if "本机当前网络:" not in r.stdout:
+        log_pass("--help 直接输出用法, 不触发探测")
+    else:
+        log_fail("--help 触发了探测", "只查用法却去扫网络/磁盘")
+
+    # 4) 文档同步
+    doc_a = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+    doc_b = (SCRIPTS_DIR / "README.md").read_text(encoding="utf-8")
+    ok_a = ("--no-sd" in doc_a) and ("SD 卡处理" in doc_a) and ("网络安全检查" in doc_a)
+    ok_b = ("--no-sd" in doc_b) and ("启动即探测" in doc_b)
+    if ok_a and ok_b:
+        log_pass("README 与 scripts/README 已同步新参数与新行为")
+    else:
+        log_fail(f"文档未同步 (README={ok_a}, scripts/README={ok_b})",
+                 "用户不知道有 --no-sd 等开关")
+
+
 # ============ 主程序 ============
 def main():
     print("=" * 60)
@@ -1611,6 +1801,7 @@ def main():
         ("安全与健壮性回归", test_safety_regression),
         ("面板前后端契约", test_panel_frontend_contract),
         ("bootstrap 网络取值", test_bootstrap_network_resolution),
+        ("bootstrap SD与风险", test_bootstrap_sd_and_risk),
     ]
     
     for test_name, test_func in tests:

@@ -72,9 +72,22 @@ node_of_service homeassistant   # 服务 → 节点映射
 # 未指定 --ip: 自动探测本机当前 IP/网关并询问是否采用 (--yes 下自动采用)
 ./scripts/bootstrap.sh --node wk-new-04 --yes
 
-# 不想探测本机网络
+# 只预览配置与风险, 不改系统 (含 SD 挂载计划)
+./scripts/bootstrap.sh --node wk-edge-01 --ip 10.0.0.5 --dry-run
+
+# 不采用本机探测值 (探测仍会执行, 仅用于风险提示)
 ./scripts/bootstrap.sh --node wk-edge-01 --ip 10.0.0.5 --no-detect --yes
+
+# 不插 SD 卡 / 换挂载点且不自动挂载
+./scripts/bootstrap.sh --node wk-edge-01 --ip 10.0.0.5 --no-sd --yes
+./scripts/bootstrap.sh --node wk-edge-01 --ip 10.0.0.5 --sd-mount /mnt/data --no-sd-automount --yes
 ```
+
+**参数与询问的关系**
+
+传入的参数一律直接生效；只有"未提供且无法从清单/探测推断"的项才在终端可用时询问
+（顺序：节点名 → IP → 主机名 → DNS → 网关）。非交互环境请加 `--yes`，否则缺失项
+直接报错而不是干等输入。
 
 **IP / 网关取值优先级**
 
@@ -87,6 +100,15 @@ node_of_service homeassistant   # 服务 → 节点映射
 换了网段时网关会跟着变：与现网关不同网段则提示询问，`--yes` 下自动调整；
 显式 `--gateway` 不参与推导，但网段对不上仍会告警。
 配置确认页会标注每个值的来源（命令行 / 本机探测 / 清单 / 由IP推导）。
+
+**启动即探测**：脚本在解析参数前先读取本机当前 IP/前缀/默认网关与可移动存储，
+用于网段比对和风险提示。
+
+**SD 卡**：探测不到就跳过挂载与 Docker 数据迁移；探测到则询问是否挂载、挂载点
+（默认 `/mnt/sd`）、是否写入 fstab 自动挂载。`--yes` 下按默认值自动执行。
+
+**写入前的网络安全检查**：新 IP 与当前 IP 跨网段、目标 IP 已被占用、网关 ping
+不通 —— 任一命中都会汇总告警；交互模式下需输入 `yes` 才继续。
 
 功能：设置主机名、换国内源、更新系统、安装工具、创建 swap、挂载 SD 卡、迁移 Docker 数据、配置静态 IP、配置 hosts。
 
