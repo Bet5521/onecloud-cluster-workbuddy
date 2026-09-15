@@ -63,9 +63,30 @@ node_of_service homeassistant   # 服务 → 节点映射
 # 全部取清单默认值
 ./scripts/bootstrap.sh --node wk-edge-01 --yes
 
-# 覆盖 IP 和主机名
+# 覆盖 IP 和主机名 (网关按同网段自动推导: 10.0.0.1)
 ./scripts/bootstrap.sh --node wk-edge-01 --ip 10.0.0.5 --hostname edge-hk --yes
+
+# 网关不是 .1 时显式指定, 不会被推导覆盖
+./scripts/bootstrap.sh --node wk-edge-01 --ip 10.0.0.5 --gateway 10.0.0.254 --yes
+
+# 未指定 --ip: 自动探测本机当前 IP/网关并询问是否采用 (--yes 下自动采用)
+./scripts/bootstrap.sh --node wk-new-04 --yes
+
+# 不想探测本机网络
+./scripts/bootstrap.sh --node wk-edge-01 --ip 10.0.0.5 --no-detect --yes
 ```
+
+**IP / 网关取值优先级**
+
+| 项目 | 优先级 |
+|---|---|
+| IP | `--ip` > 本机探测（询问 / `--yes` 自动采用）> 清单 |
+| 网关 | `--gateway` > 由最终 IP 推导（网络地址+1）> 本机探测 > 清单 |
+| 前缀 | 本机探测 > 清单 `lan_subnet` > 24 |
+
+换了网段时网关会跟着变：与现网关不同网段则提示询问，`--yes` 下自动调整；
+显式 `--gateway` 不参与推导，但网段对不上仍会告警。
+配置确认页会标注每个值的来源（命令行 / 本机探测 / 清单 / 由IP推导）。
 
 功能：设置主机名、换国内源、更新系统、安装工具、创建 swap、挂载 SD 卡、迁移 Docker 数据、配置静态 IP、配置 hosts。
 

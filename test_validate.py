@@ -1487,6 +1487,105 @@ def test_panel_frontend_contract():
         log_fail(f"白名单 ls 校验失败: {e}")
 
 
+def test_bootstrap_network_resolution():
+    """测试 16: bootstrap 网络取值 (IP/网关联动 + 本机探测 + 来源标注)"""
+    print("\n" + "=" * 60)
+    print("测试 16: bootstrap 网络取值与网关联动")
+    print("=" * 60)
+
+    boot = PROJECT_ROOT / "scripts" / "bootstrap.sh"
+    if not boot.exists():
+        log_fail("scripts/bootstrap.sh 缺失")
+        return
+    src = boot.read_text(encoding="utf-8")
+
+    def run_boot(args, env_extra=None):
+        env = dict(os.environ)
+        env["ONECLOUD_BOOTSTRAP_TTY"] = "0"   # 强制非交互, 避免测试环境差异
+        if env_extra:
+            env.update(env_extra)
+        return subprocess.run(
+            ["bash", str(boot)] + args,
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", env=env, cwd=str(boot.parent),
+            stdin=subprocess.DEVNULL,
+        )
+
+    def parse_net(out):
+        ip_m = re.search(r"静态IP:\s+(\S+)\s+\(来源:\s*([^)]+)\)", out)
+        gw_m = re.search(r"网关:\s+(\S+)\s+\(来源:\s*([^)]+)\)", out)
+        return (ip_m.groups() if ip_m else None, gw_m.groups() if gw_m else None)
+
+    # 1) 网段推导函数: 由 IP+前缀 得到 "<网络地址> <网关>"
+    cases = [("192.168.6.101", "24", "192.168.6.0 192.168.6.1"),
+             ("10.0.0.5", "8", "10.0.0.0 10.0.0.1"),
+             ("172.16.5.9", "16", "172.16.0.0 172.16.0.1")]
+    bad = []
+    for ip, prefix, expect in cases:
+        r = subprocess.run(
+            ["bash", "-c",
+             'source <(sed -n "/^ip_net_info()/,/^}/p" "$1"); ip_net_info ' + ip + " " + prefix,
+             "_", str(boot)],
+            capture_output=True, text=True, encoding="utf-8", errors="replace")
+        if r.stdout.strip() != expect:
+            bad.append(f"{ip}/{prefix} -> {r.stdout.strip()!r}")
+    if bad:
+        log_fail(f"网段推导结果错误: {'; '.join(bad)}")
+    else:
+        log_pass("网段推导函数正确 (/24 /8 /16 均得到网络地址+1 的网关)")
+
+    # 2) 传 --ip 换网段: 网关必须跟着变, 不能停留在清单默认值
+    r = run_boot(["--node", "wk-edge-01", "--ip", "192.168.6.101",
+                  "--hostname", "edge-01", "--dry-run"])
+    (ip_val, ip_src), (gw_val, gw_src) = parse_net(r.stdout)
+    if gw_val == "192.168.6.1" and "推导" in (gw_src or ""):
+        log_pass("--ip 换网段后网关自动跟随 (192.168.1.1 -> 192.168.6.1)")
+    else:
+        log_fail(f"--ip 换网段后网关未跟随: 网关={gw_val} 来源={gw_src}",
+                 "换网段后网关仍是清单默认值会导致配置完无法联网")
+
+    # 3) 显式 --gateway 不被推导覆盖
+    r = run_boot(["--node", "wk-edge-01", "--ip", "192.168.6.101",
+                  "--gateway", "192.168.6.254", "--dry-run"])
+    _, (gw_val, gw_src) = parse_net(r.stdout)
+    if gw_val == "192.168.6.254" and "命令行" in (gw_src or ""):
+        log_pass("显式 --gateway 不被自动推导覆盖 (尊重明确意图)")
+    else:
+        log_fail(f"显式 --gateway 被覆盖: {gw_val} ({gw_src})")
+
+    # 4) 未换网段时保留清单网关 (不能瞎改)
+    r = run_boot(["--node", "wk-edge-01", "--dry-run"])
+    _, (gw_val, gw_src) = parse_net(r.stdout)
+    if gw_val == "192.168.1.1" and "清单" in (gw_src or ""):
+        log_pass("IP 未变更时网关保持清单值 (192.168.1.1)")
+    else:
+        log_fail(f"IP 未变更时网关异常: {gw_val} ({gw_src})")
+
+    # 5) 本机探测能力 + 可关闭
+    has_detect = "detect_current_network()" in src and "--no-detect" in src
+    has_dry = "--dry-run" in src
+    if has_detect and has_dry:
+        log_pass("具备本机网络探测 (--no-detect 可关闭) 与 --dry-run 预览")
+    else:
+        missing = [n for n, ok in [("detect_current_network", "detect_current_network()" in src),
+                                   ("--no-detect", "--no-detect" in src),
+                                   ("--dry-run", has_dry)] if not ok]
+        log_fail(f"缺少: {missing}")
+
+    # 6) 配置确认页必须标注取值来源
+    if "来源: ${IP_SOURCE}" in src and "来源: ${GW_SOURCE}" in src:
+        log_pass("配置确认页标注了 IP/网关的取值来源")
+    else:
+        log_fail("配置确认页未标注来源", "用户无法判断值来自命令行、探测还是清单")
+
+    # 7) 文档同步: README 需说明优先级与网关联动
+    readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+    if "由最终 IP 推导" in readme and "自动探测当前设备" in readme:
+        log_pass("README 已记录 IP/网关取值优先级与探测行为")
+    else:
+        log_fail("README 未说明新的取值规则", "文档与实际行为会漂移")
+
+
 # ============ 主程序 ============
 def main():
     print("=" * 60)
@@ -1511,6 +1610,7 @@ def main():
         ("节点 IP 自定义与主机名", test_ip_customizable),
         ("安全与健壮性回归", test_safety_regression),
         ("面板前后端契约", test_panel_frontend_contract),
+        ("bootstrap 网络取值", test_bootstrap_network_resolution),
     ]
     
     for test_name, test_func in tests:

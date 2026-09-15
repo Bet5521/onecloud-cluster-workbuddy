@@ -109,6 +109,37 @@ onecloud-cluster/
 
 > 不带参数运行时会进入交互式提问；非交互环境（cron / CI）请务必加 `--yes`。
 
+#### IP 与网关的取值规则
+
+| 项目 | 优先级 |
+|---|---|
+| IP | `--ip` > 本机探测（交互询问 / `--yes` 自动采用）> 清单 |
+| 网关 | `--gateway` > 由最终 IP 推导（网络地址+1）> 本机探测 > 清单 |
+| 前缀 | 本机探测 > 清单 `lan_subnet` > 24 |
+
+关键行为：
+
+- **换了网段，网关会跟着变。** 指定 `--ip 192.168.6.101` 后，脚本按同网段推导出
+  `192.168.6.1`；与现网关不在同一网段时会提示并询问是否调整，`--yes` 下自动调整。
+  显式给了 `--gateway` 则不推导（尊重明确意图），但若网段对不上仍会告警。
+- **自动探测当前设备的网络。** 未指定 `--ip` 时先读取本机当前的 IP/前缀/默认网关，
+  询问是否直接采用；`--yes` 下自动采用。不想探测加 `--no-detect`。
+- 配置确认页会标注每个值的来源（命令行 / 本机探测 / 清单 / 由IP推导）。
+
+```bash
+# 换网段部署: 网关自动算成 192.168.6.1
+./scripts/bootstrap.sh --node wk-edge-01 --ip 192.168.6.101 --hostname edge-01 --yes
+
+# 新节点: 直接用这台机器当前拿到的 IP 和网关
+./scripts/bootstrap.sh --node wk-new-04 --hostname new-04 --yes
+
+# 网关不是 .1 的网段: 显式指定, 不会被推导覆盖
+./scripts/bootstrap.sh --node wk-edge-01 --ip 192.168.6.101 --gateway 192.168.6.254 --yes
+
+# 自动化场景可强制指定是否当作交互终端 (1=交互 0=非交互)
+ONECLOUD_BOOTSTRAP_TTY=0 ./scripts/bootstrap.sh --node wk-edge-01 --ip 192.168.6.101 --yes
+```
+
 ### 2. 生成 WireGuard 配置
 
 ```bash
@@ -193,7 +224,8 @@ vim inventory/nodes.local.yaml   # 填入你的 IP/主机名, 该文件已被 gi
 要点：
 
 - `bootstrap.sh` 对已登记节点自动取清单中的 IP/主机名作为默认值，命令行
-  `--ip/--hostname` 可再覆盖；网关、DNS、`/etc/hosts` 全部参数化
+  `--ip/--hostname` 可再覆盖；网关、DNS、`/etc/hosts` 全部参数化。
+  **IP 与网关联动**：`--ip` 换了网段时网关按同网段推导并询问确认（见「快速开始」）
 - 所有运维脚本（deploy / update-all / health-check / backup / restore /
   wireguard-setup / setup / install-services）均从 `scripts/lib-nodes.sh`
   动态读取节点，**功能脚本中无任何硬编码 IP**
@@ -218,7 +250,7 @@ vim inventory/nodes.local.yaml   # 填入你的 IP/主机名, 该文件已被 gi
 | `lib-nodes.sh` | 节点清单库（单一数据源，供所有脚本 source） | 被其他脚本引用 |
 | `gen-panel-config.sh` | 从清单生成 `panel/config.json` | 直接运行 |
 | `gen-node-env.sh` | 从清单渲染各节点 `.env`（保留已填密钥） | `[节点名]` / `--dry-run` |
-| `bootstrap.sh` | 新节点初始化（主机名/源/swap/SD卡/Docker/静态IP） | `--node <名> [--ip <IP>] --yes` |
+| `bootstrap.sh` | 新节点初始化（主机名/源/swap/SD卡/Docker/静态IP） | `--node <名> [--ip <IP>] [--gateway <IP>] [--no-detect] --yes` |
 | `setup.sh` | 统一安装（端口检测 + 多选批量安装 + 磁盘挂载） | `sudo bash setup.sh` |
 | `wireguard-setup.sh` | WireGuard mesh 配置生成 | `gen` / `add peer` / `list` |
 | `deploy.sh` | rsync 分发配置到各节点 | `-n <节点>` / `--exec <命令>` / `-t` / `-d` |
