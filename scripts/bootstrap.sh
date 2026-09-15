@@ -203,6 +203,29 @@ apt_try() {
 }
 
 # ------------------------------------------------------------
+# DNS 取值: 区分"自动获取 (DHCP)"与"写死地址列表"
+# ------------------------------------------------------------
+# 以下写法一律视为自动获取: 空 / dhcp / auto / none / automatic / 自动获取
+dns_is_auto() {
+    case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]' | tr -d ' ')" in
+        ''|dhcp|auto|none|automatic|自动|自动获取) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# 依候选值设置 DNS_MODE (dhcp|static) 与 DNS_SERVERS
+# 自动模式下清空 DNS_SERVERS, 保证后续不会把 dhcp 当成 nameserver 写进配置
+dns_apply_mode() {
+    if dns_is_auto "${1:-}"; then
+        DNS_MODE="dhcp"
+        DNS_SERVERS=""
+    else
+        DNS_MODE="static"
+        DNS_SERVERS="$1"
+    fi
+}
+
+# ------------------------------------------------------------
 # 网段计算: 由 IP + 前缀得到 "网络地址 网关"
 # 网关取网络地址 + 1 (家用网段惯例), 输出 "<网络地址> <网关>"
 # 纯算术实现, 不依赖 awk 的位运算函数 (mawk 没有 and()/lshift())
@@ -357,7 +380,8 @@ usage() {
   -i, --ip IP           静态 IP (清单中已登记的节点可省略)
   -H, --hostname NAME   主机名 (默认: 清单值, 或节点名去掉 wk- 前缀)
   -g, --gateway IP      网关 (默认: 由最终 IP 推导)
-  -D, --dns IP          DNS (默认: 清单 network.dns, 多个用逗号分隔)
+  -D, --dns IP|dhcp     DNS: 具体地址 (多个用逗号分隔) 或 dhcp (自动获取)
+      --dns-dhcp        等价于 --dns dhcp: 不写死 DNS, 交由 DHCP/系统提供
   -s, --sd DEV          SD 卡设备名 (如 mmcblk1, 不含 /dev/; 默认自动探测)
   -m, --sd-mount DIR    SD 卡挂载点 (默认 /mnt/sd)
       --no-sd           完全跳过 SD 卡挂载与 Docker 数据迁移
@@ -375,6 +399,15 @@ usage() {
 网络取值优先级:
   IP     命令行 --ip  >  本机探测(询问/--yes 采用)  >  清单
   网关   命令行 --gateway  >  由最终 IP 推导  >  本机探测  >  清单
+  DNS    命令行 --dns  >  环境变量 ONECLOUD_DNS  >  清单 network.dns  >  默认 dhcp
+         (取值写 dhcp / auto / none 均表示"自动获取", 交互时直接回车也是它)
+
+DNS 的两种模式:
+  自动获取 (dhcp, 默认)  不向系统写入任何 nameserver, 交给 DHCP / 网络管理器 / 系统现状;
+                         交互询问直接回车即为该模式。注意: 本脚本配置的是静态 IP,
+                         若系统没有其它 DNS 来源(如已停跑的 dhclient), 解析可能失败 ——
+                         此时重新执行并指定 --dns <你的DNS> 即可。
+  静态指定 (IP 列表)     写入 dns-nameservers / netplan nameservers, 最可预期。
 
 执行前的安全检查 (防止配完静态 IP 后失联):
   * 新 IP 与本机当前 IP 不同网段 -> 告警并要求确认
@@ -385,6 +418,7 @@ usage() {
 环境变量 (优先级最高):
   ONECLOUD_WK_EDGE_01_IP / _HOSTNAME / _WG_IP
   ONECLOUD_GATEWAY / ONECLOUD_DNS / ONECLOUD_LAN_SUBNET / ONECLOUD_DOMAIN
+                                                      # ONECLOUD_DNS=dhcp 亦可 (自动获取)
   ONECLOUD_APT_MIRROR / ONECLOUD_APT_SECURITY_MIRROR  # 覆盖默认 apt 镜像
   ONECLOUD_DEBIAN_CODENAME                            # 强制指定 apt 源代号
   ONECLOUD_APT_SKIP_MIRROR=1                          # 完全不换源, 沿用系统原有源
@@ -439,6 +473,8 @@ HOSTNAME=""
 SD_DEV=""
 GATEWAY=""
 DNS_SERVERS=""
+DNS_EXPLICIT=false          # 命令行是否显式指定了 DNS
+DNS_MODE="dhcp"             # dhcp = 自动获取 (默认); static = 写死指定地址
 SD_MOUNT="/mnt/sd"
 ASSUME_YES=false
 NO_DETECT=false
@@ -452,7 +488,8 @@ while [[ $# -gt 0 ]]; do
         -i|--ip)        NODE_IP="$2";      shift 2 ;;
         -H|--hostname)  HOSTNAME="$2";     shift 2 ;;
         -g|--gateway)   GATEWAY="$2";      shift 2 ;;
-        -D|--dns)       DNS_SERVERS="$2";  shift 2 ;;
+        -D|--dns)       DNS_SERVERS="$2";  DNS_EXPLICIT=true; shift 2 ;;
+        --dns-dhcp)     DNS_SERVERS="dhcp"; DNS_EXPLICIT=true; shift ;;
         -s|--sd)        SD_DEV="$2";       shift 2 ;;
         -m|--sd-mount)  SD_MOUNT="$2";     shift 2 ;;
         --no-sd)        NO_SD=true;        shift ;;
@@ -513,8 +550,21 @@ if [ -z "$GATEWAY" ]; then
         GW_SOURCE=""
     fi
 fi
-if [ -z "$DNS_SERVERS" ]; then
-    DNS_SERVERS="${ONECLOUD_DNS:-${NET_DNS:-}}"
+# DNS 取值: 命令行 --dns > ONECLOUD_DNS > 清单 network.dns > 默认 dhcp(自动获取)
+DNS_SOURCE=""
+DNS_RAW="$DNS_SERVERS"
+if [ "$DNS_EXPLICIT" = true ]; then
+    DNS_SOURCE="命令行"
+elif [ -n "${ONECLOUD_DNS:-}" ]; then
+    DNS_RAW="$ONECLOUD_DNS"; DNS_SOURCE="环境变量"
+elif [ -n "${NET_DNS:-}" ]; then
+    DNS_RAW="$NET_DNS"; DNS_SOURCE="清单"
+else
+    DNS_RAW=""; DNS_SOURCE="默认"
+fi
+dns_apply_mode "$DNS_RAW"
+if [ "$DNS_MODE" = "dhcp" ] && [ "$DNS_SOURCE" = "默认" ]; then
+    DNS_SOURCE="默认(自动获取)"
 fi
 
 # 前缀: 本机探测 > 清单 > 24
@@ -570,9 +620,22 @@ if [ "$INTERACTIVE" = true ]; then
     if [ -z "$HOSTNAME" ]; then
         read -r -p "请输入主机名 (如 edge-01): " HOSTNAME || true
     fi
-    if [ -z "$DNS_SERVERS" ]; then
-        read -r -p "请输入 DNS (默认 1.1.1.1, 多个用逗号分隔): " DNS_SERVERS || true
-    fi
+    # DNS: 交互可覆盖清单/默认值 (回车 = 沿用候选值; 候选为自动获取则回车 = 自动获取)
+    case "$DNS_SOURCE" in
+        命令行|环境变量|交互输入) : ;;
+        *)
+            if [ "$DNS_MODE" = "dhcp" ]; then
+                _dns_hint="DHCP 自动获取"
+            else
+                _dns_hint="$DNS_SERVERS"
+            fi
+            read -r -p "请输入 DNS (直接回车 = ${_dns_hint}; 多个用逗号分隔): " _dns_in || true
+            if [ -n "$_dns_in" ]; then
+                dns_apply_mode "$_dns_in"
+                DNS_SOURCE="交互输入"
+            fi
+            ;;
+    esac
 fi
 
 # ---- 1d. 默认值兜底 ----
@@ -582,8 +645,9 @@ fi
 if [ -z "$HOSTNAME" ]; then
     HOSTNAME="${NODE_NAME#wk-}"
 fi
-if [ -z "$DNS_SERVERS" ]; then
-    DNS_SERVERS="1.1.1.1"
+# DNS 默认值兜底: 无任何来源时使用"自动获取 (DHCP)", 不再写死 1.1.1.1
+if [ "$DNS_MODE" != "dhcp" ] && [ -z "$DNS_SERVERS" ]; then
+    DNS_MODE="dhcp"
 fi
 
 # IP 无法安全猜测: 缺失时明确报错, 而不是套用写死的网段
@@ -783,13 +847,25 @@ if [ "$NET_RISK" = true ]; then
     echo ""
 fi
 
-# DNS 支持逗号分隔多个
+# DNS 自动获取的注意事项 (默认模式)
+if [ "$DNS_MODE" = "dhcp" ] && [ "$DRY_RUN" != true ]; then
+    log_warn "DNS 采用自动获取: 不向系统写入任何 nameserver, 交由 DHCP/系统自行提供"
+    log_warn "      本脚本配置的是静态 IP, 若该机已无 DHCP 客户端在跑, 解析可能失败;"
+    log_warn "      遇到解析异常请重新执行并指定: --dns <你的DNS>"
+    echo ""
+fi
+
+# DNS 支持逗号分隔多个; 自动获取模式下不写入任何地址
 DNS_LIST=""
-IFS=',' read -ra _dns_arr <<< "$DNS_SERVERS"
-for d in "${_dns_arr[@]}"; do
-    d="$(echo "$d" | tr -d ' ')"
-    [ -n "$d" ] && DNS_LIST="${DNS_LIST:+$DNS_LIST, }$d"
-done
+if [ "$DNS_MODE" = "static" ]; then
+    IFS=',' read -ra _dns_arr <<< "$DNS_SERVERS"
+    for d in "${_dns_arr[@]}"; do
+        d="$(echo "$d" | tr -d ' ')"
+        [ -n "$d" ] && DNS_LIST="${DNS_LIST:+$DNS_LIST, }$d"
+    done
+else
+    DNS_LIST="自动获取 (DHCP)"
+fi
 
 echo ""
 log_info "配置信息:"
@@ -797,7 +873,7 @@ echo "  节点名称: $NODE_NAME"
 echo "  静态IP:   $NODE_IP/${LAN_PREFIX}    (来源: ${IP_SOURCE})"
 echo "  主机名:   $HOSTNAME"
 echo "  网关:     $GATEWAY    (来源: ${GW_SOURCE})"
-echo "  DNS:      $DNS_LIST"
+echo "  DNS:      ${DNS_LIST}    (来源: ${DNS_SOURCE})"
 if [ "$SD_ENABLE" = true ]; then
     echo "  SD设备:   /dev/${SD_DEV}"
     echo "  挂载点:   ${SD_MOUNT}    (自动挂载: $([ "$SD_AUTOMOUNT" = true ] && echo 是 || echo 否))"
@@ -815,6 +891,11 @@ if [ "$DRY_RUN" = true ]; then
     echo ""
     echo "  将写入: /etc/network/interfaces 或 /etc/netplan/99-static.yaml"
     echo "  将设置: hostname=${HOSTNAME}, address=${NODE_IP}/${LAN_PREFIX}, gateway=${GATEWAY}"
+    if [ "$DNS_MODE" = "dhcp" ]; then
+        echo "  将设置: DNS 不写入 (自动获取, 由 DHCP/系统提供)"
+    else
+        echo "  将设置: DNS = ${DNS_LIST}"
+    fi
     if [ "$SD_ENABLE" = true ]; then
         if [ "$SD_AUTOMOUNT" = true ]; then
             echo "  将挂载: /dev/${SD_DEV} -> ${SD_MOUNT} (并写入 /etc/fstab 自动挂载)"
@@ -1004,8 +1085,17 @@ fi
 
 # ---- 11. 设置静态 IP ----
 log_info "配置静态 IP: $NODE_IP/${LAN_PREFIX} (网关 $GATEWAY)"
-if [ -f /etc/network/interfaces ]; then
-    cat > /etc/network/interfaces << EOF
+# ONECLOUD_ETC_ROOT 仅用于测试/演练时把 /etc 指到别处 (默认 /etc)
+NET_ETC="${ONECLOUD_ETC_ROOT:-/etc}"
+if [ -f "${NET_ETC}/network/interfaces" ]; then
+    if [ "$DNS_MODE" = "dhcp" ]; then
+        DNS_LINE="# DNS 不写死: 由 DHCP/系统提供 (bootstrap --dns dhcp)"
+        log_info "DNS: 自动获取 (不向 interfaces 写入 dns-nameservers)"
+    else
+        DNS_LINE="    dns-nameservers ${DNS_LIST}"
+        log_info "DNS: ${DNS_LIST}"
+    fi
+    cat > "${NET_ETC}/network/interfaces" << EOF
 auto lo
 iface lo inet loopback
 
@@ -1013,21 +1103,43 @@ auto eth0
 iface eth0 inet static
     address ${NODE_IP}/${LAN_PREFIX}
     gateway ${GATEWAY}
-    dns-nameservers ${DNS_LIST}
+${DNS_LINE}
 EOF
-elif [ -d /etc/netplan ]; then
-    # netplan 的 nameservers 需要 YAML 列表形式
-    DNS_YAML=""
-    IFS=',' read -ra _dns_arr2 <<< "$DNS_SERVERS"
-    for d in "${_dns_arr2[@]}"; do
-        d="$(echo "$d" | tr -d ' ')"
-        [ -n "$d" ] && DNS_YAML="${DNS_YAML}        - ${d}
+elif [ -d "${NET_ETC}/netplan" ]; then
+    if [ "$DNS_MODE" = "dhcp" ]; then
+        # 静态地址 + dhcp4 仅取 DNS: use-routes/use-ntp 关掉, 免得 DHCP 抢默认路由
+        log_info "DNS: 自动获取 (netplan dhcp4 只取 DNS)"
+        {
+            cat << EOF
+network:
+  version: 2
+  ethernets:
+    eth0:
+      dhcp4: true
+      dhcp4-overrides:
+        use-routes: false
+        use-ntp: false
+      addresses:
+        - ${NODE_IP}/${LAN_PREFIX}
+      routes:
+        - to: default
+          via: ${GATEWAY}
+EOF
+        } > "${NET_ETC}/netplan/99-static.yaml"
+    else
+        # netplan 的 nameservers 需要 YAML 列表形式
+        DNS_YAML=""
+        IFS=',' read -ra _dns_arr2 <<< "$DNS_SERVERS"
+        for d in "${_dns_arr2[@]}"; do
+            d="$(echo "$d" | tr -d ' ')"
+            [ -n "$d" ] && DNS_YAML="${DNS_YAML}        - ${d}
 "
-    done
-    # netplan 的 nameservers 需要 YAML 列表形式; DNS 行数不定, 故分两段输出
-    # (heredoc 结束符必须独占一行, 不能被变量展开吞掉)
-    {
-        cat << EOF
+        done
+        log_info "DNS: ${DNS_LIST}"
+        # netplan 的 nameservers 需要 YAML 列表形式; DNS 行数不定, 故分两段输出
+        # (heredoc 结束符必须独占一行, 不能被变量展开吞掉)
+        {
+            cat << EOF
 network:
   version: 2
   ethernets:
@@ -1040,8 +1152,9 @@ network:
       nameservers:
         addresses:
 EOF
-        printf '%s' "$DNS_YAML"
-    } > /etc/netplan/99-static.yaml
+            printf '%s' "$DNS_YAML"
+        } > "${NET_ETC}/netplan/99-static.yaml"
+    fi
     netplan apply 2>/dev/null || true
 fi
 

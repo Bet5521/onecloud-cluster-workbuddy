@@ -154,10 +154,36 @@ pydeps_hint "flask flask-cors" python3 ""           # 失败时给人可复制�
 | IP | `--ip` > 本机探测（询问 / `--yes` 自动采用）> 清单 |
 | 网关 | `--gateway` > 由最终 IP 推导（网络地址+1）> 本机探测 > 清单 |
 | 前缀 | 本机探测 > 清单 `lan_subnet` > 24 |
+| DNS | `--dns` > `ONECLOUD_DNS` > 清单 `network.dns` > 默认 `dhcp`（自动获取） |
 
 换了网段时网关会跟着变：与现网关不同网段则提示询问，`--yes` 下自动调整；
 显式 `--gateway` 不参与推导，但网段对不上仍会告警。
-配置确认页会标注每个值的来源（命令行 / 本机探测 / 清单 / 由IP推导）。
+配置确认页会标注每个值的来源（命令行 / 本机探测 / 清单 / 由IP推导 / 环境变量 / 交互输入）。
+
+**DNS 默认「DHCP 自动获取」**（v1.4.3 起）
+
+```bash
+# 默认: 不写死 nameserver, 交给 DHCP / 网络管理器 / 系统现状
+./scripts/bootstrap.sh --node wk-edge-01 --yes
+./scripts/bootstrap.sh --node wk-edge-01 --dns dhcp --yes     # 等价写法
+./scripts/bootstrap.sh --node wk-edge-01 --dns auto --yes     # auto / none 同义
+./scripts/bootstrap.sh --node wk-edge-01 --dns-dhcp --yes     # 不带值的开关
+
+# 需要固定解析时显式给出 (多个用逗号分隔)
+./scripts/bootstrap.sh --node wk-edge-01 --dns 223.5.5.5,1.1.1.1 --yes
+ONECLOUD_DNS=8.8.8.8 ./scripts/bootstrap.sh --node wk-edge-01 --yes
+```
+
+- **ifupdown**（`/etc/network/interfaces`）：自动获取时不写 `dns-nameservers`，
+  只留一行说明注释；静态指定时照旧写入
+- **netplan**：自动获取时写成 `dhcp4: true` + `dhcp4-overrides`
+  （`use-routes: false` / `use-ntp: false`），即**只从 DHCP 取 DNS，不用它下发的路由/NTP**，
+  静态地址与静态网关保持不变
+- 交互式运行时 DNS 一定会问一次，**直接回车 = 沿用当前候选值**（候选为自动获取时回车即自动获取）
+- 脚本配的是**静态 IP**：若该机已无 DHCP 客户端在跑，自动获取会拿不到 DNS。
+  执行前会明确告警，遇到解析异常改用 `--dns <地址>` 即可
+- `wireguard-setup.sh` 不受影响：`wg0.conf` 的 `DNS =` 必须是具体地址，
+  清单写了 `dhcp`/`auto` 标记时会回退为 `1.1.1.1`
 
 **apt 源按系统实际代号渲染**（v1.4.2 起）
 

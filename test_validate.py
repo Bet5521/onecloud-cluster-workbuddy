@@ -2612,6 +2612,239 @@ echo "###DONE"
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_bootstrap_dns_mode():
+    """测试 22: bootstrap 的 DNS 新增「DHCP 自动获取」并设为默认
+
+    背景: 原先 DNS 兜底写死 1.1.1.1 (lib-nodes.sh 亦然), 路由器已下发 DNS 的场景
+    反而被硬编码盖掉, 也无法表达"不干预、交给系统"。改为默认 dhcp (自动获取)。
+    """
+    print("\n" + "=" * 60)
+    print("测试 22: bootstrap DNS 模式 (DHCP 自动获取 / 静态指定)")
+    print("=" * 60)
+
+    boot = SCRIPTS_DIR / "bootstrap.sh"
+    lib = SCRIPTS_DIR / "lib-nodes.sh"
+    wg = SCRIPTS_DIR / "wireguard-setup.sh"
+    inv = PROJECT_ROOT / "inventory" / "nodes.yaml"
+    missing = [str(p) for p in (boot, lib, wg, inv) if not p.exists()]
+    if missing:
+        log_fail(f"必要文件缺失: {missing}")
+        return
+    src = boot.read_text(encoding="utf-8")
+    lsrc = lib.read_text(encoding="utf-8")
+    wsrc = wg.read_text(encoding="utf-8")
+    isrc = inv.read_text(encoding="utf-8")
+
+    # ---- 1) 静态检查 ----
+    if "dns_is_auto()" in src and "dns_apply_mode()" in src:
+        log_pass("具备 DNS 取值归一化函数 (dns_is_auto / dns_apply_mode)")
+    else:
+        log_fail("缺少 DNS 取值归一化函数")
+
+    if "--dns-dhcp" in src and "dhcp|auto|none|automatic" in src:
+        log_pass("支持 --dns-dhcp 及 dhcp/auto/none 等自动获取写法")
+    else:
+        log_fail("未识别 dhcp/auto 等自动获取写法")
+
+    if 'DNS_SERVERS="1.1.1.1"' in src:
+        log_fail("DNS 兜底仍写死 1.1.1.1", "应改为 dhcp (自动获取)")
+    else:
+        log_pass("bootstrap 不再把 1.1.1.1 写死为 DNS 兜底")
+
+    if '${_NODE_FIELD[__net__.dns]:-dhcp}' in lsrc:
+        log_pass("清单未配 dns 时默认 dhcp (lib-nodes.sh)")
+    else:
+        log_fail("lib-nodes.sh 的 NET_DNS 仍兜底成固定地址")
+
+    if re.search(r"^\s*dns:\s*dhcp\s*$", isrc, re.M):
+        log_pass("inventory/nodes.yaml 的 network.dns 已同步为 dhcp")
+    else:
+        log_fail("清单默认值未同步为 dhcp", "清单与脚本默认值会漂移")
+
+    if "WG_NET_DNS" in wsrc:
+        log_pass("wireguard 对 dhcp 标记做了回退 (wg0.conf 必须是具体地址)")
+    else:
+        log_fail("wireguard 会把 dhcp 字面值写进 wg0.conf", "客户端无法解析")
+
+    # ---- 2) 行为验证: 跑真实脚本的 dry-run / 交互 ----
+    tmpdir = Path(tempfile.mkdtemp(prefix="oc_t22_"))
+
+    def _posix(p):
+        s = Path(p).as_posix()
+        m = re.match(r"^([A-Za-z]):/(.*)$", s)
+        return f"/{m.group(1).lower()}/{m.group(2)}" if m else s
+
+    def run_boot(args, env_extra=None, stdin_data=None, tty="0", timeout=90):
+        """跑 bootstrap。
+
+        stdin 必须按**字节**喂: Windows 上 Python 的 text 模式会把 "\\n" 转成
+        "\\r\\n", bash 的 read 会把 \\r 当成内容读进去 (交互测试会因此拿到 "\\r"
+        而不是空串), 导致断言以肉眼看不见的方式失败。
+        """
+        env = dict(os.environ)
+        env["ONECLOUD_BOOTSTRAP_TTY"] = tty
+        env["ONECLOUD_ETC_ROOT"] = _posix(tmpdir)   # 越界也不会碰真实 /etc
+        if env_extra:
+            env.update(env_extra)
+        kwargs = dict(capture_output=True, env=env, cwd=str(SCRIPTS_DIR),
+                      timeout=timeout)
+        if stdin_data is None:
+            kwargs["stdin"] = subprocess.DEVNULL
+        else:
+            kwargs["input"] = stdin_data.encode("utf-8")
+        r = subprocess.run(["bash", _posix(boot)] + args, **kwargs)
+        return subprocess.CompletedProcess(
+            r.args, r.returncode,
+            r.stdout.decode("utf-8", "replace"),
+            r.stderr.decode("utf-8", "replace"))
+
+    def dns_of(out):
+        m = re.search(r"^\s*DNS:\s+(.*?)\s{2,}\(来源:\s*([^)]+)\)", out, re.M)
+        return m.groups() if m else (None, None)
+
+    base = ["--node", "wk-edge-01", "--ip", "192.168.1.101", "--hostname", "edge-01"]
+
+    try:
+        # 默认 (清单 dns: dhcp)
+        r = run_boot(base + ["--dry-run"])
+        val, srce = dns_of(r.stdout)
+        if val == "自动获取 (DHCP)" and "将设置: DNS 不写入" in r.stdout:
+            log_pass("默认即为自动获取 (清单未强制静态 DNS)")
+        else:
+            log_fail(f"默认 DNS 不是自动获取: {val} / 来源={srce}")
+
+        # 三种等价写法
+        for arg in (["--dns", "auto"], ["--dns", "none"], ["--dns-dhcp"]):
+            r = run_boot(base + arg + ["--dry-run"])
+            val, srce = dns_of(r.stdout)
+            if val == "自动获取 (DHCP)" and srce == "命令行":
+                log_pass(f"{' '.join(arg)} 识别为自动获取")
+            else:
+                log_fail(f"{' '.join(arg)} 未识别为自动获取: {val} / {srce}")
+
+        # 静态指定
+        r = run_boot(base + ["--dns", "1.1.1.1,8.8.8.8", "--dry-run"])
+        val, srce = dns_of(r.stdout)
+        if val == "1.1.1.1, 8.8.8.8" and "将设置: DNS = 1.1.1.1, 8.8.8.8" in r.stdout:
+            log_pass("--dns 指定多个地址时按列表写入")
+        else:
+            log_fail(f"静态 DNS 处理不正确: {val} / {srce}")
+
+        # 环境变量
+        r = run_boot(base + ["--dry-run"], {"ONECLOUD_DNS": "223.5.5.5"})
+        val, srce = dns_of(r.stdout)
+        if val == "223.5.5.5" and srce == "环境变量":
+            log_pass("ONECLOUD_DNS 生效并标注来源")
+        else:
+            log_fail(f"ONECLOUD_DNS 未生效: {val} / {srce}")
+
+        # 优先级: --dns > ONECLOUD_DNS
+        r = run_boot(base + ["--dns", "8.8.8.8", "--dry-run"], {"ONECLOUD_DNS": "223.5.5.5"})
+        val, srce = dns_of(r.stdout)
+        if val == "8.8.8.8" and srce == "命令行":
+            log_pass("--dns 优先于 ONECLOUD_DNS")
+        else:
+            log_fail(f"优先级错误: {val} / {srce}")
+
+        # 交互: 回车 = 自动获取, 且在确认环节取消 (不会修改系统)
+        r = run_boot(["--node", "wk-edge-01", "--ip", "192.168.1.101"],
+                     stdin_data="\nn\n", tty="1")
+        if "自动获取 (DHCP)" in r.stdout and "设置主机名" not in r.stdout:
+            log_pass("交互式直接回车 = 自动获取 (且确认前可安全取消)")
+        else:
+            log_fail("交互式回车未走自动获取", r.stdout[-300:])
+
+        r = run_boot(["--node", "wk-edge-01", "--ip", "192.168.1.101"],
+                     stdin_data="8.8.8.8\nn\n", tty="1")
+        if "8.8.8.8" in r.stdout and "设置主机名" not in r.stdout:
+            log_pass("交互式输入地址覆盖默认值")
+        else:
+            log_fail("交互式覆盖失败", r.stdout[-300:])
+
+        # ---- 3) 步骤 11 实际写盘 (4 种组合) ----
+        lines = src.splitlines()
+        i11 = next((i for i, l in enumerate(lines)
+                    if l.startswith("# ---- 11. 设置静态 IP")), -1)
+        i12 = next((i for i, l in enumerate(lines)
+                    if l.startswith("# ---- 12. 配置")), -1)
+        if min(i11, i12) < 0:
+            log_fail("无法定位步骤 11 锚点", "代码结构变了, 需同步更新本测试")
+            return
+        flow11 = "\n".join(lines[i11:i12])
+        probe = tmpdir / "probe11.sh"
+        probe.write_text(
+            'GREEN=""; YELLOW=""; RED=""; NC=""\n'
+            'log_info()  { echo "[INFO] $*"; }\n'
+            'log_warn()  { echo "[WARN] $*"; }\n'
+            'log_error() { echo "[ERROR] $*"; }\n'
+            + flow11 + "\n",
+            encoding="utf-8", newline="\n")
+
+        def run_step11(tag, layout, mode, servers, dlist):
+            root = tmpdir / f"etc_{tag}"
+            if layout == "ifupdown":
+                (root / "network").mkdir(parents=True, exist_ok=True)
+                (root / "network" / "interfaces").write_text("", encoding="utf-8")
+                artifact = root / "network" / "interfaces"
+            else:
+                (root / "netplan").mkdir(parents=True, exist_ok=True)
+                artifact = root / "netplan" / "99-static.yaml"
+            env = dict(os.environ)
+            env.update({
+                "ONECLOUD_ETC_ROOT": _posix(root),
+                "NODE_IP": "192.168.6.101", "LAN_PREFIX": "24",
+                "GATEWAY": "192.168.6.1", "DNS_MODE": mode,
+                "DNS_SERVERS": servers, "DNS_LIST": dlist,
+            })
+            subprocess.run(["bash", _posix(probe)], env=env, cwd=str(SCRIPTS_DIR),
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", stdin=subprocess.DEVNULL, timeout=60)
+            return artifact.read_text(encoding="utf-8") if artifact.exists() else ""
+
+        s = run_step11("a", "ifupdown", "dhcp", "", "自动获取 (DHCP)")
+        if "address 192.168.6.101/24" in s and "dns-nameservers" not in s:
+            log_pass("ifupdown + 自动获取: 写静态地址但不写 dns-nameservers")
+        else:
+            log_fail("ifupdown 自动获取模式下仍写入了 dns-nameservers", s[:200])
+
+        s = run_step11("b", "ifupdown", "static", "1.1.1.1,8.8.8.8", "1.1.1.1, 8.8.8.8")
+        if "dns-nameservers 1.1.1.1, 8.8.8.8" in s:
+            log_pass("ifupdown + 静态指定: 正常写入 dns-nameservers")
+        else:
+            log_fail("ifupdown 静态 DNS 未写入", s[:200])
+
+        s = run_step11("c", "netplan", "dhcp", "", "自动获取 (DHCP)")
+        if "dhcp4: true" in s and "use-routes: false" in s and "nameservers" not in s:
+            log_pass("netplan + 自动获取: dhcp4 只取 DNS (关 use-routes), 不写 nameservers")
+        else:
+            log_fail("netplan 自动获取配置不正确", s[:250])
+        if "addresses:" in s and "192.168.6.101/24" in s and "via: 192.168.6.1" in s:
+            log_pass("netplan 自动获取模式仍保留静态地址与静态网关")
+        else:
+            log_fail("netplan 静态地址/网关丢失", s[:250])
+
+        s = run_step11("d", "netplan", "static", "223.5.5.5", "223.5.5.5")
+        if "nameservers:" in s and "- 223.5.5.5" in s and "dhcp4" not in s:
+            log_pass("netplan + 静态指定: 写 nameservers 列表, 不启用 dhcp4")
+        else:
+            log_fail("netplan 静态 DNS 配置不正确", s[:250])
+
+        # ---- 4) 文档同步 ----
+        readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+        if "DNS 默认为 `dhcp`" in readme and "--dns-dhcp" in readme:
+            log_pass("README 已记录 DNS 默认值与自动获取写法")
+        else:
+            log_fail("README 未说明新的 DNS 默认行为", "文档与实际行为会漂移")
+
+        sreadme = (SCRIPTS_DIR / "README.md").read_text(encoding="utf-8")
+        if "dhcp" in sreadme and "DNS" in sreadme:
+            log_pass("scripts/README 已同步 DNS 说明")
+        else:
+            log_fail("scripts/README 未同步 DNS 说明")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 # ============ 主程序 ============
 def main():
     print("=" * 60)
@@ -2642,6 +2875,7 @@ def main():
         ("交付物一致性", test_delivery_consistency),
         ("Python 依赖降级链", test_pydeps_fallback),
         ("bootstrap apt 源与依赖", test_bootstrap_apt_sources),
+        ("bootstrap DNS 模式", test_bootstrap_dns_mode),
     ]
     
     for test_name, test_func in tests:

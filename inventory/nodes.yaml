@@ -85,6 +85,7 @@ network:
   lan_subnet: 192.168.1.0/24
   wg_subnet: 10.8.0.0/24
   gateway: 192.168.1.1
-  dns: 1.1.1.1
+  # dns: dhcp = 由 DHCP/系统自动获取 (默认); 也可写具体地址, 多个用逗号分隔
+  dns: dhcp
   wg_port: 51820
   domain: yourdomain.com

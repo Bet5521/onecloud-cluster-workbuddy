@@ -43,6 +43,13 @@ HUB_NODE="$(node_name_by_role edge-gateway 2>/dev/null || echo "${NODE_NAMES[0]}
 WG_PORT="$NET_WG_PORT"
 WG_DNS="$(node_wg_ip "$HUB_NODE" 2>/dev/null || true)"
 
+# wg0.conf 的 DNS 必须是具体地址: 清单里若写 dhcp/auto 等标记 (= 由 DHCP 自动获取),
+# 客户端拿到这个字面值无法解析, 这里统一回退到公共 DNS
+case "$(printf '%s' "${NET_DNS:-}" | tr '[:upper:]' '[:lower:]' | tr -d ' ')" in
+    ''|dhcp|auto|none|automatic|自动|自动获取) WG_NET_DNS="1.1.1.1" ;;
+    *) WG_NET_DNS="$NET_DNS" ;;
+esac
+
 # 域名: 优先参数 > 状态文件 > 清单 > 默认值
 DOMAIN=""
 if [ -f "$DOMAIN_FILE" ]; then
@@ -144,7 +151,7 @@ write_node_conf() {
         echo "Address = ${wg_ip}/32"
         echo "PrivateKey = ${PRIVATE_KEYS[$name]}"
         echo "ListenPort = ${WG_PORT}"
-        echo "DNS = ${WG_DNS}, ${NET_DNS}"
+        echo "DNS = ${WG_DNS}, ${WG_NET_DNS}"
         echo ""
         if [ "$name" = "$HUB_NODE" ]; then
             echo "# 作为 Hub 转发流量 (PostUp/PostDown 各只允许出现一次)"

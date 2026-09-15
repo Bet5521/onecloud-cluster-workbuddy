@@ -88,7 +88,7 @@ sudo bash install-service.sh
 ```json
 {
   "cluster_name": "OneCloud Cluster",
-  "version": "1.4.2",
+  "version": "1.4.3",
   "nodes": [
     {
       "name": "wk-edge-01",

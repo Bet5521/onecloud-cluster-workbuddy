@@ -175,8 +175,9 @@ load_nodes() {
     NET_LAN_SUBNET="${ONECLOUD_LAN_SUBNET:-${_NODE_FIELD[__net__.lan_subnet]:-192.168.1.0/24}}"
     NET_WG_SUBNET="${ONECLOUD_WG_SUBNET:-${_NODE_FIELD[__net__.wg_subnet]:-10.8.0.0/24}}"
     NET_WG_PORT="${ONECLOUD_WG_PORT:-${_NODE_FIELD[__net__.wg_port]:-51820}}"
-    NET_DNS="${ONECLOUD_DNS:-${_NODE_FIELD[__net__.dns]:-}}"
-    [ -z "$NET_DNS" ] && NET_DNS="1.1.1.1"
+    # 允许 "dhcp"/"auto"/"none" 等标记值 (表示由 DHCP 自动获取);
+    # 未配置时默认即为 dhcp, 不再强制兜底成 1.1.1.1
+    NET_DNS="${ONECLOUD_DNS:-${_NODE_FIELD[__net__.dns]:-dhcp}}"
 
     # LAN 掩码位数: 由 lan_subnet 推导, 例 192.168.1.0/24 -> 24
     NET_LAN_PREFIX="${NET_LAN_SUBNET##*/}"

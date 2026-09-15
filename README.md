@@ -2,7 +2,7 @@
 
 > 基于玩客云 WS1608 (Amlogic S805, ARMv7, 1GB RAM) 多节点组建的家庭服务集群
 
-**当前版本: v1.4.2**
+**当前版本: v1.4.3**
 
 ---
 
@@ -255,6 +255,9 @@ PANEL_USER=admin PANEL_PASS='强密码' PANEL_PORT=9000 python3 app.py
 
 环境变量命名规则：节点名转大写、`-` 换 `_`，字段为 `IP` / `HOSTNAME` / `WG_IP` / `ROLE`；
 网络参数用 `ONECLOUD_GATEWAY` / `ONECLOUD_DNS` / `ONECLOUD_DOMAIN` / `ONECLOUD_WG_PORT` / `ONECLOUD_LAN_PREFIX` / `ONECLOUD_WG_SUBNET`；
+其中 **DNS 默认为 `dhcp`（自动获取）** —— 脚本不向系统写入任何 nameserver，交给 DHCP / 网络管理器 /
+系统现状决定；需要写死时把 `network.dns`（或 `--dns` / `ONECLOUD_DNS`）填成具体地址，多个用逗号分隔，
+`bootstrap.sh` 交互式运行直接回车也等于"自动获取"；
 `bootstrap.sh` 换源相关用 `ONECLOUD_APT_MIRROR` / `ONECLOUD_APT_SECURITY_MIRROR`（自定义镜像）、
 `ONECLOUD_DEBIAN_CODENAME`（强制指定代号）、`ONECLOUD_APT_SKIP_MIRROR=1`（完全不换源）。
 
@@ -276,6 +279,11 @@ vim inventory/nodes.local.yaml   # 填入你的 IP/主机名, 该文件已被 gi
 
 - `bootstrap.sh` 对已登记节点自动取清单中的 IP/主机名作为默认值，命令行
   `--ip/--hostname` 可再覆盖；网关、DNS、`/etc/hosts` 全部参数化。
+  **DNS 默认自动获取（DHCP）**：`--dns dhcp`（或 `--dns auto`/`--dns-dhcp`）、清单 `dns: dhcp`、
+  交互式直接回车都等于该模式，脚本不会写死 `dns-nameservers`（netplan 下写成 `dhcp4: true`
+  且 `use-routes: false`，只从 DHCP 取 DNS 不抢默认路由）；要固定解析就传 `--dns 223.5.5.5,1.1.1.1`。
+  注意脚本配的是**静态 IP**，若该机已无 DHCP 客户端在跑，自动获取会拿不到 DNS —— 碰到解析异常
+  重新执行并指定 `--dns <地址>` 即可。
   **IP 与网关联动**：`--ip` 换了网段时网关按同网段推导并询问确认（见「快速开始」）
 - 所有运维脚本（deploy / update-all / health-check / backup / restore /
   wireguard-setup / setup / install-services）均从 `scripts/lib-nodes.sh`
@@ -317,10 +325,11 @@ vim inventory/nodes.local.yaml   # 填入你的 IP/主机名, 该文件已被 gi
 
 ## ✅ 功能验证
 
-项目自带验证套件，共 21 组，覆盖配置完整性、脚本语法、节点映射、服务一致性、
+项目自带验证套件，共 22 组，覆盖配置完整性、脚本语法、节点映射、服务一致性、
 **文档化 CLI 接口契约**、**IP/主机名可自定义性**、**安全健壮性回归**、
 **面板前后端契约**、**bootstrap 网络取值与 SD/风险预检**、**init 交互式入口契约**、
-**Python 依赖降级链**、**bootstrap apt 源与依赖安装回归**（当前 286 项）：
+**Python 依赖降级链**、**bootstrap apt 源与依赖安装回归**、
+**bootstrap DNS 模式（DHCP 自动获取）**（当前 308 项）：
 
 ```bash
 python3 test_validate.py
@@ -329,8 +338,8 @@ python3 test_validate.py
 输出示例：
 
 ```
-  总计: 286 项
-  通过: 286
+  总计: 308 项
+  通过: 308
   失败: 0
   警告: 0
 ```
@@ -380,6 +389,48 @@ python3 test_validate.py
   校验功能脚本无硬编码 IP、每个节点 hostname 字段齐全、环境变量覆盖真实生效
 - 验证项从 176 扩至 **184**（全部通过、0 警告）
 - 新增 `inventory/nodes.local.yaml.example` 覆盖模板（真实覆盖文件已 gitignore）
+
+---
+
+## 🚀 v1.4.3 变更说明
+
+**新增：`bootstrap.sh` 的 DNS 支持「DHCP 自动获取」，并把它作为默认值。**
+
+原先 DNS 的兜底值是写死的 `1.1.1.1`（`lib-nodes.sh` 里同样如此）：家里路由器已经下发
+DNS 的场景反被这个硬编码盖掉，而且没法表达「不干预、交给系统」。
+
+### 取值方式
+
+| 方式 | 写法 | 行为 |
+|------|------|------|
+| **自动获取（默认）** | `--dns dhcp` / `--dns auto` / `--dns none` / `--dns-dhcp`、清单 `dns: dhcp`、交互直接回车 | 不向系统写入任何 nameserver |
+| 静态指定 | `--dns 223.5.5.5,1.1.1.1`、清单 `dns: 223.5.5.5`、`ONECLOUD_DNS=...` | 写入 `dns-nameservers` / netplan `nameservers` |
+
+优先级：`--dns` > `ONECLOUD_DNS` > 清单 `network.dns` > 默认 `dhcp`。
+配置确认页会标注 DNS 的取值来源（命令行 / 环境变量 / 清单 / 交互输入）。
+
+### 具体行为
+
+- **ifupdown**（`/etc/network/interfaces`）：自动获取时不写 `dns-nameservers`，只留一行说明注释
+- **netplan**：自动获取时写成 `dhcp4: true` + `dhcp4-overrides`（`use-routes: false`、`use-ntp: false`）——
+  **只从 DHCP 取 DNS，不用它下发的路由 / NTP**，静态地址与静态网关不受影响
+- **交互式**：DNS 一定会问一次，直接回车 = 沿用候选值（候选为自动获取时回车即自动获取）
+- **执行前告警**：自动获取模式下明确提示「脚本配的是静态 IP，若该机已无 DHCP 客户端在跑，
+  解析可能失败，可改用 `--dns <地址>`」
+- **WireGuard 不受影响**：`wg0.conf` 的 `DNS =` 必须是具体地址，清单写了 `dhcp` / `auto`
+  标记时自动回退为 `1.1.1.1`（`wireguard-setup.sh`）
+- **清单同步**：`inventory/nodes.yaml` 与 `nodes.local.yaml.example` 的 `network.dns`
+  由 `1.1.1.1` 改为 `dhcp`
+- 测试钩子 `ONECLOUD_ETC_ROOT` 覆盖到步骤 11（静态 IP 写入），
+  便于在不触碰真实 `/etc` 的前提下做回归
+
+⚠️ **注意**：玩客云配的是**静态 IP** —— 静态配置下不会跑 DHCP 客户端，`dhcp` 的语义是
+「脚本不写死、交给系统现状」。若你的机器原本靠 DHCP 拿 DNS，改成静态 IP 后会失去这个来源，
+此时请显式指定 `--dns`。
+
+验证：新增第 22 组测试 22 项，覆盖取值归一化（dhcp/auto/none/`--dns-dhcp`）、
+优先级（`--dns` > `ONECLOUD_DNS` > 清单）、交互回车默认、dry-run 预览，
+并用探针实跑步骤 11 的 4 种组合（ifupdown / netplan × 自动获取 / 静态指定）核对写盘结果。
 
 ---
 
