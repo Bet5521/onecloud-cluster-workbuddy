@@ -2,7 +2,7 @@
 
 > 基于玩客云 WS1608 (Amlogic S805, ARMv7, 1GB RAM) 多节点组建的家庭服务集群
 
-**当前版本: v1.4.4**
+**当前版本: v1.4.5**
 
 ---
 
@@ -187,6 +187,12 @@ onecloud-cluster/
 
 # 自动化场景可强制指定是否当作交互终端 (1=交互 0=非交互)
 ONECLOUD_BOOTSTRAP_TTY=0 ./scripts/bootstrap.sh --node wk-edge-01 --ip 192.168.6.101 --yes
+
+# apt 动作默认全部跳过; 需要时显式开启 (换源会自动补一步 apt update, 但不升级系统包)
+./scripts/bootstrap.sh --node wk-edge-01 --ip 192.168.6.101 --mirror --yes
+./scripts/bootstrap.sh --node wk-edge-01 --ip 192.168.6.101 --mirror --apt-upgrade --yes
+# 完全不动 apt (纯离线初始化: 只配主机名/IP/存储/目录/SSH 密钥)
+./scripts/bootstrap.sh --node wk-edge-01 --ip 192.168.6.101 --no-apt --yes
 ```
 
 ### 2. 生成 WireGuard 配置
@@ -275,8 +281,11 @@ PANEL_USER=admin PANEL_PASS='强密码' PANEL_PORT=9000 PANEL_HOST=192.168.1.101
 其中 **DNS 默认为 `dhcp`（自动获取）** —— 脚本不向系统写入任何 nameserver，交给 DHCP / 网络管理器 /
 系统现状决定；需要写死时把 `network.dns`（或 `--dns` / `ONECLOUD_DNS`）填成具体地址，多个用逗号分隔，
 `bootstrap.sh` 交互式运行直接回车也等于"自动获取"；
-`bootstrap.sh` 换源相关用 `ONECLOUD_APT_MIRROR` / `ONECLOUD_APT_SECURITY_MIRROR`（自定义镜像）、
-`ONECLOUD_DEBIAN_CODENAME`（强制指定代号）、`ONECLOUD_APT_SKIP_MIRROR=1`（完全不换源）。
+`bootstrap.sh` 的 apt 动作**默认全部跳过**（v1.4.5 起）：换源用 `--mirror`
+（或 `ONECLOUD_APT_ENABLE_MIRROR=1`）、刷新索引用 `--apt-update`、升级系统包用
+`--apt-upgrade`、跳过装基础工具用 `--no-apt-pkgs`、四项一起跳过用 `--no-apt`；
+镜像可用 `ONECLOUD_APT_MIRROR` / `ONECLOUD_APT_SECURITY_MIRROR` 自定义，
+`ONECLOUD_DEBIAN_CODENAME` 强制指定代号，旧开关 `ONECLOUD_APT_SKIP_MIRROR=1` 仍然有效。
 
 示例 —— 把 edge 节点部署到 `10.20.30.41`、主机名 `edge-hk`：
 
@@ -324,9 +333,10 @@ vim inventory/nodes.local.yaml   # 填入你的 IP/主机名, 该文件已被 gi
 | 脚本 | 作用 | 常用用法 |
 |------|------|---------|
 | `lib-nodes.sh` | 节点清单库（单一数据源，供所有脚本 source） | 被其他脚本引用 |
+| `lib-network-audit.sh` | 通路/防火墙/SSH 通道自检库（只读探测） | 被 `bootstrap.sh` 引用 |
 | `gen-panel-config.sh` | 从清单生成 `panel/config.json` | 直接运行 |
 | `gen-node-env.sh` | 从清单渲染各节点 `.env`（保留已填密钥） | `[节点名]` / `--dry-run` |
-| `bootstrap.sh` | 新节点初始化（主机名/源/swap/SD卡/Docker/静态IP） | `--node <名> [--ip <IP>] [--gateway <IP>] [--sd <DEV>] [--no-sd] [--dry-run] --yes` |
+| `bootstrap.sh` | 新节点初始化（主机名/swap/SD卡/Docker/静态IP；apt 换源与更新默认跳过） | `--node <名> [--ip <IP>] [--gateway <IP>] [--sd <DEV>] [--no-sd] [--mirror] [--apt-update] [--no-apt] [--dry-run] --yes` |
 | `setup.sh` | 统一安装（端口检测 + 多选批量安装 + 磁盘挂载） | `sudo bash setup.sh` |
 | `wireguard-setup.sh` | WireGuard mesh 配置生成 | `gen` / `add peer` / `list` |
 | `deploy.sh` | rsync 分发配置到各节点 | `-n <节点>` / `--exec <命令>` / `-t` / `-d` |
@@ -407,6 +417,88 @@ python3 test_validate.py
   校验功能脚本无硬编码 IP、每个节点 hostname 字段齐全、环境变量覆盖真实生效
 - 验证项从 176 扩至 **184**（全部通过、0 警告）
 - 新增 `inventory/nodes.local.yaml.example` 覆盖模板（真实覆盖文件已 gitignore）
+
+---
+
+## 🚀 v1.4.5 变更说明
+
+三件事：**换源/更新不再强制执行**、**通路自检（防火墙与 SSH 通道）**、
+**面板安装可直接设置 IP / 端口 / 监听端口**。
+
+### 1. apt 动作全部改为可选，默认跳过
+
+此前初始化**必然换源 + 必然 `apt update/upgrade`**。现场代价不小：换源失败会留下
+半截源文件；升级可能拉入新内核/firmware 让机器起不来；而多数节点跑脚本前源和
+索引其实已经就绪，再动一遍纯属引入变量。现在四项各自独立，默认都不做：
+
+| 动作 | 默认 | 开启方式 |
+|------|------|---------|
+| 换源 | **跳过** | `--mirror` / `ONECLOUD_APT_ENABLE_MIRROR=1` |
+| 刷新索引 (`apt update`) | **跳过** | `--apt-update` |
+| 升级系统包 (`apt upgrade -y`) | **跳过** | `--apt-upgrade` |
+| 安装基础工具 | 执行 | 跳过用 `--no-apt-pkgs` |
+
+- `--no-apt` 一键关掉全部四项（纯离线初始化：只配主机名/IP/存储/目录/SSH 密钥）
+- 交互模式下会问这两件事，**直接回车 = 跳过**
+- 只换源、没表态要不要更新时，**自动补一步 `apt update`**（新源配旧索引装包必 404），
+  并在日志里说明这是自动补的；`--no-apt-update` 可显式否决
+- 基础工具安装失败不再中断初始化（未刷新索引时多半是索引过期，会给出 `--apt-update` 提示）
+
+### 2. 通路自检：防火墙与 SSH 通道
+
+新增 `scripts/lib-network-audit.sh`（与 `lib-nodes.sh` / `lib-pydeps.sh` /
+`lib-panel-host.sh` 同一约定：不 `set -e`、不定义 `log_*`、命令缺失时安全降级为
+`unknown`）。bootstrap 启动时打印只读报告：
+
+```
+  ── 通路自检 (只读, 不修改任何设置) ──
+    会话      : SSH 远程 (来自 192.168.1.50)
+    sshd 端口 : 22
+    防火墙    : iptables 生效中 (INPUT 默认策略 DROP)
+    [高危]    : 当前规则未放行 SSH 端口 (22), 改网络配置或重启后可能直接失联
+```
+
+要点：**本仓库的脚本不主动改防火墙**（唯一会写 `iptables` 的是 wg-quick 的
+PostUp/PostDown），报告只指出别人留下的坑：INPUT 策略 `DROP` 却没放行 SSH、
+`ufw` / `firewalld` 启用后没放行、Docker 启动把 `FORWARD` 置 `DROP`
+（本机是 WireGuard 出口时会顺带打断转发，报告会给出 `DOCKER-USER` 放行命令）。
+
+改 IP 的自保动作：
+
+- 改写 `network/` / `netplan/` 前先打快照（`/etc/onecloud/net-backup-<时间戳>/net-config.tar`）
+- netplan 先 `netplan generate` 校验，**校验不过不 apply**（旧配置继续顶着）
+- 通过 SSH 远端操作且 IP 将变更时，明确告知「这条连接会断」并打印重新登录与回滚命令
+- 变更前风险预检新增两项：SSH 会话中改 IP、现有防火墙未放行 SSH 端口
+
+WireGuard 规则同步修掉两个隐患：
+
+| 问题 | 后果 | 现在 |
+|------|------|------|
+| `iptables -A` 无 `-C` 探测 | 反复 `wg-quick up` 规则越堆越多，`PostDown` 只删一条，残留难查 | 先 `-C` 再 `-A`（幂等） |
+| `POSTROUTING -o eth0` 写死网卡 | 玩客云刷 Armbian 后网卡常是 `end0`，MASQUERADE 静默失效：wg 握手正常但客户端上不了网 | 节点侧探测默认路由网卡 |
+
+### 3. 面板安装：IP / 端口 / 监听端口分开设置
+
+`panel/install-service.sh` 现在接受参数（或交互询问，回车即默认）：
+
+```bash
+sudo bash panel/install-service.sh --host 192.168.1.101 --port 9000
+sudo bash panel/install-service.sh --host 127.0.0.1 --port 9000 --url-port 19000
+sudo bash panel/install-service.sh -y          # 全部默认, 不询问
+```
+
+| 参数 | 含义 |
+|------|------|
+| `--host` | **监听地址**（绑哪张网卡）：`0.0.0.0` / 本机局域网地址 / `127.0.0.1` |
+| `--port` | **监听端口**（默认 9000） |
+| `--url-host` | **访问地址**：面板 IP 或域名（用于生成访问入口，默认自动探测本机地址） |
+| `--url-port` | **访问端口**：经 Nginx 反代 / 路由器端口映射 / `ssh -L` 时与监听端口不同 |
+
+- 校验复用 `lib-panel-host.sh`：`192.168.1.0`、`127.0.0.0`、`224.0.0.1`、非法端口
+  一律当场拒绝并给出可采用的替代值
+- 监听/访问参数合并写入 `/etc/onecloud/panel.env`（600），只更新自己负责的四个键，
+  **不会冲掉 `init.sh` 写入的账号密码**；unit 通过 `EnvironmentFile` 引用它
+- `init/init.sh` 调用时传 `ONECLOUD_PANEL_TTY=0`，避免把已问过的问题再问一遍
 
 ---
 

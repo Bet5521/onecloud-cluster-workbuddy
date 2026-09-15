@@ -18,6 +18,17 @@ if [ -f "${SCRIPT_DIR}/lib-nodes.sh" ]; then
     fi
 fi
 
+# 网络通路 / 防火墙 / SSH 通道自检库 (纯只读探测)
+# 库缺失时自检整段降级跳过, 不影响初始化主流程
+HAVE_NET_AUDIT=false
+if [ -f "${SCRIPT_DIR}/lib-network-audit.sh" ]; then
+    # shellcheck source=lib-network-audit.sh
+    source "${SCRIPT_DIR}/lib-network-audit.sh"
+    if declare -F net_audit_report >/dev/null 2>&1; then
+        HAVE_NET_AUDIT=true
+    fi
+fi
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -226,6 +237,100 @@ dns_apply_mode() {
 }
 
 # ------------------------------------------------------------
+# apt 动作开关 —— 换源与更新默认都跳过
+#
+#   历史行为: 初始化必然换源 + 必然 apt update/upgrade。现场代价不小:
+#     换源失败会留下半截源文件; 升级可能拉入新内核/firmware 让机器起不来;
+#     多数节点跑这个脚本前源和索引其实已经就绪, 再动一遍纯属引入变量。
+#   现在四项各自独立、默认都不做, 需要哪项显式开哪项:
+#
+#     换源       DO_MIRROR       --mirror       / ONECLOUD_APT_ENABLE_MIRROR=1
+#     刷新索引   DO_APT_UPDATE   --apt-update   / ONECLOUD_APT_ENABLE_UPDATE=1
+#     升级系统包 DO_APT_UPGRADE  --apt-upgrade  / ONECLOUD_APT_ENABLE_UPGRADE=1
+#     装基础工具 DO_APT_PKGS     (默认开)       / --no-apt-pkgs 关闭
+#
+#   --no-apt 一键关掉全部四项 (纯离线初始化: 只配主机名/IP/存储/目录/SSH 密钥)
+#   旧开关 ONECLOUD_APT_SKIP_MIRROR=1 继续有效 (= 不换源, 向后兼容)
+# ------------------------------------------------------------
+apt_switch_defaults() {
+    DO_MIRROR=false
+    DO_APT_UPDATE=false
+    DO_APT_UPGRADE=false
+    DO_APT_PKGS=true
+    APT_UPDATE_AUTO=false        # 换源后自动补的刷索引 (不是用户本意, 日志里要说明)
+    APT_UPDATE_EXPLICIT=false    # 用户是否显式表过态 (显式优先于自动补)
+    APT_OPTS_EXPLICIT=false      # 命令行是否给过任一 apt 开关 (给了就不再交互询问)
+    case "$(printf '%s' "${ONECLOUD_APT_ENABLE_MIRROR:-}" | tr 'A-Z' 'a-z')" in
+        1|true|yes|on) DO_MIRROR=true ;;
+    esac
+    case "$(printf '%s' "${ONECLOUD_APT_ENABLE_UPDATE:-}" | tr 'A-Z' 'a-z')" in
+        1|true|yes|on) DO_APT_UPDATE=true ;;
+    esac
+    case "$(printf '%s' "${ONECLOUD_APT_ENABLE_UPGRADE:-}" | tr 'A-Z' 'a-z')" in
+        1|true|yes|on) DO_APT_UPGRADE=true ;;
+    esac
+    # 兼容旧开关与一键开关, 放最后 (优先级最高)
+    case "$(printf '%s' "${ONECLOUD_APT_SKIP_MIRROR:-}" | tr 'A-Z' 'a-z')" in
+        1|true|yes|on) DO_MIRROR=false ;;
+    esac
+    case "$(printf '%s' "${ONECLOUD_APT_SKIP_PKGS:-}" | tr 'A-Z' 'a-z')" in
+        1|true|yes|on) DO_APT_PKGS=false ;;
+    esac
+    case "$(printf '%s' "${ONECLOUD_APT_SKIP_ALL:-}" | tr 'A-Z' 'a-z')" in
+        1|true|yes|on)
+            DO_MIRROR=false; DO_APT_UPDATE=false; DO_APT_UPGRADE=false; DO_APT_PKGS=false ;;
+    esac
+    return 0
+}
+
+# 换源之后索引必须跟着刷新, 否则 apt install 会拿旧索引去新源取包 -> 404。
+# 因此「只换了源、没表态要不要更新」时自动补一步 apt update (不含 upgrade)。
+apt_switch_fixup() {
+    if [ "$DO_MIRROR" = true ] && [ "$DO_APT_UPDATE" != true ] \
+       && [ "$APT_UPDATE_EXPLICIT" != true ]; then
+        DO_APT_UPDATE=true
+        APT_UPDATE_AUTO=true
+    fi
+    return 0
+}
+
+# 四项状态摘要 (dry-run 与配置汇总共用); 只写 stdout
+apt_switch_desc() {
+    if [ "$DO_MIRROR" = true ]; then
+        printf '    换源      : 执行 (镜像 %s)\n' \
+            "${ONECLOUD_APT_MIRROR:-https://mirrors.tuna.tsinghua.edu.cn/debian}"
+    else
+        printf '    换源      : 跳过 (默认; 需要时加 --mirror)\n'
+    fi
+    if [ "$DO_APT_UPDATE" = true ]; then
+        if [ "$APT_UPDATE_AUTO" = true ]; then
+            printf '    刷新索引  : 执行 (换源后自动补, 可用 --no-apt-update 关闭)\n'
+        else
+            printf '    刷新索引  : 执行 (--apt-update)\n'
+        fi
+    else
+        printf '    刷新索引  : 跳过 (默认; 需要时加 --apt-update)\n'
+    fi
+    if [ "$DO_APT_UPGRADE" = true ]; then
+        printf '    升级系统  : 执行 (--apt-upgrade)\n'
+    else
+        printf '    升级系统  : 跳过 (默认; 需要时加 --apt-upgrade)\n'
+    fi
+    if [ "$DO_APT_PKGS" = true ]; then
+        printf '    基础工具  : 安装 (跳过用 --no-apt-pkgs)\n'
+    else
+        printf '    基础工具  : 跳过 (--no-apt-pkgs)\n'
+    fi
+    return 0
+}
+
+# 四项全关 (= 完全不动 apt)
+apt_switch_all_off() {
+    [ "$DO_MIRROR" != true ] && [ "$DO_APT_UPDATE" != true ] \
+        && [ "$DO_APT_UPGRADE" != true ] && [ "$DO_APT_PKGS" != true ]
+}
+
+# ------------------------------------------------------------
 # 网段计算: 由 IP + 前缀得到 "网络地址 网关"
 # 网关取网络地址 + 1 (家用网段惯例), 输出 "<网络地址> <网关>"
 # 纯算术实现, 不依赖 awk 的位运算函数 (mawk 没有 and()/lshift())
@@ -389,6 +494,16 @@ usage() {
   -y, --yes             跳过交互确认 (非交互/自动化场景必填)
       --dry-run         只打印将要应用的配置, 不修改系统 (可单独使用)
       --no-detect       不自动采用本机探测到的 IP/网关 (仍会探测并用于风险提示)
+
+  apt 动作 (四项独立, 默认全部跳过):
+      --mirror          替换 apt 源为国内镜像
+      --no-mirror       不换源 (默认行为, 显式写出便于脚本自述)
+      --apt-update      刷新 apt 索引 (apt update)
+      --no-apt-update   不刷新索引 (默认行为)
+      --apt-upgrade     升级系统包 (apt upgrade -y; 默认: 跳过)
+      --no-apt-upgrade  不升级系统包 (默认行为)
+      --no-apt-pkgs     跳过基础工具安装 (curl/git/parted/wireguard-tools ...)
+      --no-apt          跳过以上全部 (纯离线初始化: 只配主机名/IP/存储/目录/密钥)
   -h, --help            显示帮助
 
 参数与询问的关系:
@@ -413,26 +528,49 @@ DNS 的两种模式:
   * 新 IP 与本机当前 IP 不同网段 -> 告警并要求确认
   * 新 IP 已被占用 (ping 有响应) -> 告警并要求确认
   * 网关 ping 不可达 -> 告警并要求确认
+  * 当前是 SSH 会话且 IP 将变更 -> 告警 (这条连接会当场断开)
+  * 防火墙现状未放行 SSH 端口 -> 告警 (改完可能再也登不回来)
   --yes 下仅告警后继续; --dry-run 下只提示不改动。
+
+通路自检 (只读, 不改系统):
+  启动时会打印当前会话类型、sshd 端口、防火墙后端与 INPUT/FORWARD 默认策略。
+  本脚本自身不触碰防火墙 —— 唯一会写 iptables 的是 WireGuard 的 PostUp/PostDown。
+  常见"被自己挡在门外"的情形都会在这里点出来, 不会自动修改:
+    * INPUT 默认策略为 DROP 而没放行 SSH 端口
+    * ufw / firewalld 启用后未放行 SSH
+    * Docker 启动会把 FORWARD 置 DROP, 若本机是 WireGuard 出口会顺带打断转发
+
+改 IP 前的自保动作:
+  写网络配置前把 network/ 与 netplan/ 打成快照 (.onecloud/net-backup-<时间戳>/),
+  校验不过就不 apply; 通过 SSH 远端操作时会打印重新登录与回滚命令。
 
 环境变量 (优先级最高):
   ONECLOUD_WK_EDGE_01_IP / _HOSTNAME / _WG_IP
   ONECLOUD_GATEWAY / ONECLOUD_DNS / ONECLOUD_LAN_SUBNET / ONECLOUD_DOMAIN
                                                       # ONECLOUD_DNS=dhcp 亦可 (自动获取)
+  ONECLOUD_APT_ENABLE_MIRROR=1                        # 等价于 --mirror
+  ONECLOUD_APT_ENABLE_UPDATE=1                        # 等价于 --apt-update
+  ONECLOUD_APT_ENABLE_UPGRADE=1                       # 等价于 --apt-upgrade
+  ONECLOUD_APT_SKIP_PKGS=1                            # 跳过基础工具安装
+  ONECLOUD_APT_SKIP_ALL=1                             # 跳过全部 apt 动作
+  ONECLOUD_APT_SKIP_MIRROR=1                          # 旧开关, 仍然有效 (= 不换源)
   ONECLOUD_APT_MIRROR / ONECLOUD_APT_SECURITY_MIRROR  # 覆盖默认 apt 镜像
   ONECLOUD_DEBIAN_CODENAME                            # 强制指定 apt 源代号
-  ONECLOUD_APT_SKIP_MIRROR=1                          # 完全不换源, 沿用系统原有源
   ONECLOUD_ETC_ROOT                                   # 测试用: 把 /etc 指到别处 (默认 /etc)
 
 apt 源说明:
-  源按系统实际代号 (/etc/os-release 的 VERSION_CODENAME) 渲染, 不再写死 bullseye;
-  系统已用 deb822 格式 (/etc/apt/sources.list.d/debian.sources) 时就地重写该文件,
-  其余仍指向 Debian 的源会被注释/停用以免重复。被改动的文件都留 .onecloud.bak。
+  换源默认不做, 需要时 --mirror。开启后源按系统实际代号 (/etc/os-release 的
+  VERSION_CODENAME) 渲染, 不写死 bullseye; 系统已用 deb822 格式
+  (/etc/apt/sources.list.d/debian.sources) 时就地重写该文件, 其余仍指向 Debian
+  的源会被注释/停用以免重复。被改动的文件都留 .onecloud.bak。
+  只换源未表态更新时, 会自动补一步 apt update (新源配旧索引装包必 404)。
 
 示例:
-  $0 --node wk-edge-01 --yes                                  # 全部取清单值
+  $0 --node wk-edge-01 --yes                                  # 全部取清单值, 不动 apt
   $0 --node wk-edge-01 --ip 10.0.0.5 --hostname edge-01 --yes  # 覆盖 IP 与主机名
   $0 --node wk-new --ip 10.0.0.9 --hostname new --gateway 10.0.0.1 --yes
+  $0 --node wk-edge-01 --yes --mirror                         # 顺便换源 (自动刷索引)
+  $0 --node wk-edge-01 --yes --no-apt                         # 一个字节都不动 apt
   $0                                                          # 无参数: 全交互询问
 EOF
 }
@@ -467,6 +605,22 @@ else
     log_info "未检测到 SD 卡 / USB 存储"
 fi
 
+# ============================================================
+# 0b. 通路自检: 防火墙 / SSH 放行 / 转发策略
+#     纯只读, 不修改任何系统状态。目的是在"开始改网络"之前先把
+#     已经存在的、可能把人挡在门外的东西说出来 (INPUT 策略 DROP、
+#     ufw 未放行 SSH、Docker 把 FORWARD 置 DROP 之类)。
+# ============================================================
+NET_AUDIT_RISK=false
+if [ "$HAVE_NET_AUDIT" = true ]; then
+    echo ""
+    if ! net_audit_report; then
+        NET_AUDIT_RISK=true
+        log_warn "自检发现可能阻断 SSH 通道或转发的现状, 请先确认再继续"
+    fi
+    echo ""
+fi
+
 NODE_NAME=""
 NODE_IP=""
 HOSTNAME=""
@@ -482,6 +636,9 @@ DRY_RUN=false
 NO_SD=false
 NO_SD_AUTOMOUNT=false
 
+# apt 动作开关初值 (默认全部跳过; 环境变量可覆盖; 命令行参数在下面再覆盖一次)
+apt_switch_defaults
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -n|--node)      NODE_NAME="$2";    shift 2 ;;
@@ -494,6 +651,18 @@ while [[ $# -gt 0 ]]; do
         -m|--sd-mount)  SD_MOUNT="$2";     shift 2 ;;
         --no-sd)        NO_SD=true;        shift ;;
         --no-sd-automount) NO_SD_AUTOMOUNT=true; shift ;;
+        --mirror)       DO_MIRROR=true;    APT_OPTS_EXPLICIT=true; shift ;;
+        --no-mirror)    DO_MIRROR=false;   APT_OPTS_EXPLICIT=true; shift ;;
+        --apt-update)   DO_APT_UPDATE=true;   APT_UPDATE_EXPLICIT=true
+                        APT_OPTS_EXPLICIT=true; shift ;;
+        --no-apt-update) DO_APT_UPDATE=false; APT_UPDATE_EXPLICIT=true
+                        APT_OPTS_EXPLICIT=true; shift ;;
+        --apt-upgrade)  DO_APT_UPGRADE=true;  APT_OPTS_EXPLICIT=true; shift ;;
+        --no-apt-upgrade) DO_APT_UPGRADE=false; APT_OPTS_EXPLICIT=true; shift ;;
+        --no-apt-pkgs)  DO_APT_PKGS=false;  APT_OPTS_EXPLICIT=true; shift ;;
+        --no-apt)       DO_MIRROR=false; DO_APT_UPDATE=false
+                        DO_APT_UPGRADE=false; DO_APT_PKGS=false
+                        APT_OPTS_EXPLICIT=true; shift ;;
         -y|--yes)       ASSUME_YES=true;   shift ;;
         --dry-run)      DRY_RUN=true;      shift ;;
         --no-detect)    NO_DETECT=true;    shift ;;
@@ -520,6 +689,31 @@ if [ "$ASSUME_YES" = true ] || [ "$DRY_RUN" = true ]; then
 fi
 
 DETECT_IP="$CUR_IP"; DETECT_GW="$CUR_GW"; DETECT_PREFIX="$CUR_PREFIX"
+
+# ---- 1a0. apt 动作选择 (换源/更新默认都跳过) ----
+# 只在"没人表过态 + 当前可交互"时问; 一律默认 N, 直接回车 = 一个字节都不动 apt。
+# 非交互场景 (cron/CI) 请用 --mirror / --apt-update 或 ONECLOUD_APT_* 环境变量。
+if [ "$INTERACTIVE" = true ] && [ "$APT_OPTS_EXPLICIT" != true ]; then
+    echo ""
+    log_info "apt 动作 (默认全部跳过; 直接回车即跳过, 也可稍后用参数指定)"
+    _ans_mirror=""
+    read -r -p "  替换 apt 源为国内镜像? [y/N] " _ans_mirror || true
+    case "$_ans_mirror" in
+        [Yy]*) DO_MIRROR=true ;;
+        *)     DO_MIRROR=false ;;
+    esac
+    _ans_update=""
+    read -r -p "  更新系统包 (apt update && apt upgrade -y)? [y/N] " _ans_update || true
+    case "$_ans_update" in
+        [Yy]*) DO_APT_UPDATE=true; DO_APT_UPGRADE=true ;;
+        *)     DO_APT_UPDATE=false; DO_APT_UPGRADE=false ;;
+    esac
+    if [ "$DO_APT_PKGS" = true ] && [ "$DO_MIRROR" != true ] && [ "$DO_APT_UPDATE" != true ]; then
+        log_warn "基础工具仍会尝试安装 (未刷新索引, 失败只告警); 需一并跳过请加 --no-apt-pkgs"
+    fi
+fi
+# 换源了却没说要更新 -> 自动补一步刷新索引 (否则新源配旧索引, 装包必 404)
+apt_switch_fixup
 
 # ---- 1a. 用清单填充未显式给出的参数 (清单只作为默认值, 命令行优先) ----
 INVENTORY_HIT=false
@@ -832,6 +1026,19 @@ if [ -n "$DETECT_IP" ] || [ -n "$DETECT_GW" ]; then
     fi
 fi
 
+# 4) 正在通过 SSH 操作, 同时又要改 IP: 这条连接必然当场断开
+#    (这是"配完就失联"最常见的形态, 比 IP 冲突更容易发生)
+if [ "$HAVE_NET_AUDIT" = true ] && net_audit_is_ssh \
+   && [ -n "$DETECT_IP" ] && [ "$DETECT_IP" != "$NODE_IP" ]; then
+    _ssh_from="$(net_audit_ssh_client | awk '{print $1}')"
+    add_risk "当前是 SSH 会话 (来自 ${_ssh_from:-未知}), 把 IP 由 ${DETECT_IP} 改成 ${NODE_IP} 会立即断开这条连接"
+fi
+# 5) 防火墙现状本身就挡着 SSH (自检已在上方报告过, 这里再计入风险计数)
+if [ "$NET_AUDIT_RISK" = true ] && [ "$HAVE_NET_AUDIT" = true ] \
+   && ! net_audit_ssh_allowed; then
+    add_risk "现有防火墙规则未放行 SSH 端口, 改完网络配置后可能无法重新登录"
+fi
+
 # ---- 1h. 最终一致性检查: 网关与 IP 不同网段时明确告警 ----
 FINAL_IP_NET="$(ip_net_addr "$NODE_IP" "$LAN_PREFIX" 2>/dev/null || true)"
 FINAL_GW_NET="$(ip_net_addr "$GATEWAY" "$LAN_PREFIX" 2>/dev/null || true)"
@@ -883,6 +1090,8 @@ fi
 if [ -n "$DETECT_IP" ] || [ -n "$DETECT_GW" ]; then
     echo "  本机现状: IP=${DETECT_IP:-未获取} 网关=${DETECT_GW:-未获取}"
 fi
+echo "  apt 动作:"
+apt_switch_desc
 echo ""
 
 # 干跑: 只展示将要写入的配置, 不触碰系统 (放在确认之前, 可单独使用)
@@ -905,6 +1114,14 @@ if [ "$DRY_RUN" = true ]; then
         echo "  将迁移: Docker 数据目录 -> ${SD_MOUNT}/docker"
     else
         echo "  将跳过: SD 卡挂载与 Docker 数据迁移"
+    fi
+    if [ "$DO_APT_PKGS" = true ]; then
+        echo "  将执行: 安装基础工具 (curl wget git parted wireguard-tools 等)"
+    else
+        echo "  将跳过: 基础工具安装"
+    fi
+    if apt_switch_all_off; then
+        echo "  将跳过: 全部 apt 动作 (换源/刷新索引/升级/装包) —— 一个字节都不动 apt"
     fi
     echo ""
     exit 0
@@ -934,7 +1151,7 @@ log_info "设置主机名: $HOSTNAME"
 hostnamectl set-hostname "$HOSTNAME"
 echo "$HOSTNAME" > /etc/hostname
 
-# ---- 3. 换国内源 (按系统实际代号渲染, 不再写死 bullseye) ----
+# ---- 3. 换国内源 (可选, 默认跳过) ----
 APT_MIRROR="${ONECLOUD_APT_MIRROR:-https://mirrors.tuna.tsinghua.edu.cn/debian}"
 APT_SEC_MIRROR="${ONECLOUD_APT_SECURITY_MIRROR:-https://mirrors.tuna.tsinghua.edu.cn/debian-security}"
 APT_SOURCES_FILE=""
@@ -943,44 +1160,71 @@ _distro_info="$(detect_distro)"
 DISTRO_ID="${_distro_info%% *}"
 DISTRO_CODENAME="${_distro_info#* }"
 APT_CODENAME="${ONECLOUD_DEBIAN_CODENAME:-${DISTRO_CODENAME:-bullseye}}"
-log_info "系统: ID=${DISTRO_ID} 代号=${DISTRO_CODENAME:-未知} -> 使用代号 ${APT_CODENAME}"
+log_info "系统: ID=${DISTRO_ID} 代号=${DISTRO_CODENAME:-未知}"
+APT_SRC_ETC="${ONECLOUD_ETC_ROOT:-/etc}"
 
-if [ "${ONECLOUD_APT_SKIP_MIRROR:-0}" = "1" ]; then
-    log_warn "ONECLOUD_APT_SKIP_MIRROR=1: 跳过换源, 沿用系统原有源"
+if [ "$DO_MIRROR" != true ]; then
+    log_info "换源: 跳过 (默认; 需要换源请加 --mirror)"
+    log_info "      沿用系统现有源: ${APT_SRC_ETC}/apt/sources.list 或 sources.list.d/debian.sources"
 elif [ "$DISTRO_ID" = "debian" ] || [ "$DISTRO_ID" = "armbian" ] || [ "$DISTRO_ID" = "unknown" ]; then
-    log_info "配置国内 apt 源 (镜像: ${APT_MIRROR})"
+    log_info "配置国内 apt 源 (镜像: ${APT_MIRROR}, 代号 ${APT_CODENAME})"
     configure_apt_sources "$APT_CODENAME" "$APT_MIRROR" "$APT_SEC_MIRROR"
 else
     log_warn "系统 ID=${DISTRO_ID} 非 Debian 系, 跳过换源 (保留系统原有源)"
 fi
 
-# ---- 4. 更新系统 ----
-log_info "更新系统包..."
-# apt update 必须成功, 否则后面的安装没有索引可用 -> 失败即中断
-apt_run "更新软件包索引 (apt update)" apt update
-# 升级允许失败: 玩客云常因内核/firmware 升级失败或需重启而中断,
-# 不该因此让整机初始化停在一半 (主机名/源已改, 却什么都没配完)
-apt_try "升级已安装软件包 (apt upgrade)" apt upgrade -y
+# ---- 4. 更新系统 (可选, 默认跳过) ----
+if [ "$DO_APT_UPDATE" != true ] && [ "$DO_APT_UPGRADE" != true ]; then
+    log_info "更新: 跳过 (默认; 需要时加 --apt-update 刷索引 / --apt-upgrade 升级系统包)"
+else
+    if [ "$DO_APT_UPDATE" = true ]; then
+        if [ "$APT_UPDATE_AUTO" = true ]; then
+            log_warn "换源后自动补一步刷新索引 (不想刷请加 --no-apt-update)"
+        fi
+        # 刷新索引失败不致命: 后面装包会连带失败, 届时给出明确指引
+        apt_try "刷新软件包索引 (apt update)" apt update
+    else
+        log_info "刷新索引: 跳过 (未指定 --apt-update)"
+    fi
+    if [ "$DO_APT_UPGRADE" = true ]; then
+        # 升级允许失败: 玩客云常因内核/firmware 升级需重启而中断,
+        # 不该因此让整机初始化停在一半
+        apt_try "升级已安装软件包 (apt upgrade)" apt upgrade -y
+    else
+        log_info "升级系统包: 跳过 (未指定 --apt-upgrade)"
+    fi
+fi
 
-# ---- 5. 安装基础工具 ----
+# ---- 5. 安装基础工具 (默认执行; --no-apt-pkgs / --no-apt 可跳过) ----
 # 注意: 这里刻意不含 wireguard-dkms —— Debian 12 (bookworm) 起该包已从仓库移除
 #       (bullseye 尚在; 内核 5.6+ 已内置 wireguard 模块, 本就无需 dkms)。
 #       老内核且源里确实提供该包时才按需安装, 见下方。
-log_info "安装基础工具..."
-apt_run "安装基础工具" apt install -y \
-    curl wget git vim htop iotop net-tools dnsutils \
-    parted fdisk dosfstools rsync unzip jq ca-certificates \
-    gnupg lsb-release software-properties-common \
-    wireguard-tools
-
-if wireguard_kernel_builtin; then
-    log_info "内核 $(uname -r) 已内置 wireguard 模块, 无需 wireguard-dkms"
-elif apt-cache show wireguard-dkms >/dev/null 2>&1; then
-    log_warn "内核 $(uname -r) 未见内置 wireguard, 源中提供 wireguard-dkms, 安装之"
-    apt_run "安装 wireguard-dkms" apt install -y wireguard-dkms
+if [ "$DO_APT_PKGS" != true ]; then
+    log_info "跳过基础工具安装 (--no-apt-pkgs): 请自行确认 curl/git/parted/wireguard-tools 已就绪"
 else
-    log_warn "内核 $(uname -r) 较老且当前源不提供 wireguard-dkms, 已跳过"
-    log_warn "  如需 wireguard, 请先确认模块可用: modinfo wireguard"
+    log_info "安装基础工具..."
+    if ! apt_run "安装基础工具" apt install -y \
+        curl wget git vim htop iotop net-tools dnsutils \
+        parted fdisk dosfstools rsync unzip jq ca-certificates \
+        gnupg lsb-release software-properties-common \
+        wireguard-tools; then
+        log_warn "基础工具安装失败, 已继续后续步骤 (不中断初始化)"
+        if [ "$DO_APT_UPDATE" != true ]; then
+            log_warn "  当前未刷新 apt 索引, 多半是索引过期; 可加 --apt-update 重跑, 或手工 apt update"
+        else
+            log_warn "  索引已刷新仍失败, 请检查源可达性与磁盘空间: df -h /"
+        fi
+    fi
+
+    if wireguard_kernel_builtin; then
+        log_info "内核 $(uname -r) 已内置 wireguard 模块, 无需 wireguard-dkms"
+    elif apt-cache show wireguard-dkms >/dev/null 2>&1; then
+        log_warn "内核 $(uname -r) 未见内置 wireguard, 源中提供 wireguard-dkms, 安装之"
+        apt_run "安装 wireguard-dkms" apt install -y wireguard-dkms
+    else
+        log_warn "内核 $(uname -r) 较老且当前源不提供 wireguard-dkms, 已跳过"
+        log_warn "  如需 wireguard, 请先确认模块可用: modinfo wireguard"
+    fi
 fi
 
 # ---- 6. 配置时区 ----
@@ -1087,6 +1331,38 @@ fi
 log_info "配置静态 IP: $NODE_IP/${LAN_PREFIX} (网关 $GATEWAY)"
 # ONECLOUD_ETC_ROOT 仅用于测试/演练时把 /etc 指到别处 (默认 /etc)
 NET_ETC="${ONECLOUD_ETC_ROOT:-/etc}"
+
+# 断链防护 (只备份 + 告知回滚, 不自动回滚):
+#   改写 interfaces / netplan 并生效的瞬间, 旧地址就没了。如果这条命令是通过
+#   SSH 发的, 连接当场断; 万一新配置有问题, 人也回不来了。
+#   先把 network/ netplan/ 整体打个快照, 并把"怎么退回去"打在屏幕上。
+NET_BACKUP_TAR=""
+if [ "$DRY_RUN" != true ]; then
+    _net_ts="$(date +%Y%m%d-%H%M%S)"
+    _net_backup_dir="${NET_ETC}/onecloud/net-backup-${_net_ts}"
+    if mkdir -p "$_net_backup_dir" 2>/dev/null \
+       && tar -C "$NET_ETC" -cf "${_net_backup_dir}/net-config.tar" \
+              network netplan 2>/dev/null; then
+        NET_BACKUP_TAR="${_net_backup_dir}/net-config.tar"
+        log_info "原网络配置已备份: ${NET_BACKUP_TAR}"
+    else
+        log_warn "未能备份原网络配置 (目录不存在或无权限), 继续配置"
+    fi
+fi
+
+# SSH 远端改 IP: 明确告知"会断", 并给出重新登录与回滚的动作
+if [ "$HAVE_NET_AUDIT" = true ] && net_audit_is_ssh 2>/dev/null \
+   && [ -n "$DETECT_IP" ] && [ "$DETECT_IP" != "$NODE_IP" ]; then
+    echo ""
+    log_warn "当前是 SSH 会话, 新地址生效的瞬间这条连接就会断开 —— 属正常现象"
+    log_warn "  请改用新地址重新登录: ssh <用户>@${NODE_IP}"
+    if [ -n "$NET_BACKUP_TAR" ]; then
+        log_warn "  若新地址连不上, 到节点本地控制台回滚:"
+        log_warn "    tar -C ${NET_ETC} -xf ${NET_BACKUP_TAR} && netplan apply"
+    fi
+    echo ""
+fi
+
 if [ -f "${NET_ETC}/network/interfaces" ]; then
     if [ "$DNS_MODE" = "dhcp" ]; then
         DNS_LINE="# DNS 不写死: 由 DHCP/系统提供 (bootstrap --dns dhcp)"
@@ -1155,7 +1431,18 @@ EOF
             printf '%s' "$DNS_YAML"
         } > "${NET_ETC}/netplan/99-static.yaml"
     fi
-    netplan apply 2>/dev/null || true
+    # 先校验再生效: netplan generate 只生成后端配置, 不影响运行态。
+    # 校验不过就不 apply —— 让旧配置继续顶着, 总好过把机器留在半截状态。
+    if command -v netplan >/dev/null 2>&1; then
+        if netplan generate >/dev/null 2>&1; then
+            netplan apply 2>/dev/null || true
+        else
+            log_error "netplan 配置校验未通过, 本次不执行 apply (旧配置仍在生效)"
+            if [ -n "$NET_BACKUP_TAR" ]; then
+                log_error "  回滚: tar -C ${NET_ETC} -xf ${NET_BACKUP_TAR}"
+            fi
+        fi
+    fi
 fi
 
 # ---- 12. 配置 /etc/hosts (幂等: 避免重复追加) ----

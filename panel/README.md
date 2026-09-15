@@ -80,15 +80,38 @@ PANEL_HOST=127.0.0.0 python3 app.py
 ```bash
 sudo bash install-service.sh
 
-# 自定义监听地址/端口（不传则用 unit 里的默认值）
-sudo env PANEL_HOST=192.168.1.101 PANEL_PORT=9000 bash install-service.sh
+# 自定义监听地址/端口（不传则逐个询问, 直接回车 = 默认值）
+sudo bash install-service.sh --host 192.168.1.101 --port 9000
+
+# 监听在回环、经 SSH 转发到 19000 访问（访问端口与监听端口不同）
+sudo bash install-service.sh --host 127.0.0.1 --port 9000 --url-port 19000
+
+# 等价的环境变量写法 + 全程不询问（自动化场景）
+sudo env PANEL_HOST=192.168.1.101 PANEL_PORT=9000 bash install-service.sh -y
 ```
+
+| 参数 | 含义 | 默认 |
+|------|------|------|
+| `--host` / `PANEL_HOST` | **监听地址**（绑哪张网卡） | `0.0.0.0` |
+| `--port` / `PANEL_PORT` | **监听端口** | `9000` |
+| `--url-host` / `PANEL_URL_HOST` | **访问地址**：面板 IP 或域名 | 自动探测本机地址 |
+| `--url-port` / `PANEL_URL_PORT` | **访问端口**（反代 / 端口映射 / `ssh -L` 时与监听端口不同） | 同监听端口 |
+| `-y` / `--yes` | 全部取环境变量/默认值, 不询问 | — |
+
+三者的区别：**监听**决定进程 bind 到哪里（必须是本机网卡地址或 `0.0.0.0`）；
+**访问**只是浏览器里敲的入口，Nginx 反代、路由器端口映射、SSH 端口转发都会让
+它与监听值不一致，所以单独可配。
 
 `install-service.sh` 会在写 unit 之前**再校验一次** `PANEL_HOST`：即使绕过
 `init.sh` 直接调用，也不会把绑不上的地址写进服务配置（否则只会得到一个起不来的
 服务，`systemctl status` 里只有一行 `Cannot assign requested address`）。
-启动后会按监听类型打印真实入口（`0.0.0.0` 列出各网卡地址、`127.0.0.1` 提示
-仅本机并给出 `ssh -L` 命令）。
+网段地址（`192.168.1.0`）、回环网段的网络地址（`127.0.0.0`）、组播/保留段、
+非法端口都会被当场拒绝并给出替代值。启动后会按监听类型打印真实入口
+（`0.0.0.0` 列出各网卡地址、`127.0.0.1` 提示仅本机并给出 `ssh -L` 命令）。
+
+参数同时写入 `/etc/onecloud/panel.env`（权限 600，**合并**写入 —— 只更新
+`PANEL_HOST` / `PANEL_PORT` / `PANEL_URL_HOST` / `PANEL_URL_PORT` 四个键，
+不会冲掉 `init.sh` 放的账号密码），systemd unit 通过 `EnvironmentFile` 引用它。
 
 ---
 
@@ -122,7 +145,7 @@ sudo env PANEL_HOST=192.168.1.101 PANEL_PORT=9000 bash install-service.sh
 ```json
 {
   "cluster_name": "OneCloud Cluster",
-  "version": "1.4.4",
+  "version": "1.4.5",
   "nodes": [
     {
       "name": "wk-edge-01",

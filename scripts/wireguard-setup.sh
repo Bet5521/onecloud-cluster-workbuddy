@@ -154,9 +154,26 @@ write_node_conf() {
         echo "DNS = ${WG_DNS}, ${WG_NET_DNS}"
         echo ""
         if [ "$name" = "$HUB_NODE" ]; then
-            echo "# 作为 Hub 转发流量 (PostUp/PostDown 各只允许出现一次)"
-            echo "PostUp = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -A FORWARD -o wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE; iptables -A INPUT -p udp --dport ${WG_PORT} -j ACCEPT"
-            echo "PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -D FORWARD -o wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE; iptables -D INPUT -p udp --dport ${WG_PORT} -j ACCEPT"
+            # 作为 Hub 转发流量 (PostUp/PostDown 各只允许出现一次)
+            #
+            # 两条硬约束 (都是实测踩过的):
+            #   1) 先 -C 探测再 -A: wg-quick 反复 up 时规则不会越堆越多
+            #      (堆起来之后 PostDown 只删一条, 剩下的会永久留在表里,
+            #       默认策略被改成 DROP 的机器上尤其难查)。PostDown 同理。
+            #   2) 出网网卡在**节点上**运行时探测, 不写死 eth0。
+            #      玩客云刷 Armbian 后网卡常是 end0, 写死 eth0 会让 MASQUERADE
+            #      静默失效 —— 表现是 wg 握手正常、但客户端上不了网。
+            #
+            # 注意: 下面这些 \$ 是刻意转义的 —— 要让它们原样写进 wg0.conf,
+            #       由节点上的 wg-quick(eval) 展开, 而不是在控制端生成时就展开。
+            local hub_up hub_down
+            hub_up='WG_IF=$(ip -4 route show default scope global 2>/dev/null | awk "{print \$5; exit}"); [ -n "$WG_IF" ] || WG_IF=eth0; iptables -C FORWARD -i wg0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -i wg0 -j ACCEPT; iptables -C FORWARD -o wg0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -o wg0 -j ACCEPT; iptables -t nat -C POSTROUTING -o "$WG_IF" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o "$WG_IF" -j MASQUERADE'
+            hub_down='WG_IF=$(ip -4 route show default scope global 2>/dev/null | awk "{print \$5; exit}"); [ -n "$WG_IF" ] || WG_IF=eth0; iptables -D FORWARD -i wg0 -j ACCEPT 2>/dev/null; iptables -D FORWARD -o wg0 -j ACCEPT 2>/dev/null; iptables -t nat -D POSTROUTING -o "$WG_IF" -j MASQUERADE 2>/dev/null'
+            echo "# 转发 + NAT + 放行 WireGuard 入站"
+            echo "#   - 规则用 -C 探测后再添加, 重复 up 不会堆积"
+            echo "#   - 出网网卡在节点上运行时探测 (玩客云可能是 end0 而非 eth0)"
+            echo "PostUp = ${hub_up}; iptables -C INPUT -p udp --dport ${WG_PORT} -j ACCEPT 2>/dev/null || iptables -A INPUT -p udp --dport ${WG_PORT} -j ACCEPT"
+            echo "PostDown = ${hub_down}; iptables -D INPUT -p udp --dport ${WG_PORT} -j ACCEPT 2>/dev/null || true"
             echo ""
         fi
     } > "$conf"

@@ -126,6 +126,14 @@ bash init/init.sh
 之所以用 drop-in 而不是重写 unit，是为了保持 `panel/install-service.sh` 是面板服务安装的
 **唯一实现**，避免两份 unit 模板各自漂移。
 
+调用安装脚本时会带上 `ONECLOUD_PANEL_TTY=0`：监听地址/端口已在本菜单问过，
+不要再让底层脚本问一遍；**访问地址**（面板 IP 或域名）则由脚本按本机地址自动填充。
+需要单独指定访问入口（反代 / 端口映射 / `ssh -L`）时，直接调用安装脚本：
+
+```bash
+sudo bash panel/install-service.sh --host 127.0.0.1 --port 9000 --url-host panel.lan --url-port 19000
+```
+
 访问地址与账号会在部署结束时打印。
 
 > 面板默认部署到**运行本入口的这台机器**。若要把面板装到 edge 节点，请先 SSH 到该节点，

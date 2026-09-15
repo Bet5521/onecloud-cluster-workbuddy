@@ -80,6 +80,15 @@ if [ -f "${SCRIPTS_DIR}/lib-panel-host.sh" ]; then
 fi
 
 # ------------------------------------------------------------
+#     复用 scripts/lib-network-audit.sh (通路/防火墙/SSH 通道自检)
+#     只读探测, 供网络相关操作前把关; 缺失时相关提醒自动降级为跳过
+# ------------------------------------------------------------
+if [ -f "${SCRIPTS_DIR}/lib-network-audit.sh" ]; then
+    # shellcheck source=../scripts/lib-network-audit.sh
+    source "${SCRIPTS_DIR}/lib-network-audit.sh"
+fi
+
+# ------------------------------------------------------------
 # 3. 颜色与日志 (在 source lib-nodes.sh 之后定义, 覆盖同名函数)
 # ------------------------------------------------------------
 RED='\033[0;31m'
@@ -572,8 +581,11 @@ panel_install_systemd() {
     log_info "安装 systemd 服务 (复用 panel/install-service.sh)"
     # 同时以环境变量注入监听参数, 与上面的 EnvironmentFile 形成双保险
     # (用 env 而非 VAR= 前缀, 避免 sudo 的 env_reset 把变量丢掉)
+    # ONECLOUD_PANEL_TTY=0: 监听地址/端口已在本菜单问过, 别让安装脚本再问一遍
+    #        (访问地址由脚本按本机地址自动填充)
+    #        刻意不用命令行开关表达 —— 那等于预置默认值, 与本脚本的约定冲突
     $SUDO env PANEL_HOST="$PANEL_HOST" PANEL_PORT="$PANEL_PORT" \
-        bash "${PANEL_DIR}/install-service.sh" || return 1
+        ONECLOUD_PANEL_TTY=0 bash "${PANEL_DIR}/install-service.sh" || return 1
 
     $SUDO systemctl daemon-reload
     $SUDO systemctl restart onecloud-panel
@@ -1171,7 +1183,8 @@ menu_selfcheck() {
     echo ""
     echo -e "${BOLD}关键脚本${NC}"
     local s
-    for s in lib-nodes.sh lib-pydeps.sh lib-panel-host.sh bootstrap.sh deploy.sh \
+    for s in lib-nodes.sh lib-pydeps.sh lib-panel-host.sh lib-network-audit.sh \
+             bootstrap.sh deploy.sh \
              health-check.sh backup.sh \
              restore.sh update-all.sh install-services.sh setup.sh \
              wireguard-setup.sh gen-panel-config.sh gen-node-env.sh; do

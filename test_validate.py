@@ -2459,6 +2459,8 @@ EOS
     export MOCK_FAIL_UPDATE=0 MOCK_FAIL_UPGRADE=0 MOCK_DKMS_AVAILABLE=0
     export MOCK_DKMS_INSTALL_FAIL=0 MOCK_KERNEL=5.10.63-rockchip
     unset ONECLOUD_APT_SKIP_MIRROR
+    # v1.4.5 起换源/更新默认跳过; 本组验证的是"开启后"的老行为, 故显式打开
+    export DO_MIRROR=true DO_APT_UPDATE=true DO_APT_UPGRADE=true DO_APT_PKGS=true
     local kv
     for kv in "$@"; do export "$kv"; done
     ( set -e; step_apt_flow ) > "$WORK/out_$tag.txt" 2>&1
@@ -2486,7 +2488,7 @@ run_case s4_oldkern_nodkms    debian bookworm 1 0 MOCK_KERNEL=4.19.100-rockchip
 run_case s5_oldkern_dkms      debian bookworm 1 0 MOCK_KERNEL=4.19.100-rockchip MOCK_DKMS_AVAILABLE=1
 run_case s6_deb822            debian bookworm 1 1
 run_case s7_ubuntu            ubuntu jammy    1 0
-run_case s8_skip_mirror       debian bookworm 1 0 ONECLOUD_APT_SKIP_MIRROR=1
+run_case s8_skip_mirror       debian bookworm 1 0 DO_MIRROR=false
 run_case s9_bullseye          debian bullseye 1 0
 run_case s10_dkms_install_100 debian bookworm 1 0 MOCK_KERNEL=4.19.100-rockchip MOCK_DKMS_AVAILABLE=1 MOCK_DKMS_INSTALL_FAIL=1
 echo "###DONE"
@@ -2545,12 +2547,12 @@ echo "###DONE"
         else:
             log_fail("未备份原 sources.list", "出问题无法回滚")
 
-        # --- s2: apt update 返回 100 ---
+        # --- s2: apt update 返回 100 (v1.4.5 起为非致命步骤, 但报错必须透出) ---
         c2 = sect("OUT", "s2_update_100")
-        if rc("s2_update_100") == 100:
-            log_pass("apt update 失败时退出码透传 100")
+        if rc("s2_update_100") == 0:
+            log_pass("apt update 失败不致命 (不再让整机初始化停在半路)")
         else:
-            log_fail(f"apt update 失败退出码异常: {rc('s2_update_100')}")
+            log_fail(f"apt update 失败导致整体退出 {rc('s2_update_100')}")
         if "apt 步骤失败" in c2 and "100 = apt/dpkg 处理失败" in c2:
             log_pass("失败时打印步骤名并解释 100 的含义")
         else:
@@ -2618,9 +2620,9 @@ echo "###DONE"
         else:
             log_fail("非 Debian 系统处理不正确", s7[:200])
         s8 = sect("SOURCES", "s8_skip_mirror")
-        if rc("s8_skip_mirror") == 0 and "跳过换源" in sect("OUT", "s8_skip_mirror") \
+        if rc("s8_skip_mirror") == 0 and "换源: 跳过" in sect("OUT", "s8_skip_mirror") \
                 and "bullseye main contrib non-free" in s8:
-            log_pass("ONECLOUD_APT_SKIP_MIRROR=1 时完全不动源文件")
+            log_pass("不换源 (DO_MIRROR=false) 时完全不动源文件")
         else:
             log_fail("跳过换源开关未生效", s8[:200])
 
@@ -2777,15 +2779,16 @@ def test_bootstrap_dns_mode():
             log_fail(f"优先级错误: {val} / {srce}")
 
         # 交互: 回车 = 自动获取, 且在确认环节取消 (不会修改系统)
+        # 输入前两个回车用于跳过 v1.4.5 新增的 apt 开关询问 (换源 / 更新)
         r = run_boot(["--node", "wk-edge-01", "--ip", "192.168.1.101"],
-                     stdin_data="\nn\n", tty="1")
+                     stdin_data="\n\n\nn\n", tty="1")
         if "自动获取 (DHCP)" in r.stdout and "设置主机名" not in r.stdout:
             log_pass("交互式直接回车 = 自动获取 (且确认前可安全取消)")
         else:
             log_fail("交互式回车未走自动获取", r.stdout[-300:])
 
         r = run_boot(["--node", "wk-edge-01", "--ip", "192.168.1.101"],
-                     stdin_data="8.8.8.8\nn\n", tty="1")
+                     stdin_data="\n\n8.8.8.8\nn\n", tty="1")
         if "8.8.8.8" in r.stdout and "设置主机名" not in r.stdout:
             log_pass("交互式输入地址覆盖默认值")
         else:
@@ -3056,8 +3059,9 @@ def test_panel_listen_host():
     else:
         log_fail("描述文案未说明访问范围")
 
-    # ---- 3) install-service.sh 入参校验 (截到写 unit 之前) ----
-    anchor = "cat > /etc/systemd/system/onecloud-panel.service << EOF"
+    # ---- 3) install-service.sh 入参校验 (截到落盘/写 unit 之前) ----
+    # 锚点取"落盘"注释行: 校验逻辑都在它之前, 而它之后会写文件 (测试不该落盘)
+    anchor = "# ---- 落盘: 合并写 panel.env"
     probe = PANEL_DIR / "_probe_t23.sh"
     probe.write_text(ssrc[:ssrc.index(anchor)] + "\nexit 0\n", encoding="utf-8", newline="\n")
     try:
@@ -3205,6 +3209,817 @@ def test_panel_listen_host():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+# ============ 测试24: bootstrap apt 动作可选化 ============
+def test_bootstrap_apt_optional():
+    """测试 24: bootstrap 的换源/更新改为可选且默认跳过
+
+    背景: 此前初始化必然换源 + 必然 apt update/upgrade。现场代价:
+    换源失败会留下半截源文件, 升级可能拉入新内核让机器起不来,
+    而多数节点跑脚本前源和索引其实已经就绪。
+    v1.4.5 起四项 (换源/刷索引/升级/装基础工具) 各自独立, 默认都不做。
+    """
+    print("\n" + "=" * 60)
+    print("测试 24: bootstrap apt 动作可选化 (默认跳过)")
+    print("=" * 60)
+
+    boot = SCRIPTS_DIR / "bootstrap.sh"
+    if not boot.exists():
+        log_fail("scripts/bootstrap.sh 缺失")
+        return
+    src = boot.read_text(encoding="utf-8")
+    lines = src.splitlines()
+
+    # ---- 1) 静态检查 ----
+    needed = ["apt_switch_defaults()", "apt_switch_fixup()", "apt_switch_desc()",
+              "apt_switch_all_off()"]
+    missing = [n for n in needed if n not in src]
+    if missing:
+        log_fail(f"缺少 apt 开关相关函数: {missing}")
+    else:
+        log_pass("具备 apt 开关函数 (默认值 / 联动 / 摘要 / 全关判定)")
+
+    flags = ["--mirror", "--no-mirror", "--apt-update", "--apt-upgrade",
+             "--no-apt-pkgs", "--no-apt"]
+    absent = [f for f in flags if f not in src]
+    if absent:
+        log_fail(f"缺少选项: {absent}")
+    else:
+        log_pass("提供 --mirror / --apt-update / --apt-upgrade / --no-apt-pkgs / --no-apt")
+
+    if re.search(r"DO_MIRROR=false\s*$", src, re.M) \
+            and re.search(r"DO_APT_UPDATE=false\s*$", src, re.M) \
+            and re.search(r"DO_APT_UPGRADE=false\s*$", src, re.M):
+        log_pass("换源/刷索引/升级三项默认 false (默认跳过)")
+    else:
+        log_fail("默认值不是跳过", "换源与更新仍会自动执行")
+
+    if re.search(r"DO_APT_PKGS=true\s*$", src, re.M):
+        log_pass("基础工具安装默认仍执行 (可用 --no-apt-pkgs 关)")
+    else:
+        log_fail("基础工具安装默认被关掉", "会与历史行为不一致")
+
+    if "ONECLOUD_APT_SKIP_MIRROR" in src and "ONECLOUD_APT_SKIP_ALL" in src:
+        log_pass("保留旧开关并新增总开关 (向后兼容)")
+    else:
+        log_fail("旧开关被移除", "已有脚本/文档会失效")
+
+    # ---- 2) 行为验证: 切片 + mock apt, 逐个开关组合 ----
+    i_log = next((i for i, l in enumerate(lines) if l.startswith("log_info()  {")), -1)
+    i_net = next((i for i, l in enumerate(lines) if l.startswith("# 网段计算")), -1)
+    i_s3 = next((i for i, l in enumerate(lines) if l.startswith("# ---- 3. 换国内源")), -1)
+    i_s6 = next((i for i, l in enumerate(lines) if l.startswith("# ---- 6. 配置时区")), -1)
+    if min(i_log, i_net, i_s3, i_s6) < 0:
+        log_fail("无法定位 helper / 步骤锚点", "代码结构变了, 需同步更新本测试")
+        return
+
+    helpers = "\n".join(lines[i_log:i_net - 1])
+    flow = "\n".join(lines[i_s3:i_s6])
+
+    tmpdir = Path(tempfile.mkdtemp(prefix="oc_t24_"))
+    mockbin = tmpdir / "mockbin"
+    mockbin.mkdir()
+
+    def _posix(p):
+        s = Path(p).as_posix()
+        m = re.match(r"^([A-Za-z]):/(.*)$", s)
+        return f"/{m.group(1).lower()}/{m.group(2)}" if m else s
+
+    mocks = {
+        "apt": r"""#!/bin/bash
+echo "apt $*" >> "$APT_LOG"
+exit 0
+""",
+        "apt-cache": r"""#!/bin/bash
+echo "apt-cache $*" >> "$APT_LOG"
+exit 0
+""",
+        "uname": r"""#!/bin/bash
+[ "$1" = "-r" ] && { echo "5.10.63-rockchip"; exit 0; }
+echo Linux
+exit 0
+""",
+    }
+    for name, body in mocks.items():
+        p = mockbin / name
+        p.write_text(body, encoding="utf-8", newline="\n")
+        os.chmod(p, 0o755)
+
+    driver = r"""
+# ---------------- driver ----------------
+set +e
+WORK="@WORK@"
+M="@MOCK@"
+PATH="$M:/usr/bin:/bin"
+export PATH
+
+run_case() {
+    local tag="$1"
+    shift
+    local root="$WORK/root_$tag"
+    mkdir -p "$root/apt/sources.list.d"
+    printf 'ID=debian\nVERSION_CODENAME=bookworm\n' > "$root/os-release"
+    cat > "$root/apt/sources.list" <<'EOS'
+deb http://deb.debian.org/debian bookworm main
+EOS
+    export ONECLOUD_ETC_ROOT="$root"
+    export APT_LOG="$WORK/apt_$tag.log"
+    : > "$APT_LOG"
+
+    # 复位: 先清掉所有开关与环境变量, 再用 apt_switch_defaults 取默认值
+    unset DO_MIRROR DO_APT_UPDATE DO_APT_UPGRADE DO_APT_PKGS
+    unset APT_UPDATE_AUTO APT_UPDATE_EXPLICIT
+    unset ONECLOUD_APT_ENABLE_MIRROR ONECLOUD_APT_ENABLE_UPDATE
+    unset ONECLOUD_APT_ENABLE_UPGRADE ONECLOUD_APT_SKIP_MIRROR
+    unset ONECLOUD_APT_SKIP_PKGS ONECLOUD_APT_SKIP_ALL
+    local kv
+    for kv in "$@"; do
+        case "$kv" in ONECLOUD_*) export "$kv" ;; esac
+    done
+    apt_switch_defaults
+    for kv in "$@"; do
+        case "$kv" in DO_*|APT_*) export "$kv" ;; esac
+    done
+    apt_switch_fixup
+
+    ( set -e; step_apt_flow ) > "$WORK/out_$tag.txt" 2>&1
+    echo "###RC:$tag:$?"
+    echo "###APTLOG_BEGIN:$tag"
+    cat "$APT_LOG"
+    echo "###APTLOG_END:$tag"
+    echo "###SOURCES_BEGIN:$tag"
+    cat "$root/apt/sources.list"
+    echo "###SOURCES_END:$tag"
+    echo "###OUT_BEGIN:$tag"
+    cat "$WORK/out_$tag.txt"
+    echo "###OUT_END:$tag"
+}
+
+run_case a1_default
+run_case a2_mirror_only        DO_MIRROR=true
+run_case a3_mirror_no_update   DO_MIRROR=true APT_UPDATE_EXPLICIT=true
+run_case a4_update_only        DO_APT_UPDATE=true
+run_case a5_upgrade_only       DO_APT_UPGRADE=true
+run_case a6_no_pkgs            DO_APT_PKGS=false
+run_case a7_all_off            DO_APT_PKGS=false DO_APT_UPDATE=false DO_APT_UPGRADE=false DO_MIRROR=false
+run_case a8_legacy_env         ONECLOUD_APT_ENABLE_MIRROR=1 ONECLOUD_APT_SKIP_MIRROR=1
+run_case a9_env_enable         ONECLOUD_APT_ENABLE_MIRROR=1 ONECLOUD_APT_ENABLE_UPDATE=1
+echo "###DONE"
+"""
+    probe = tmpdir / "probe.sh"
+    probe.write_text(
+        helpers + "\n\nstep_apt_flow() {\n" + flow + "\n}\n" + driver
+        .replace("@WORK@", _posix(tmpdir))
+        .replace("@MOCK@", _posix(mockbin)),
+        encoding="utf-8", newline="\n")
+
+    try:
+        r = subprocess.run(["bash", _posix(probe)], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace",
+                           stdin=subprocess.DEVNULL, timeout=420)
+        out = r.stdout
+
+        def sect(name, tag):
+            m = re.search(rf"###{name}_BEGIN:{tag}\n(.*?)\n###{name}_END:{tag}", out, re.S)
+            return (m.group(1) + "\n") if m else ""
+
+        def rc(tag):
+            m = re.search(rf"###RC:{tag}:(\d+)", out)
+            return int(m.group(1)) if m else None
+
+        if "###DONE" not in out:
+            log_fail("mock 驱动未跑完", f"stderr={r.stderr[-300:]}")
+            return
+
+        # a1: 默认 —— 一个 apt 动作都不该有源改动, 只装基础工具
+        a1 = sect("APTLOG", "a1_default")
+        s1 = sect("SOURCES", "a1_default")
+        if rc("a1_default") == 0:
+            log_pass("默认组合下初始化正常退出")
+        else:
+            log_fail(f"默认组合退出码 {rc('a1_default')}")
+        if "update" not in a1 and "upgrade" not in a1:
+            log_pass("默认不刷新索引、不升级系统 (这是本次改动的核心)")
+        else:
+            log_fail("默认仍在执行 update/upgrade", a1[:200])
+        if "apt install -y" in a1:
+            log_pass("默认仍会安装基础工具")
+        else:
+            log_fail("默认跳过了基础工具安装")
+        if "bookworm main" in s1 and "onecloud" not in s1:
+            log_pass("默认完全不改写 apt 源文件")
+        else:
+            log_fail("默认仍改写了源文件", s1[:200])
+        if "换源: 跳过" in sect("OUT", "a1_default"):
+            log_pass("输出里明确标注「换源: 跳过」")
+        else:
+            log_fail("未标注换源被跳过")
+
+        # a2: 只开换源 -> 必须自动补刷索引, 但不升级
+        a2 = sect("APTLOG", "a2_mirror_only")
+        s2 = sect("SOURCES", "a2_mirror_only")
+        if "bookworm" in s2 and "mirrors.tuna" in s2:
+            log_pass("--mirror 时按系统代号写入国内源")
+        else:
+            log_fail("--mirror 未写入源", s2[:200])
+        if "apt update" in a2 and "apt upgrade" not in a2:
+            log_pass("换源后自动补刷索引, 但不顺手升级系统包")
+        else:
+            log_fail("换源后的联动不正确", a2[:200])
+        if "自动补" in sect("OUT", "a2_mirror_only"):
+            log_pass("自动补的刷索在日志里被说明 (不是悄悄执行)")
+        else:
+            log_fail("自动补刷索引未说明原因")
+
+        # a3: 显式否决刷索引 -> 不自动补 (尊重显式指定)
+        a3 = sect("APTLOG", "a3_mirror_no_update")
+        if "update" not in a3 and "upgrade" not in a3:
+            log_pass("显式否决刷索引时不做任何 apt 动作 (显式优先)")
+        else:
+            log_fail("显式否决仍被执行", a3[:200])
+
+        # a4/a5: 只刷索引 / 只升级
+        a4 = sect("APTLOG", "a4_update_only")
+        if "apt update" in a4 and "apt upgrade" not in a4:
+            log_pass("--apt-update 只刷索引, 不升级")
+        else:
+            log_fail("--apt-update 行为不正确", a4[:200])
+        a5 = sect("APTLOG", "a5_upgrade_only")
+        if "apt upgrade" in a5 and "apt update" not in a5:
+            log_pass("--apt-upgrade 只升级, 不额外刷索引")
+        else:
+            log_fail("--apt-upgrade 行为不正确", a5[:200])
+
+        # a6/a7: 跳过装包 / 全关
+        a6 = sect("APTLOG", "a6_no_pkgs")
+        if "apt install -y" not in a6 and "update" not in a6:
+            log_pass("--no-apt-pkgs 时不再安装基础工具")
+        else:
+            log_fail("--no-apt-pkgs 未生效", a6[:200])
+        a7 = sect("APTLOG", "a7_all_off")
+        if a7.strip() == "":
+            log_pass("四项全关时 apt 一次都没被调用 (纯离线初始化)")
+        else:
+            log_fail("四项全关仍调用了 apt", a7[:200])
+
+        # a8: 旧开关 ONECLOUD_APT_SKIP_MIRROR 仍能压住新开关
+        s8 = sect("SOURCES", "a8_legacy_env")
+        if "onecloud" not in s8 and "bookworm main" in s8:
+            log_pass("旧开关 ONECLOUD_APT_SKIP_MIRROR=1 仍能阻止换源")
+        else:
+            log_fail("旧开关失效", s8[:200])
+
+        # a9: 环境变量启用换源+刷索引
+        s9 = sect("SOURCES", "a9_env_enable")
+        a9 = sect("APTLOG", "a9_env_enable")
+        if "mirrors.tuna" in s9 and "apt update" in a9:
+            log_pass("ONECLOUD_APT_ENABLE_MIRROR/UPDATE 环境变量生效")
+        else:
+            log_fail("环境变量开关未生效", (s9[:120] + a9[:120]))
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ============ 测试25: 防火墙 / SSH 通道自检 ============
+def test_network_audit():
+    """测试 25: 网络通路 / 防火墙 / SSH 通道自检
+
+    背景: 本仓库脚本不主动改防火墙 (唯一动 iptables 的是 wg-quick 的
+    PostUp/PostDown), 但现场真正把人挡在门外的是别的: INPUT 策略 DROP
+    却没放行 SSH、ufw 启用后没放行、Docker 把 FORWARD 置 DROP 打断 wg 转发、
+    以及通过 SSH 远端改静态 IP 把自己的连接改断。
+    """
+    print("\n" + "=" * 60)
+    print("测试 25: 防火墙与 SSH 通道自检")
+    print("=" * 60)
+
+    lib = SCRIPTS_DIR / "lib-network-audit.sh"
+    boot = SCRIPTS_DIR / "bootstrap.sh"
+    wg = SCRIPTS_DIR / "wireguard-setup.sh"
+    gk = PROJECT_ROOT / "node-wk-edge-01" / "wireguard" / "generate-keys.sh"
+    missing = [str(p) for p in (lib, boot, wg, gk) if not p.exists()]
+    if missing:
+        log_fail(f"必要文件缺失: {missing}")
+        return
+
+    src = boot.read_text(encoding="utf-8")
+    wsrc = wg.read_text(encoding="utf-8")
+    gsrc = gk.read_text(encoding="utf-8")
+
+    # ---- 1) 静态检查: bootstrap 集成与断链防护 ----
+    if "lib-network-audit.sh" in src and "net_audit_report" in src:
+        log_pass("bootstrap 接入通路自检库并在启动时输出报告")
+    else:
+        log_fail("bootstrap 未接入自检库")
+
+    if "net_audit_is_ssh" in src and "会立即断开这条连接" in src:
+        log_pass("SSH 会话中变更 IP 会明确告警「连接将断开」")
+    else:
+        log_fail("未检测 SSH 会话风险", "远端改 IP 会当场失联且无提示")
+
+    if "net-backup-" in src and "net-config.tar" in src:
+        log_pass("改写网络配置前先打快照 (含 netplan / interfaces)")
+    else:
+        log_fail("改写前没有备份", "配置出错无法回退")
+
+    if "netplan generate" in src:
+        log_pass("netplan 配置先校验再生效 (校验不过不 apply)")
+    else:
+        log_fail("netplan 未做语法校验", "写坏配置会直接 apply")
+
+    if not re.search(r"iptables\s+-(A|I|D|P|F|X)\b", src):
+        log_pass("bootstrap 自身不写 iptables (只在自检里只读)")
+    else:
+        log_fail("bootstrap 里出现会改防火墙的命令", "改网络配置时动防火墙极易把自己挡在外面")
+
+    # ---- 2) 静态检查: WireGuard 规则不再写死网卡且幂等 ----
+    if "-o eth0" in wsrc or "-o eth0" in gsrc:
+        log_fail("wg0.conf 的 MASQUERADE 仍写死 eth0",
+                 "玩客云可能是 end0, NAT 会静默失效")
+    else:
+        log_pass("MASQUERADE 不再写死 eth0")
+
+    if "iptables -C" in wsrc or "-C FORWARD" in wsrc:
+        log_pass("wireguard 规则用 -C 探测后再添加 (重复 up 不堆叠)")
+    else:
+        log_fail("wireguard 规则仍是无条件 -A", "反复 up 会堆叠残留规则")
+
+    if "WG_IF" in wsrc and "WG_EGRESS_IF" in gsrc:
+        log_pass("出网网卡在节点侧探测 (控制端生成 + 节点本地生成两条路都覆盖)")
+    else:
+        log_fail("出网网卡探测缺失")
+
+    # ---- 3) 行为验证: 自检函数在受控环境下判定 ----
+    tmpdir = Path(tempfile.mkdtemp(prefix="oc_t25_"))
+    mockbin = tmpdir / "mockbin"
+    mockbin.mkdir()
+
+    def _posix(p):
+        s = Path(p).as_posix()
+        m = re.match(r"^([A-Za-z]):/(.*)$", s)
+        return f"/{m.group(1).lower()}/{m.group(2)}" if m else s
+
+    mocks = {
+        "iptables": r"""#!/bin/bash
+# 支持 -S / -P / -C / -A / -D 的最小实现; -C 命中已存在规则时返回 0
+LOG="${IPT_LOG:-/dev/null}"
+STATE="${IPT_STATE:-/dev/null}"
+tbl="filter"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -t) tbl="$2"; shift 2 ;;
+        -C|-A|-D|-I|-S|-P) break ;;
+        *) shift ;;
+    esac
+done
+op="${1:-}"; shift || true
+if [ "$op" = "-S" ]; then
+    chain="${1:-}"
+    if [ -n "$chain" ]; then
+        # 指定链: 只回该链的策略 (net_audit_policy 按链读取)
+        eval "pol=\${MOCK_POL_$chain:-ACCEPT}"
+        echo "-P $chain $pol"
+        if [ "$chain" = "INPUT" ] && [ -n "${MOCK_S_INPUT_RULES:-}" ]; then
+            printf '%s\n' "$MOCK_S_INPUT_RULES"
+        fi
+        exit 0
+    fi
+    echo "-P INPUT ${MOCK_POL_INPUT:-ACCEPT}"
+    echo "-P FORWARD ${MOCK_POL_FORWARD:-ACCEPT}"
+    echo "-P OUTPUT ACCEPT"
+    exit 0
+fi
+key="$tbl $*"
+echo "iptables[$tbl] $op $*" >> "$LOG"
+case "$op" in
+    -C) grep -qxF "$key" "$STATE" 2>/dev/null && exit 0; exit 1 ;;
+    -A|-I) echo "$key" >> "$STATE"; exit 0 ;;
+    -D)
+        grep -vxF "$key" "$STATE" > "${STATE}.tmp" 2>/dev/null || true
+        mv "${STATE}.tmp" "$STATE" 2>/dev/null || true
+        exit 0 ;;
+    -P) exit 0 ;;
+esac
+exit 0
+""",
+        "ss": r"""#!/bin/bash
+echo "LISTEN 0 128 0.0.0.0:${MOCK_SSH_PORT:-22} 0.0.0.0:* users:(("sshd",pid=1,fd=3))"
+exit 0
+""",
+        "ufw": r"""#!/bin/bash
+case "$1" in
+    status)
+        if [ "${MOCK_UFW_ACTIVE:-0}" = "1" ]; then
+            echo "Status: active"
+            [ -n "${MOCK_UFW_ALLOW:-}" ] && printf '%s\n' "$MOCK_UFW_ALLOW"
+            echo ""
+            echo "To                         Action      From"
+            echo "--                         ------      ----"
+        else
+            echo "Status: inactive"
+        fi
+        exit 0 ;;
+esac
+exit 0
+""",
+        "ip": r"""#!/bin/bash
+# 默认路由与地址查询: 只覆盖自检用到的两种
+case "$*" in
+    *"route show default"*)
+        echo "${MOCK_DEFAULT_ROUTE:-default via 192.168.1.1 dev end0 proto dhcp metric 100}"
+        exit 0 ;;
+    *"addr show"*)
+        # 贴近 iproute2 真实输出: 第 4 列是地址/前缀
+        echo "2: eth0    inet ${MOCK_LOCAL_ADDR:-192.168.1.101/24} brd 192.168.1.255 scope global eth0"
+        exit 0 ;;
+esac
+exit 0
+""",
+    }
+    for name, body in mocks.items():
+        p = mockbin / name
+        p.write_text(body, encoding="utf-8", newline="\n")
+        os.chmod(p, 0o755)
+
+    driver = r"""
+# ---------------- driver ----------------
+set +e
+M="@MOCK@"
+LIB="@LIB@"
+WORK="@WORK@"
+PATH="$M:/usr/bin:/bin"
+export PATH
+log_info()  { echo "[INFO] $*"; }
+log_warn()  { echo "[WARN] $*"; }
+log_error() { echo "[ERROR] $*"; }
+# shellcheck disable=SC1090
+. "$LIB"
+
+export IPT_STATE="$WORK/ipt.rules"
+export IPT_LOG="$WORK/ipt.log"
+: > "$IPT_STATE"; : > "$IPT_LOG"
+
+case_run() {
+    local tag="$1"; shift
+    unset SSH_CONNECTION SSH_CLIENT MOCK_POL_INPUT MOCK_POL_FORWARD MOCK_S_INPUT_RULES
+    unset MOCK_UFW_ACTIVE MOCK_UFW_ALLOW MOCK_SSH_PORT MOCK_DEFAULT_ROUTE
+    local kv
+    for kv in "$@"; do export "$kv"; done
+    echo "###CASE:$tag"
+    echo "  backend=$(net_audit_backend)"
+    echo "  input_pol=$(net_audit_policy INPUT)"
+    echo "  forward_pol=$(net_audit_policy FORWARD)"
+    echo "  ssh_ports=$(net_audit_ssh_ports | tr '\n' ' ')"
+    if net_audit_ssh_allowed; then echo "  ssh_allowed=yes"; else echo "  ssh_allowed=no"; fi
+    echo "  is_ssh=$(net_audit_is_ssh && echo yes || echo no)"
+    echo "  egress=$(net_audit_egress_if || echo none)"
+    if net_audit_report > "$WORK/rep_$tag.txt" 2>&1; then
+        echo "  report=clean"
+    else
+        echo "  report=risk"
+    fi
+    echo "###REPORT_BEGIN:$tag"
+    cat "$WORK/rep_$tag.txt"
+    echo "###REPORT_END:$tag"
+}
+
+case_run c1_no_firewall
+case_run c2_drop_no_ssh      MOCK_POL_INPUT=DROP
+case_run c3_drop_with_ssh    MOCK_POL_INPUT=DROP MOCK_S_INPUT_RULES="-A INPUT -p tcp --dport 22 -j ACCEPT"
+case_run c4_ufw_blocked      MOCK_UFW_ACTIVE=1
+case_run c5_ufw_allowed      MOCK_UFW_ACTIVE=1 MOCK_UFW_ALLOW="22/tcp                     ALLOW       Anywhere"
+case_run c6_fwd_drop         MOCK_POL_FORWARD=DROP
+case_run c7_ssh_session      SSH_CONNECTION="192.168.1.50 51234 192.168.1.101 22"
+case_run c8_custom_port      MOCK_SSH_PORT=2222 MOCK_POL_INPUT=DROP MOCK_S_INPUT_RULES="-A INPUT -p tcp --dport 2222 -j ACCEPT"
+echo "###DONE"
+"""
+    probe = tmpdir / "probe.sh"
+    probe.write_text(driver.replace("@MOCK@", _posix(mockbin))
+                           .replace("@LIB@", _posix(lib))
+                           .replace("@WORK@", _posix(tmpdir)),
+                     encoding="utf-8", newline="\n")
+
+    try:
+        r = subprocess.run(["bash", _posix(probe)], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace",
+                           stdin=subprocess.DEVNULL, timeout=180)
+        out = r.stdout
+
+        def case_block(tag):
+            m = re.search(rf"###CASE:{tag}\n(.*?)(?=###CASE:|###DONE)", out, re.S)
+            return m.group(1) if m else ""
+
+        def report(tag):
+            m = re.search(rf"###REPORT_BEGIN:{tag}\n(.*?)\n###REPORT_END:{tag}", out, re.S)
+            return (m.group(1) + "\n") if m else ""
+
+        if "###DONE" not in out:
+            log_fail("自检驱动未跑完", f"stderr={r.stderr[-300:]}")
+            return
+
+        c1 = case_block("c1_no_firewall")
+        if "backend=none" in c1 and "ssh_allowed=yes" in c1 and "report=clean" in c1:
+            log_pass("无防火墙时判定为安全 (不误报)")
+        else:
+            log_fail("无防火墙场景判定错误", c1[:200])
+
+        c2 = case_block("c2_drop_no_ssh")
+        if "input_pol=DROP" in c2 and "ssh_allowed=no" in c2 and "report=risk" in c2:
+            log_pass("INPUT 策略 DROP 且未放行 SSH -> 判为高危")
+        else:
+            log_fail("漏判 INPUT DROP 未放行 SSH", c2[:200])
+        if "高危" in report("c2_drop_no_ssh") and "--dport 22" in report("c2_drop_no_ssh"):
+            log_pass("报告里给出高危说明与放行命令")
+        else:
+            log_fail("报告缺少可执行的放行建议")
+
+        c3 = case_block("c3_drop_with_ssh")
+        if "ssh_allowed=yes" in c3 and "report=clean" in c3:
+            log_pass("INPUT DROP 但已放行 22 -> 不误报")
+        else:
+            log_fail("已放行 SSH 仍被判风险", c3[:200])
+
+        c4 = case_block("c4_ufw_blocked")
+        if "backend=ufw" in c4 and "ssh_allowed=no" in c4:
+            log_pass("ufw 启用且未放行 SSH -> 判为高危")
+        else:
+            log_fail("ufw 未放行 SSH 漏判", c4[:200])
+
+        c5 = case_block("c5_ufw_allowed")
+        if "ssh_allowed=yes" in c5:
+            log_pass("ufw 已放行 22/tcp -> 不误报")
+        else:
+            log_fail("ufw 已放行仍误报", c5[:200])
+
+        c6 = case_block("c6_fwd_drop")
+        if "forward_pol=DROP" in c6 and "report=risk" in c6:
+            log_pass("FORWARD 策略 DROP -> 在报告里点出转发受影响")
+        else:
+            log_fail("FORWARD DROP 未被识别", c6[:200])
+
+        c7 = case_block("c7_ssh_session")
+        if "is_ssh=yes" in c7 and "SSH 远程 (来自 192.168.1.50)" in report("c7_ssh_session"):
+            log_pass("SSH 会话被正确识别并标出来源 IP")
+        else:
+            log_fail("SSH 会话识别失败", c7[:200])
+
+        c8 = case_block("c8_custom_port")
+        if "2222" in c8 and "ssh_allowed=yes" in c8:
+            log_pass("sshd 非 22 端口时按实际端口判定放行")
+        else:
+            log_fail("非默认 SSH 端口判定错误", c8[:200])
+
+        if "egress=end0" in c1:
+            log_pass("默认路由出口网卡取到 end0 (不假设 eth0)")
+        else:
+            log_fail("出口网卡探测错误", c1[:200])
+
+        # 4) 行为验证: 生成的 PostUp 在节点上幂等
+        # 在临时副本里生成 (不往仓库里写密钥与 wg0.conf)
+        gk_root = tmpdir / "wgtest"
+        (gk_root / "scripts").mkdir(parents=True)
+        (gk_root / "inventory").mkdir(parents=True)
+        for f in SCRIPTS_DIR.glob("*.sh"):
+            shutil.copy2(f, gk_root / "scripts" / f.name)
+        for f in (PROJECT_ROOT / "inventory").glob("*.yaml"):
+            shutil.copy2(f, gk_root / "inventory" / f.name)
+        mock_wg = mockbin / "wg"
+        mock_wg.write_text(r"""#!/bin/bash
+case "$1" in
+    genkey) echo "PRIV_TEST_KEY" ;;
+    pubkey) cat >/dev/null; echo "PUB_TEST_KEY" ;;
+esac
+exit 0
+""", encoding="utf-8", newline="\n")
+        os.chmod(mock_wg, 0o755)
+
+        env_g = dict(os.environ)
+        env_g["PATH"] = f"{_posix(mockbin)}:/usr/bin:/bin"
+        subprocess.run(["bash", "scripts/wireguard-setup.sh"], cwd=str(gk_root),
+                       capture_output=True, env=env_g, timeout=180)
+        conf = gk_root / "node-wk-edge-01" / "wireguard" / "wg0.conf"
+        if not conf.exists():
+            log_fail("临时副本里未生成 wg0.conf", str(conf))
+        else:
+            post_up = ""
+            for line in conf.read_text(encoding="utf-8").splitlines():
+                if line.startswith("PostUp"):
+                    post_up = line.split("=", 1)[1].strip()
+                    break
+            if not post_up:
+                log_fail("wg0.conf 里没有 PostUp 行")
+            else:
+                env = dict(os.environ)
+                env["PATH"] = f"{_posix(mockbin)}:/usr/bin:/bin"
+                env["IPT_STATE"] = _posix(tmpdir / "run.rules")
+                env["IPT_LOG"] = _posix(tmpdir / "run.log")
+                env["MOCK_DEFAULT_ROUTE"] = "default via 192.168.1.1 dev end0 proto dhcp"
+                Path(tmpdir / "run.rules").write_text("", encoding="utf-8")
+                Path(tmpdir / "run.log").write_text("", encoding="utf-8")
+                # 模拟 wg-quick 的执行方式 (bash -c), 连跑两次
+                subprocess.run(["bash", "-c", post_up], capture_output=True, env=env, timeout=60)
+                log1 = Path(tmpdir / "run.log").read_text(encoding="utf-8")
+                subprocess.run(["bash", "-c", post_up], capture_output=True, env=env, timeout=60)
+                log2 = Path(tmpdir / "run.log").read_text(encoding="utf-8")
+
+                if "-o end0" in log1:
+                    log_pass("PostUp 在节点上按实际出口网卡 end0 做 MASQUERADE")
+                else:
+                    log_fail("PostUp 未取到实际出口网卡", log1[:200])
+                if log1.count("-A FORWARD -i wg0 -j ACCEPT") == 1:
+                    log_pass("首次执行添加转发规则")
+                else:
+                    log_fail("首次执行未添加规则", log1[:200])
+                n_add_first = log1.count("-A FORWARD")
+                n_add_total = log2.count("-A FORWARD")
+                if n_add_total == n_add_first:
+                    log_pass("重复执行不再堆叠规则 (-C 命中后跳过 -A)")
+                else:
+                    log_fail(f"规则重复堆叠: 第一次 {n_add_first} 次, 两次共 {n_add_total} 次")
+                if "-C INPUT -p udp --dport 51820" in log1:
+                    log_pass("入站放行同样先探测再添加")
+                else:
+                    log_fail("INPUT 规则未做幂等处理")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ============ 测试26: 面板安装参数 (IP/端口/监听端口) ============
+def test_panel_install_params():
+    """测试 26: panel/install-service.sh 可设置面板 IP / 端口 / 监听端口
+
+    三个概念刻意分开:
+      监听地址 (bind 到哪张网卡) / 监听端口 (bind 到哪个端口) /
+      访问地址 (浏览器里敲的面板 IP 或域名) —— 反代、NAT、SSH 转发都会
+      让"访问"与"监听"不一致, 因此访问端口可单独指定。
+    """
+    print("\n" + "=" * 60)
+    print("测试 26: 面板安装参数 (监听地址 / 监听端口 / 访问地址)")
+    print("=" * 60)
+
+    script = PANEL_DIR / "install-service.sh"
+    if not script.exists():
+        log_fail("panel/install-service.sh 缺失")
+        return
+    src = script.read_text(encoding="utf-8")
+
+    # ---- 1) 静态检查 ----
+    for opt in ["--host", "--port", "--url-host", "--url-port", "--yes"]:
+        if opt not in src:
+            log_fail(f"缺少选项 {opt}")
+            break
+    else:
+        log_pass("提供 --host / --port / --url-host / --url-port / --yes")
+
+    if "panel_env_set" in src:
+        log_pass("参数写入面板环境文件")
+    else:
+        log_fail("参数没有落到 panel.env")
+
+    if "EnvironmentFile=-" in src:
+        log_pass("unit 引用 EnvironmentFile (文件缺失也不报错)")
+    else:
+        log_fail("unit 未引用环境文件")
+
+    if "grep -v" in src and "PANEL_USER" not in src.split("panel_env_set")[1][:400]:
+        log_pass("环境文件是合并写入 (不会冲掉账号密码)")
+    else:
+        log_warn("无法确认环境文件为合并写入")
+
+    if "ONECLOUD_PANEL_TTY" in src:
+        log_pass("交互开关可强制 (便于演练与自动化测试)")
+    else:
+        log_fail("交互分支无法在非 TTY 下演练")
+
+    # ---- 2) 行为验证: mock systemctl + 临时 unit/env 路径 ----
+    tmpdir = Path(tempfile.mkdtemp(prefix="oc_t26_"))
+    mockbin = tmpdir / "mockbin"
+    mockbin.mkdir()
+    sc = mockbin / "systemctl"
+    sc.write_text("#!/bin/bash\necho \"systemctl $*\" >> \"$SC_LOG\"\nexit 0\n",
+                  encoding="utf-8", newline="\n")
+    os.chmod(sc, 0o755)
+
+    def _posix(p):
+        s = Path(p).as_posix()
+        m = re.match(r"^([A-Za-z]):/(.*)$", s)
+        return f"/{m.group(1).lower()}/{m.group(2)}" if m else s
+
+    unit = tmpdir / "onecloud-panel.service"
+    envf = tmpdir / "etc" / "onecloud" / "panel.env"
+
+    def run_inst(args, stdin_data=None, env_extra=None):
+        env = dict(os.environ)
+        env["PATH"] = f"{_posix(mockbin)}:/usr/bin:/bin"
+        env["ONECLOUD_PANEL_UNIT"] = _posix(unit)
+        env["ONECLOUD_PANEL_ENV_FILE"] = _posix(envf)
+        env["SC_LOG"] = _posix(tmpdir / "sc.log")
+        for k in ("PANEL_HOST", "PANEL_PORT", "PANEL_URL_HOST", "PANEL_URL_PORT",
+                  "ONECLOUD_PANEL_TTY"):
+            env.pop(k, None)
+        if env_extra:
+            env.update(env_extra)
+        kwargs = dict(capture_output=True, env=env, cwd=str(PROJECT_ROOT), timeout=120)
+        if stdin_data is None:
+            kwargs["stdin"] = subprocess.DEVNULL
+        else:
+            kwargs["input"] = stdin_data.encode("utf-8")
+        r = subprocess.run(["bash", "panel/install-service.sh"] + args, **kwargs)
+        return (r.returncode,
+                r.stdout.decode("utf-8", "replace"),
+                r.stderr.decode("utf-8", "replace"))
+
+    def unit_env():
+        if not unit.exists():
+            return {}
+        out = {}
+        for line in unit.read_text(encoding="utf-8").splitlines():
+            if line.startswith("Environment=PANEL_"):
+                k, v = line.split("=", 1)[1].split("=", 1)
+                out[k] = v
+        return out
+
+    try:
+        # 参数路径
+        rc, out, err = run_inst(["--host", "192.168.1.101", "--port", "9100",
+                                 "--url-host", "panel.example.com",
+                                 "--url-port", "19000"])
+        ue = unit_env()
+        if rc == 0 and ue.get("PANEL_HOST") == "192.168.1.101" and ue.get("PANEL_PORT") == "9100":
+            log_pass("--host/--port 生效并写入 unit")
+        else:
+            log_fail(f"参数未生效 (rc={rc})", str(ue)[:200])
+        if "http://panel.example.com:19000" in out and "经反代/NAT" in out:
+            log_pass("访问地址与监听值不同时给出对外入口说明")
+        else:
+            log_fail("访问入口回显不正确", out[-200:])
+        if envf.exists() and "PANEL_URL_PORT=19000" in envf.read_text(encoding="utf-8"):
+            log_pass("访问参数落到 panel.env")
+        else:
+            log_fail("访问参数未落盘")
+
+        # 非法监听地址: 网段地址 / 回环网段网络地址 / 组播
+        for bad, expect in [("192.168.1.0", "网络地址"),
+                            ("127.0.0.0", "回环网段"),
+                            ("224.0.0.1", "组播")]:
+            rc, out, err = run_inst(["--host", bad])
+            if rc != 0 and expect in (out + err):
+                log_pass(f"拒绝监听地址 {bad} 并说明原因 ({expect})")
+            else:
+                log_fail(f"未拒绝非法监听地址 {bad} (rc={rc})")
+
+        # 非法端口 / 访问地址
+        for args, label in [(["--port", "70000"], "端口超范围"),
+                            (["--port", "abc"], "端口非数字"),
+                            (["--url-host", "192.168.1.999"], "访问地址非法")]:
+            rc, out, err = run_inst(args)
+            if rc != 0 and "ERROR" in (out + err):
+                log_pass(f"拒绝非法参数: {label}")
+            else:
+                log_fail(f"未拒绝非法参数: {label} (rc={rc})")
+
+        # 环境变量注入 + --yes: 不应再询问
+        rc, out, err = run_inst(["--yes"], env_extra={"PANEL_HOST": "127.0.0.1",
+                                                     "PANEL_PORT": "9101"})
+        ue = unit_env()
+        if rc == 0 and ue.get("PANEL_HOST") == "127.0.0.1" and ue.get("PANEL_PORT") == "9101" \
+                and "回车=" not in out:
+            log_pass("env 注入 + --yes 时不询问 (init.sh 调用路径)")
+        else:
+            log_fail(f"env 注入路径异常 (rc={rc})", (out + err)[-200:])
+
+        # 环境文件合并: 已有账号密码必须保留
+        envf.parent.mkdir(parents=True, exist_ok=True)
+        envf.write_text("PANEL_USER=admin\nPANEL_PASS=s3cret\nPANEL_HOST=0.0.0.0\n",
+                        encoding="utf-8")
+        rc, out, err = run_inst(["--host", "192.168.1.102", "--port", "9000", "-y"])
+        content = envf.read_text(encoding="utf-8") if envf.exists() else ""
+        if "PANEL_USER=admin" in content and "PANEL_PASS=s3cret" in content \
+                and "PANEL_HOST=192.168.1.102" in content:
+            log_pass("改写 panel.env 时保留账号密码, 只更新自己负责的键")
+        else:
+            log_fail("panel.env 被整份覆盖", content[:200])
+
+        # 交互: 直接回车 = 默认值 0.0.0.0:9000
+        rc, out, err = run_inst([], stdin_data="\n\n\n",
+                                env_extra={"ONECLOUD_PANEL_TTY": "1"})
+        ue = unit_env()
+        if rc == 0 and ue.get("PANEL_HOST") == "0.0.0.0" and ue.get("PANEL_PORT") == "9000":
+            log_pass("交互直接回车 = 默认 0.0.0.0:9000")
+        else:
+            log_fail(f"交互默认值异常 (rc={rc})", str(ue)[:200])
+
+        # 交互: 非法值被拒后重新询问
+        rc, out, err = run_inst([], stdin_data="192.168.1.0\n192.168.1.101\n9000\n\n\n",
+                                env_extra={"ONECLOUD_PANEL_TTY": "1"})
+        ue = unit_env()
+        if rc == 0 and ue.get("PANEL_HOST") == "192.168.1.101" and "网络地址" in (out + err):
+            log_pass("交互时非法监听地址被拒并要求重新输入")
+        else:
+            log_fail(f"交互拒绝非法值失败 (rc={rc})", str(ue)[:200])
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 # ============ 主程序 ============
 def main():
     print("=" * 60)
@@ -3237,6 +4052,9 @@ def main():
         ("bootstrap apt 源与依赖", test_bootstrap_apt_sources),
         ("bootstrap DNS 模式", test_bootstrap_dns_mode),
         ("面板监听地址", test_panel_listen_host),
+        ("bootstrap apt 可选化", test_bootstrap_apt_optional),
+        ("防火墙与 SSH 自检", test_network_audit),
+        ("面板安装参数", test_panel_install_params),
     ]
     
     for test_name, test_func in tests:
