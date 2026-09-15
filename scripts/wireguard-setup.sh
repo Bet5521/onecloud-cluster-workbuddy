@@ -270,7 +270,8 @@ cmd_list() {
     echo ""
     echo "已登记节点:"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    printf "  %-16s %-16s %-14s %s\n" "名称" "LAN IP" "WG IP" "主机名"
+    # 表头按"显示宽度"手工排版: printf 的 %-Ns 按字节填充, 中文表头会错位
+    echo "  名称             LAN IP           WG IP          主机名"
     local node name lan_ip wg_ip host
     for node in "${NODES[@]}"; do
         IFS='|' read -r name lan_ip wg_ip host <<< "$node"

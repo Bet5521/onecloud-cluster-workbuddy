@@ -1776,6 +1776,245 @@ rm -f "$PROBE"
                  "用户不知道有 --no-sd 等开关")
 
 
+# ============ 测试18: init 交互式入口 ============
+def test_init_entrypoint():
+    """测试 18: init/ 交互式入口契约 (纯交互 / 无默认参数 / 菜单齐全 / 引用脚本存在)"""
+    print("\n" + "="*60)
+    print("测试 18: init 交互式入口")
+    print("="*60)
+
+    init_dir = PROJECT_ROOT / "init"
+    entry = init_dir / "init.sh"
+    init_readme = init_dir / "README.md"
+
+    if not entry.exists():
+        log_fail("init/init.sh 不存在", "缺少交互式初始化入口")
+        return
+    log_pass("init/init.sh 存在")
+
+    src = entry.read_text(encoding="utf-8")
+
+    # 1) 基本结构
+    if src.startswith("#!/bin/bash"):
+        log_pass("init.sh 有 bash shebang")
+    else:
+        log_fail("init.sh 缺少 bash shebang")
+
+    if "set -u" in src:
+        log_pass("init.sh 启用 set -u（未定义变量尽早暴露）")
+    else:
+        log_fail("init.sh 未启用 set -u")
+
+    # 2) 语法检查
+    bash = shutil.which("bash")
+    if bash:
+        r = subprocess.run([bash, "-n", str(entry)], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace")
+        if r.returncode == 0:
+            log_pass("init.sh 通过 bash -n 语法检查")
+        else:
+            log_fail(f"init.sh 语法错误: {r.stderr.strip()[:200]}")
+    else:
+        log_warn("未找到 bash，跳过 init.sh 语法检查")
+
+    # 3) 纯交互：拒绝命令行参数、不预置 --yes
+    if re.search(r'\[\s*"\$#"\s*-gt\s*0\s*\]', src) and "不接受任何命令行参数" in src:
+        log_pass("init.sh 显式拒绝命令行参数（纯交互）")
+    else:
+        log_fail("init.sh 未拒绝命令行参数", "纯交互约定要求传入参数即报错退出")
+
+    # 只看可执行代码：注释里说明"不预置 --yes"是正常表述, 不算违规
+    code = "\n".join(ln for ln in src.splitlines() if not ln.lstrip().startswith("#"))
+
+    if "--yes" not in code:
+        log_pass("init.sh 未预置 --yes 等默认参数")
+    else:
+        log_fail("init.sh 出现 --yes", "与「不采用任何默认参数」的约定冲突")
+
+    if "[Y/n]" not in code and "[y/N]" not in code:
+        log_pass("确认提问不提供回车默认值（必须显式输入 y/n）")
+    else:
+        log_fail("存在 [Y/n] 式隐式默认值", "回车即采用的默认与纯交互约定不符")
+
+    # 4) 交互基础函数齐全
+    need_fns = ["menu", "read_input", "read_secret", "ask_yes_no", "pick_node", "run_script", "pause"]
+    missing_fns = [fn for fn in need_fns
+                   if not re.search(r'^' + re.escape(fn) + r'\(\)\s*\{', src, re.MULTILINE)]
+    if missing_fns:
+        log_fail(f"init.sh 缺少交互函数: {missing_fns}")
+    else:
+        log_pass(f"init.sh 交互基础函数齐全（{len(need_fns)} 个）")
+
+    # 5) 主菜单功能项齐全
+    need_menus = ["部署 Panel 控制面板", "部署节点", "节点维护", "配置与分发", "服务安装", "环境自检"]
+    missing_menus = [m for m in need_menus if m not in src]
+    if missing_menus:
+        log_fail(f"init.sh 主菜单缺少功能项: {missing_menus}")
+    else:
+        log_pass(f"init.sh 主菜单覆盖 {len(need_menus)} 项核心功能")
+
+    # 6) 引用的 scripts/*.sh 必须真实存在（避免菜单点进去才发现脚本没了）
+    refs = sorted(set(re.findall(r'\$\{SCRIPTS_DIR\}/([A-Za-z0-9_.\-]+\.sh)', src)))
+    missing_refs = [r for r in refs if not (SCRIPTS_DIR / r).exists()]
+    if not refs:
+        log_fail("init.sh 未引用任何 scripts/ 脚本")
+    elif missing_refs:
+        log_fail(f"init.sh 引用了不存在的脚本: {missing_refs}")
+    else:
+        log_pass(f"init.sh 引用的 {len(refs)} 个 scripts/ 脚本均存在")
+
+    # 7) 面板安装复用既有实现，不重复造 unit
+    if "${PANEL_DIR}/install-service.sh" in src and (PANEL_DIR / "install-service.sh").exists():
+        log_pass("面板 systemd 安装复用 panel/install-service.sh（未重复实现）")
+    else:
+        log_fail("面板 systemd 安装未复用 panel/install-service.sh")
+
+    # 8) 不硬编码集群节点 IP（统一走 lib-nodes.sh）
+    real_ips = [ip for ip in load_node_ip_map().values() if ip]
+    hard = [ip for ip in real_ips if ip in src]
+    if hard:
+        log_fail(f"init.sh 硬编码了节点 IP: {hard}", "应统一从 lib-nodes.sh 读取")
+    else:
+        log_pass("init.sh 未硬编码节点 IP（统一走 lib-nodes.sh）")
+
+    # 9) 文档登记
+    if init_readme.exists():
+        log_pass("init/README.md 存在")
+    else:
+        log_fail("init/README.md 缺失")
+
+    root_readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+    if "init/init.sh" in root_readme and "init/README.md" in root_readme:
+        log_pass("根 README 已登记 init 入口与文档链接")
+    else:
+        log_fail("根 README 未登记 init 入口", "新目录需要在根 README 可见")
+
+
+# ============ 测试19: 交付物一致性 ============
+def test_delivery_consistency():
+    """测试 19: 版本声明一致 / 行尾防护 / 面板监听参数可注入 / 表格排版"""
+    print("\n" + "="*60)
+    print("测试 19: 交付物一致性")
+    print("="*60)
+
+    # 1) 版本声明四处一致 (历史上出现过 README 与 config.json 漂移)
+    versions = {}
+
+    readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+    m = re.search(r'当前版本:\s*v?([0-9]+\.[0-9]+\.[0-9]+)', readme)
+    if m:
+        versions["README.md"] = m.group(1)
+
+    try:
+        cfg = json.loads((PANEL_DIR / "config.json").read_text(encoding="utf-8"))
+        versions["panel/config.json"] = str(cfg.get("version", ""))
+    except Exception as e:
+        log_fail(f"panel/config.json 读取失败: {e}")
+
+    app_src = (PANEL_DIR / "app.py").read_text(encoding="utf-8")
+    m = re.search(r'"version":\s*"([0-9]+\.[0-9]+\.[0-9]+)"', app_src)
+    if m:
+        versions["panel/app.py"] = m.group(1)
+
+    gen_src = (SCRIPTS_DIR / "gen-panel-config.sh").read_text(encoding="utf-8")
+    m = re.search(r'ONECLOUD_PANEL_VERSION:-([0-9]+\.[0-9]+\.[0-9]+)', gen_src)
+    if m:
+        versions["gen-panel-config.sh"] = m.group(1)
+
+    if len(versions) == 4 and len(set(versions.values())) == 1:
+        log_pass(f"版本声明四处一致（{list(versions.values())[0]}）")
+    else:
+        log_fail(f"版本声明不一致: {versions}", "README / config.json / app.py / 生成脚本须同步")
+
+    if len(versions) == 4:
+        log_pass("版本号可从 README / config.json / app.py / 生成脚本四处解析到")
+    else:
+        log_fail(f"版本号解析不全: {sorted(versions.keys())}")
+
+    # 2) .gitattributes: 锁定 LF, 防止 Windows checkout 出 CRLF 导致 bad interpreter
+    ga = PROJECT_ROOT / ".gitattributes"
+    if ga.exists():
+        log_pass(".gitattributes 存在")
+        ga_src = ga.read_text(encoding="utf-8")
+        if re.search(r'\*[ \t]+text=auto[ \t]+eol=lf', ga_src):
+            log_pass(".gitattributes 声明 * text=auto eol=lf")
+        else:
+            log_fail(".gitattributes 未声明 * text=auto eol=lf")
+        if re.search(r'\*\.sh[ \t]+text[ \t]+eol=lf', ga_src):
+            log_pass(".gitattributes 显式声明 *.sh eol=lf")
+        else:
+            log_fail(".gitattributes 未显式声明 *.sh eol=lf")
+        if re.search(r'\*\.(png|gz|zip|deb|woff2?)\s+binary', ga_src):
+            log_pass(".gitattributes 对二进制文件声明 binary（不做行尾转换）")
+        else:
+            log_fail(".gitattributes 未保护二进制文件")
+    else:
+        log_fail(".gitattributes 缺失", "Windows 工作区会被 checkout 成 CRLF")
+
+    # 3) 实际行尾: 工作区 shell 脚本不得含 CR
+    cr_scripts = []
+    for sh in sorted(PROJECT_ROOT.rglob("*.sh")):
+        if ".git" in sh.parts:
+            continue
+        try:
+            if b"\r" in sh.read_bytes():
+                cr_scripts.append(str(sh.relative_to(PROJECT_ROOT)).replace("\\", "/"))
+        except OSError:
+            pass
+        if len(cr_scripts) >= 5:
+            break
+    if cr_scripts:
+        log_fail(f"工作区 shell 脚本含 CRLF: {cr_scripts[:5]}",
+                 "CRLF 会导致 bad interpreter 与变量尾部混入 \\r")
+    else:
+        log_pass("工作区全部 shell 脚本均为 LF 行尾")
+
+    # 4) 面板监听参数必须可注入 (不能写死在 unit 模板里)
+    inst = (PANEL_DIR / "install-service.sh").read_text(encoding="utf-8")
+    if 'PANEL_PORT="${PANEL_PORT:-' in inst and 'PANEL_HOST="${PANEL_HOST:-' in inst:
+        log_pass("install-service.sh 监听端口/地址来自环境变量（含默认值）")
+    else:
+        log_fail("install-service.sh 仍硬编码监听端口/地址",
+                 "自定义端口会退化为依赖 drop-in 覆盖顺序")
+
+    if "Environment=PANEL_PORT=${PANEL_PORT}" in inst and "Environment=PANEL_HOST=${PANEL_HOST}" in inst:
+        log_pass("unit 中的 Environment= 使用注入值而非字面量")
+    else:
+        log_fail("unit 中 Environment= 未使用注入值")
+
+    init_src = (PROJECT_ROOT / "init" / "init.sh").read_text(encoding="utf-8")
+    if "env PANEL_HOST=" in init_src and "PANEL_PORT=" in init_src:
+        log_pass("init.sh 安装面板服务时注入 PANEL_HOST/PANEL_PORT（用 env 规避 sudo env_reset）")
+    else:
+        log_fail("init.sh 未向 install-service.sh 注入监听参数")
+
+    # 5) 中文表头不得使用 %-Ns 按字节填充
+    # 判据: printf 的「实参」里出现中文字面量, 且格式串含 %-Ns
+    #   printf "  %-16s %s\n" "名称" "IP"      -> 实参有中文, 会被按字节填充 => 反模式
+    #   printf "  %-24s (无固定端口)\n" "$name" -> 中文在格式串, 填充的是 ASCII 变量 => 正常
+    def _cjk_printf_smell(line):
+        m = re.search(r'printf\s+(?:"([^"]*)"|\'([^\']*)\'|([^\s]+))', line)
+        if not m:
+            return False
+        fmt = next((g for g in m.groups() if g is not None), "")
+        rest = line[m.end():]
+        return bool(re.search(r'%-\d+s', fmt) and re.search(r'[\u4e00-\u9fff]', rest))
+
+    bad_tables = []
+    for sh in sorted(SCRIPTS_DIR.glob("*.sh")) + [PROJECT_ROOT / "init" / "init.sh"]:
+        if not sh.exists():
+            continue
+        for ln_no, ln in enumerate(sh.read_text(encoding="utf-8").splitlines(), 1):
+            if ln.lstrip().startswith("#"):
+                continue
+            if _cjk_printf_smell(ln):
+                bad_tables.append(f"{sh.name}:{ln_no}")
+    if bad_tables:
+        log_fail(f"printf 实参含中文且格式串有 %-Ns（按字节填充会错位）: {bad_tables[:5]}")
+    else:
+        log_pass("无「printf 实参含中文 + %-Ns」的按字节填充写法")
+
+
 # ============ 主程序 ============
 def main():
     print("=" * 60)
@@ -1802,6 +2041,8 @@ def main():
         ("面板前后端契约", test_panel_frontend_contract),
         ("bootstrap 网络取值", test_bootstrap_network_resolution),
         ("bootstrap SD与风险", test_bootstrap_sd_and_risk),
+        ("init 交互式入口", test_init_entrypoint),
+        ("交付物一致性", test_delivery_consistency),
     ]
     
     for test_name, test_func in tests:

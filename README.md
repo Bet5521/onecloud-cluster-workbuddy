@@ -2,7 +2,7 @@
 
 > 基于玩客云 WS1608 (Amlogic S805, ARMv7, 1GB RAM) 多节点组建的家庭服务集群
 
-**当前版本: v1.3.0**
+**当前版本: v1.4.0**
 
 ---
 
@@ -89,6 +89,7 @@ onecloud-cluster/
 ├── node-wk-iot-02/           # NODE-02 IoT Core 配置
 ├── node-wk-storage-03/       # NODE-03 Storage & Sync 配置
 ├── panel/                    # Flask 集群控制面板
+├── init/                     # 交互式初始化入口 (部署面板 / 部署节点 / 节点维护)
 ├── scripts/                  # 运维脚本
 └── test_validate.py          # 集群配置/脚本验证套件
 ```
@@ -96,6 +97,17 @@ onecloud-cluster/
 ---
 
 ## 🚀 快速开始
+
+> **第一次接触本项目？先跑交互式入口。** 不用记各种子命令与参数：
+>
+> ```bash
+> bash init/init.sh
+> ```
+>
+> 菜单方式引导完成「部署 Panel 面板 / 部署节点 / 节点维护 / 配置分发 / 服务安装 / 环境自检」，
+> 全程逐项询问、不预置任何默认参数。详见 [init/README.md](init/README.md)。
+>
+> 需要脚本化或无人值守时，用下面各节的显式命令。
 
 ### 1. 初始化节点
 
@@ -303,9 +315,10 @@ vim inventory/nodes.local.yaml   # 填入你的 IP/主机名, 该文件已被 gi
 
 ## ✅ 功能验证
 
-项目自带验证套件，覆盖配置完整性、脚本语法、节点映射、服务一致性、
-**文档化 CLI 接口契约**、**IP/主机名可自定义性**与**安全健壮性回归**
-（共 194 项）：
+项目自带验证套件，共 18 组，覆盖配置完整性、脚本语法、节点映射、服务一致性、
+**文档化 CLI 接口契约**、**IP/主机名可自定义性**、**安全健壮性回归**、
+**面板前后端契约**、**bootstrap 网络取值与 SD/风险预检**、**init 交互式入口契约**
+（当前 232 项）：
 
 ```bash
 python3 test_validate.py
@@ -314,8 +327,8 @@ python3 test_validate.py
 输出示例：
 
 ```
-  总计: 194 项
-  通过: 194
+  总计: 232 项
+  通过: 232
   失败: 0
   警告: 0
 ```
@@ -328,6 +341,7 @@ python3 test_validate.py
 
 | 文档 | 内容 |
 |------|------|
+| [init/README.md](init/README.md) | 交互式初始化入口（菜单结构、功能映射、面板部署细节） |
 | [docs/requirements.md](docs/requirements.md) | 需求分析、功能清单 |
 | [docs/architecture.md](docs/architecture.md) | 架构设计、网络拓扑、存储与内存规划 |
 | [docs/topology.md](docs/topology.md) | 可视化拓扑图 (Mermaid + ASCII) |
@@ -364,6 +378,69 @@ python3 test_validate.py
   校验功能脚本无硬编码 IP、每个节点 hostname 字段齐全、环境变量覆盖真实生效
 - 验证项从 176 扩至 **184**（全部通过、0 警告）
 - 新增 `inventory/nodes.local.yaml.example` 覆盖模板（真实覆盖文件已 gitignore）
+
+---
+
+## 🚀 v1.4.0 变更说明
+
+本轮新增 `init/` —— 一个**纯交互式**的初始化与运维总入口，把原先散落在
+`scripts/` 与 `panel/` 的操作收进一个菜单；同时加固了面板服务的参数注入与仓库行尾一致性。
+
+### 新增 init/ 交互式入口
+
+```bash
+bash init/init.sh
+```
+
+| 菜单 | 能力 |
+|------|------|
+| 1) 部署 Panel 控制面板 | systemd 常驻 / 前台试运行 / 仅装依赖 |
+| 2) 部署节点 | 本机 bootstrap（不带参数，由 bootstrap 自己提问）/ SSH 接力打开远端入口 / 查看节点清单 |
+| 3) 节点维护 | 健康巡检 / 备份 / 恢复 / 批量更新 |
+| 4) 配置与分发 | deploy / 测连通 / 预览 / 远程执行 / 面板配置 / 节点 .env / WireGuard |
+| 5) 服务安装 | setup.sh 统一安装 / 原生服务 / 节点容器 |
+| 6) 环境自检 | 目录、脚本、依赖命令、本机网络、节点清单逐项体检 |
+
+三条硬约束：
+
+| 约束 | 实现 |
+|------|------|
+| 不接受任何命令行参数 | `[ "$#" -gt 0 ]` 直接 `exit 2` 并提示直接运行 |
+| 不预置任何默认参数 | 脚本内不出现 `--yes`；取值项（端口 / 账号 / 密码 / 备份目录）**全部必填** |
+| 无隐式默认值 | 不用 `[Y/n]` 式回车默认，确认必须显式敲 `y` / `n` |
+
+设计上**只做编排、不重复实现**：面板 systemd 安装仍复用 `panel/install-service.sh`，
+自定义端口/账号经 `/etc/onecloud/panel.env`（权限 600）+ systemd drop-in 注入；
+本机 bootstrap 不附加任何参数；远程节点用 `ssh -t` 打开远端的同一个入口。
+
+> 因为没有默认参数，本入口**不服务自动化/CI**。批量与无人值守请直接调 `scripts/` 下脚本并显式传参。
+
+### 加固
+
+| 问题 | 影响 | 修复 |
+|------|------|------|
+| `panel/install-service.sh` 把 `PANEL_PORT=9000` / `PANEL_HOST=0.0.0.0` 写死在 unit 里 | 自定义端口只能靠 drop-in 里 `EnvironmentFile` 的覆盖顺序生效，属于隐性依赖 | unit 改由 `PANEL_HOST` / `PANEL_PORT` 环境变量渲染（保留 9000 / 0.0.0.0 默认值）；`init.sh` 用 `sudo env PANEL_HOST=… PANEL_PORT=…` 显式注入（规避 `sudo` 的 `env_reset`），与 `EnvironmentFile` 形成双保险 |
+| 仓库无 `.gitattributes`，Windows 工作区被 checkout 成 CRLF | `./scripts/xxx.sh` 报 `bad interpreter: /bin/bash^M`；bash 变量尾部混入 `\r` 导致字符串比较莫名失败 | 新增 `.gitattributes` 统一 `* text=auto eol=lf`，二进制与将来可能的 Windows 脚本单独声明；工作区现存 CRLF 一并归一化为 LF |
+| `wireguard-setup.sh list` 中文表头按字节填充 | `printf '%-16s'` 按字节而非显示宽度填充，表头比数据列宽 2 格，表格错位 | 表头改为按显示宽度手工排版（与 `init.sh` 的处理一致） |
+
+### 文档与验证
+
+- 新增 `init/README.md`：菜单结构、功能到脚本的映射、面板部署细节、前置条件、常见问题
+- 根 README 登记 `init/` 入口，并补充本节变更说明
+- `test_validate.py` 218 → **243 项**，全量通过、0 失败 0 警告：
+  - 第 18 组「init 交互式入口」14 项：拒绝参数、无 `--yes`、无回车默认、交互函数与菜单齐全、
+    引用的 10 个 `scripts/*.sh` 全部存在、面板安装复用、零硬编码 IP、文档登记
+  - 第 19 组「交付物一致性」11 项：版本声明四处一致、`.gitattributes` 锁定 LF、
+    工作区脚本无 CRLF、面板监听参数可注入且 unit 用注入值、无中文表头按字节填充
+- 交互实测：`init.sh` 全部菜单分支 43 项探针通过（含各"取消"路径、端口校验、`pick_node`
+  越界与非法名、非法菜单输入恢复）
+- 面板端到端实测：真实启动 `app.py` 后验证 — 首页与静态资源、未认证/错误密码 401、
+  白名单拒绝 `rm -rf` 与 `free; cat /etc/shadow`、放行 `ls` 与 `ls -la`、
+  未知节点 404 / 未知动作 400 / 危险操作二次确认 400、节点离线时 `/api/status` 正常降级
+- `bootstrap.sh --dry-run` 实测：改 IP 后网关自动由同网段推导（`192.168.6.101` → `192.168.6.1`），
+  无 SD 卡时跳过挂载与 Docker 数据迁移
+- 生成类脚本实测：`gen-node-env.sh --dry-run`、`gen-panel-config.sh`（幂等，重复执行内容不变）、
+  `wireguard-setup.sh list`
 
 ---
 

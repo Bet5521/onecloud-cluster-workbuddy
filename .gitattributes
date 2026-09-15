@@ -1,0 +1,49 @@
+# ============================================================
+# OneCloud Cluster · 行尾与文本属性
+#
+# 背景: 本仓库在 Windows 上开发 (core.autocrlf=true), 但脚本全部
+# 在 Debian/Armbian (Linux) 上执行。若工作区被 checkout 成 CRLF,
+# `#!/bin/bash^M` 会触发 "bad interpreter: /bin/bash^M" 之类的故障,
+# 且 bash 变量末尾会混入 \r 导致字符串比较莫名失败。
+#
+# 这里统一声明「入库与工作区都保持 LF」, 消除该风险。
+# ============================================================
+
+# 默认: 自动识别文本并按 LF 归一化
+* text=auto eol=lf
+
+# 脚本与配置显式声明为 LF
+*.sh      text eol=lf
+*.bash    text eol=lf
+*.py      text eol=lf
+*.js      text eol=lf
+*.css     text eol=lf
+*.html    text eol=lf
+*.json    text eol=lf
+*.yaml    text eol=lf
+*.yml     text eol=lf
+*.conf    text eol=lf
+*.service text eol=lf
+*.example text eol=lf
+*.md      text eol=lf
+*.txt     text eol=lf
+
+# 二进制文件不做任何行尾转换
+*.png     binary
+*.jpg     binary
+*.jpeg    binary
+*.gif     binary
+*.ico     binary
+*.svg     text eol=lf
+*.gz      binary
+*.tgz     binary
+*.zip     binary
+*.tar     binary
+*.deb     binary
+*.woff    binary
+*.woff2   binary
+
+# 万一将来引入 Windows 原生脚本, 保持 CRLF
+*.bat     text eol=crlf
+*.cmd     text eol=crlf
+*.ps1     text eol=crlf
