@@ -56,7 +56,7 @@ def load_config():
     except (FileNotFoundError, json.JSONDecodeError) as e:
         return {
             "cluster_name": "OneCloud Cluster",
-            "version": "1.0.0",
+            "version": "1.3.0",
             "nodes": []
         }
 
