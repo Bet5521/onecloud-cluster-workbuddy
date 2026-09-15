@@ -114,7 +114,33 @@ bash init/init.sh
 - 面板部署需要 **python3**（依赖安装失败时会自动重试 `--break-system-packages`）
 - 需 root 的操作（bootstrap、setup、install-services、systemd）在非 root 下会自动加 `sudo`
 
-缺什么可以直接跑菜单里的 **6) 环境自检**，它会逐项列出缺失的目录、脚本与命令。
+缺什么可以直接跑菜单里的 **6) 环境自检**，它会逐项列出缺失的目录、脚本与命令，
+并单独报告 **Python 环境**：解释器路径、`pip` 模块是否可用、`flask`/`flask_cors`
+是否可 import。面板依赖装不上时，先跑自检能立刻定位到「是缺 pip 还是缺包」。
+
+---
+
+## Python 依赖：pip 缺失时的降级链
+
+Debian 12+ / Armbian 上常见「`python3` 在、`pip` 不在」，此时部署面板会报：
+
+```
+/usr/bin/python3: No module named pip
+[WARN] 常规安装失败, 尝试 --break-system-packages (Debian 12+ / PEP 668)
+/usr/bin/python3: No module named pip
+[ERROR] Python 依赖安装失败
+```
+
+**`--break-system-packages` 只是 pip 的旗标**（绕过 PEP 668 的
+`externally-managed-environment`），**补不了缺失的 pip 自身**。
+
+`init.sh` 现在走 `scripts/lib-pydeps.sh` 的四路降级：pip → `--break-system-packages`
+→ 补 pip（`ensurepip` / `apt python3-pip` / `get-pip.py`）→ `apt` 装发行版包
+（`python3-flask python3-flask-cors`，完全绕开 pip）。
+每一路之后都会实跑一次 `import` 校验，**pip 谎报成功也会继续降级**。
+
+其中「用 apt 装 `python3-pip`」和「改用系统包」这两步**都会先问你**；
+两步都拒绝且依赖确实缺失时，会打印可复制的兜底命令。
 
 ---
 

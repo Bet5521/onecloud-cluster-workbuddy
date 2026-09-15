@@ -15,7 +15,12 @@ mkdir -p "$MIGPT_DIR"
 
 TARGET="$(cd "$(dirname "$0")/../../scripts" && pwd)/install-services.sh"
 if [ ! -f "$TARGET" ]; then
-    echo "[*] 请先手动安装依赖: pip3 install flask flask-cors pyyaml requests"
+    echo "[*] 未找到 scripts/install-services.sh, 请手动安装依赖:"
+    echo "    # 先确认 pip 可用 (Debian/Armbian 常缺 python3-pip)"
+    echo "    python3 -m pip --version || apt-get install -y python3-pip"
+    echo "    python3 -m pip install --break-system-packages flask flask-cors pyyaml requests"
+    echo "    # 若 pip 装不上, 直接装发行版包"
+    echo "    apt-get install -y python3-flask python3-flask-cors python3-yaml python3-requests"
     exit 0
 fi
 

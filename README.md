@@ -2,7 +2,7 @@
 
 > 基于玩客云 WS1608 (Amlogic S805, ARMv7, 1GB RAM) 多节点组建的家庭服务集群
 
-**当前版本: v1.4.0**
+**当前版本: v1.4.1**
 
 ---
 
@@ -315,10 +315,10 @@ vim inventory/nodes.local.yaml   # 填入你的 IP/主机名, 该文件已被 gi
 
 ## ✅ 功能验证
 
-项目自带验证套件，共 18 组，覆盖配置完整性、脚本语法、节点映射、服务一致性、
+项目自带验证套件，共 20 组，覆盖配置完整性、脚本语法、节点映射、服务一致性、
 **文档化 CLI 接口契约**、**IP/主机名可自定义性**、**安全健壮性回归**、
-**面板前后端契约**、**bootstrap 网络取值与 SD/风险预检**、**init 交互式入口契约**
-（当前 232 项）：
+**面板前后端契约**、**bootstrap 网络取值与 SD/风险预检**、**init 交互式入口契约**、
+**Python 依赖降级链**（当前 259 项）：
 
 ```bash
 python3 test_validate.py
@@ -327,8 +327,8 @@ python3 test_validate.py
 输出示例：
 
 ```
-  总计: 232 项
-  通过: 232
+  总计: 259 项
+  通过: 259
   失败: 0
   警告: 0
 ```
@@ -378,6 +378,46 @@ python3 test_validate.py
   校验功能脚本无硬编码 IP、每个节点 hostname 字段齐全、环境变量覆盖真实生效
 - 验证项从 176 扩至 **184**（全部通过、0 警告）
 - 新增 `inventory/nodes.local.yaml.example` 覆盖模板（真实覆盖文件已 gitignore）
+
+---
+
+## 🚀 v1.4.1 变更说明
+
+**修复：面板依赖安装在「python3 在、pip 不在」的机器上直接失败。**
+
+在玩客云（Debian 12 / Armbian）上跑 `init.sh` 部署面板，会卡在这里：
+
+```
+是否安装/更新 Python 依赖 (panel/requirements.txt)? [y/n]: y
+/usr/bin/python3: No module named pip
+[WARN] 常规安装失败, 尝试 --break-system-packages (Debian 12+ / PEP 668)
+/usr/bin/python3: No module named pip
+[ERROR] Python 依赖安装失败
+```
+
+根因：装了 `python3` 但没装 `python3-pip`。此时 `--break-system-packages`
+**完全无效** —— 它只是 pip 的**旗标**（用于绕过 PEP 668 的
+`externally-managed-environment` 限制），**补不了缺失的 pip 自身**。
+
+修复 —— 新增 `scripts/lib-pydeps.sh`，作为 Python 依赖安装的**单一实现**：
+
+- **由轻到重四路降级**，任一路成功**且 `import` 校验通过**才算成功：
+  1. `pip install`
+  2. `pip install --break-system-packages`（PEP 668）
+  3. pip 缺失 → `ensurepip` → `apt install python3-pip` → `get-pip.py` 补 pip，再回 1/2
+  4. pip 彻底不可用 → `apt install python3-flask python3-flask-cors`，**完全绕开 pip**
+- **不轻信退出码**：每路之后实跑一次 `import flask, flask_cors`，
+  pip 谎报成功也会继续降级
+- **依赖装进系统解释器**（不用 venv）—— 面板 systemd 单元执行的是 `/usr/bin/python3`
+- **失败时打印可复制的兜底命令**（pip 与 apt 两条）
+- 同一实现被 `init/init.sh`、`scripts/setup.sh`、`scripts/install-services.sh` 复用。
+  这三处原先各自拼 `pip3 install`（`setup.sh` 还带 `|| true` 静默吞错），现已统一
+- `init.sh` 中两处系统改动（装 `python3-pip`、装发行版包）**都会先询问**，
+  以符合「纯交互、不预设任何默认」的约定
+
+验证：新增第 20 组测试 15 项，用 mock 解释器 + mock `apt-get` 实测 8 个场景
+（依赖已齐 / 常规 pip / PEP 668 / ensurepip 补齐 / apt 补齐 pip /
+apt 装发行版包 / 全部失败 / pip 谎报成功）。
 
 ---
 

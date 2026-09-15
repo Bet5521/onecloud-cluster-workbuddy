@@ -62,6 +62,15 @@ if [ "$HAVE_INVENTORY" != "1" ]; then
 fi
 
 # ------------------------------------------------------------
+# 2b. Python 依赖库 (pip 缺失时的多路降级)
+#     复用 scripts/lib-pydeps.sh, 不在此重复实现
+# ------------------------------------------------------------
+if [ -f "${SCRIPTS_DIR}/lib-pydeps.sh" ]; then
+    # shellcheck source=../scripts/lib-pydeps.sh
+    source "${SCRIPTS_DIR}/lib-pydeps.sh"
+fi
+
+# ------------------------------------------------------------
 # 3. 颜色与日志 (在 source lib-nodes.sh 之后定义, 覆盖同名函数)
 # ------------------------------------------------------------
 RED='\033[0;31m'
@@ -248,7 +257,12 @@ pick_node() {
 }
 
 # 查找可用的 python 解释器
+# 实现集中在 scripts/lib-pydeps.sh, 此处只做委派 (库缺失时退化为内联实现)
 pick_python() {
+    if declare -F pydeps_pick_python >/dev/null 2>&1; then
+        pydeps_pick_python
+        return $?
+    fi
     local c
     for c in python3 python; do
         if command -v "$c" >/dev/null 2>&1; then
@@ -304,18 +318,96 @@ panel_install_deps() {
         return 0
     fi
     local py
-    py="$(pick_python)" || { log_err "未检测到 python3, 请先安装: apt-get install -y python3 python3-pip"; return 1; }
+    py="$(pick_python)" || {
+        log_err "未检测到 python3, 请先安装: apt-get install -y python3 python3-pip"
+        return 1
+    }
 
-    if ( cd "$PANEL_DIR" && "$py" -m pip install -r requirements.txt ); then
-        log_ok "Python 依赖安装完成"
+    # 解析 requirements, 得出「模块名」(import 校验) 与「发行版包名」(apt 兜底)
+    local spec p
+    spec="$(pydeps_read_requirements "$req" | tr '\n' ' ')"
+    if [ -z "$spec" ]; then
+        log_warn "panel/requirements.txt 无有效条目, 跳过"
         return 0
     fi
-    log_warn "常规安装失败, 尝试 --break-system-packages (Debian 12+ / PEP 668)"
-    if ( cd "$PANEL_DIR" && "$py" -m pip install --break-system-packages -r requirements.txt ); then
-        log_ok "Python 依赖安装完成 (--break-system-packages)"
+    local -a mods=() apts=()
+    for p in $spec; do
+        mods+=("$(pydeps_module_name "$p")")
+        apts+=("$(pydeps_apt_name "$p")")
+    done
+
+    echo -e "  ${DIM}解释器: ${py} -> $(command -v "$py" 2>/dev/null)${NC}"
+
+    # 依赖已齐就不用动系统
+    if pydeps_verify "$py" "${mods[@]}"; then
+        log_ok "Python 依赖已就绪 (${spec})"
         return 0
     fi
-    log_err "Python 依赖安装失败"
+    echo ""
+
+    # ---- 先解决「pip 本身缺失」 ----
+    # Debian 12+ / Armbian 上 python3 存在但 pip 模块没装的场景,
+    # 此时 --break-system-packages 完全无效 (它只是 pip 的旗标, 不能补 pip)
+    if ! pydeps_pip_usable "$py"; then
+        log_warn "${py} 缺少 pip 模块 (常见于: 装了 python3 但未装 python3-pip)"
+        log_warn "  注意: --break-system-packages 只是 pip 的旗标, 补不了 pip 自身"
+        if pydeps_try_ensurepip "$py"; then
+            log_ok "已通过 ensurepip 补齐 pip"
+        elif command -v apt-get >/dev/null 2>&1; then
+            echo ""
+            echo -e "  ${DIM}命令: ${SUDO:+$SUDO }apt-get install -y python3-pip${NC}"
+            if ask_yes_no "是否用 apt 补齐 pip (python3-pip)?"; then
+                if pydeps_try_apt_pip "$SUDO" && pydeps_pip_usable "$py"; then
+                    log_ok "已通过 apt 补齐 pip"
+                else
+                    log_warn "apt 安装 python3-pip 未成功"
+                fi
+            else
+                log_warn "已跳过补齐 pip"
+            fi
+        fi
+    fi
+
+    # ---- 路线 1/2: pip ----
+    if pydeps_pip_usable "$py"; then
+        echo ""
+        echo -e "  ${DIM}命令: ${SUDO:+$SUDO }${py} -m pip install -r panel/requirements.txt${NC}"
+        if ( cd "$PANEL_DIR" && $SUDO "$py" -m pip install -r requirements.txt ); then
+            if pydeps_verify "$py" "${mods[@]}"; then
+                log_ok "Python 依赖安装完成"
+                return 0
+            fi
+            log_warn "pip 报告成功, 但 import 校验未通过"
+        fi
+        log_warn "常规安装失败, 尝试 --break-system-packages (Debian 12+ / PEP 668)"
+        if ( cd "$PANEL_DIR" && $SUDO "$py" -m pip install --break-system-packages -r requirements.txt ); then
+            if pydeps_verify "$py" "${mods[@]}"; then
+                log_ok "Python 依赖安装完成 (--break-system-packages)"
+                return 0
+            fi
+            log_warn "pip 报告成功, 但 import 校验未通过"
+        fi
+    fi
+
+    # ---- 路线 4: 发行版包, 完全绕开 pip ----
+    if command -v apt-get >/dev/null 2>&1; then
+        echo ""
+        log_warn "pip 路线不可用或未成功, 可改用系统包 (完全绕开 pip)"
+        echo -e "  ${DIM}命令: ${SUDO:+$SUDO }apt-get install -y ${apts[*]}${NC}"
+        if ask_yes_no "是否改用系统包安装 (${apts[*]})?"; then
+            if pydeps_try_apt_pkgs "$SUDO" "${apts[@]}"; then
+                if pydeps_verify "$py" "${mods[@]}"; then
+                    log_ok "Python 依赖已由系统包安装"
+                    return 0
+                fi
+                log_warn "系统包装完但 import 校验仍未通过"
+            fi
+        fi
+    fi
+
+    log_err "Python 依赖安装失败 (缺少模块: ${mods[*]})"
+    log_info "可手工执行以下任一条:"
+    pydeps_hint "$spec" "$py" "$SUDO"
     return 1
 }
 
@@ -965,7 +1057,7 @@ menu_selfcheck() {
     echo ""
     echo -e "${BOLD}关键脚本${NC}"
     local s
-    for s in lib-nodes.sh bootstrap.sh deploy.sh health-check.sh backup.sh \
+    for s in lib-nodes.sh lib-pydeps.sh bootstrap.sh deploy.sh health-check.sh backup.sh \
              restore.sh update-all.sh install-services.sh setup.sh \
              wireguard-setup.sh gen-panel-config.sh gen-node-env.sh; do
         if [ -f "${SCRIPTS_DIR}/${s}" ]; then
@@ -975,6 +1067,35 @@ menu_selfcheck() {
             problems=$((problems + 1))
         fi
     done
+
+    # ---- Python 环境 (面板/ migpt 的依赖前提) ----
+    echo ""
+    echo -e "${BOLD}Python 环境${NC}"
+    local py
+    if py="$(pick_python)"; then
+        log_ok "解释器: ${py} -> $(command -v "$py" 2>/dev/null)"
+        if pydeps_pip_usable "$py"; then
+            log_ok "pip 模块可用 ($("$py" -m pip --version 2>/dev/null | head -1))"
+        else
+            log_warn "${py} 缺少 pip 模块 —— 面板依赖安装会先失败一次"
+            log_info "  修复: ${SUDO:+$SUDO }apt-get install -y python3-pip"
+            log_info "  或安装时改走系统包: ${SUDO:+$SUDO }apt-get install -y python3-flask python3-flask-cors"
+        fi
+        local m missing=""
+        for m in flask flask_cors; do
+            if ! pydeps_verify "$py" "$m"; then
+                missing="${missing:+$missing }$m"
+            fi
+        done
+        if [ -z "$missing" ]; then
+            log_ok "面板依赖已就绪 (flask, flask_cors)"
+        else
+            log_warn "面板缺少模块: ${missing} (部署面板时选择安装依赖即可)"
+        fi
+    else
+        log_warn "未检测到 python3 —— 面板与 migpt 无法运行"
+        log_info "  安装: ${SUDO:+$SUDO }apt-get install -y python3 python3-pip"
+    fi
 
     echo ""
     echo -e "${BOLD}依赖命令${NC}"

@@ -521,34 +521,49 @@ def test_script_syntax():
         try:
             with open(script, encoding='utf-8') as f:
                 content = f.read()
-            
+
+            # 仅被 source 的库文件 (lib-*.sh) 不按可执行脚本的标准要求:
+            #   - 不得 set -e: 会让调用方在任何一条命令失败时直接中止 (语义污染)。
+            #     注意 set -u (nounset) 是允许的 —— 本项目的 lib-nodes.sh 正是靠它
+            #     给 backup.sh / deploy.sh 等「只设了 set -e」的脚本补上 nounset。
+            #   - 不要求定义 log_*: 各调用方命名不同 (log_err / log_error),
+            #     init.sh 还会在 source 之后覆盖同名函数。
+            is_lib = script.name.startswith("lib-")
+
             # 检查 shebang
             if content.startswith("#!/bin/bash") or content.startswith("#!/bin/sh"):
                 log_pass(f"{script.name} 有 shebang")
             else:
                 log_warn(f"{script.name} 缺少 shebang")
-            
-            # 检查 set -e 或 set -u
-            if "set -e" in content or "set -u" in content:
-                log_pass(f"{script.name} 有错误处理 (set -e/-u)")
+
+            if is_lib:
+                if re.search(r'^set -[a-z]*e', content, re.MULTILINE):
+                    log_fail(f"{script.name} 作为被 source 的库设置了 set -e",
+                             "会污染调用方的错误处理语义")
+                else:
+                    log_pass(f"{script.name} 作为被 source 的库不设置 set -e")
             else:
-                log_warn(f"{script.name} 缺少 set -e/-u")
-            
+                # 检查 set -e 或 set -u
+                if "set -e" in content or "set -u" in content:
+                    log_pass(f"{script.name} 有错误处理 (set -e/-u)")
+                else:
+                    log_warn(f"{script.name} 缺少 set -e/-u")
+
+                # 检查 log 函数
+                has_log_info = "log_info" in content
+                has_log_error = "log_error" in content
+                if has_log_info and has_log_error:
+                    log_pass(f"{script.name} 有日志函数")
+                elif not has_log_info:
+                    log_warn(f"{script.name} 缺少 log_info 函数")
+                elif not has_log_error:
+                    log_warn(f"{script.name} 缺少 log_error 函数")
+
             # 检查基本结构
             functions = re.findall(r'^(\w+)\(\)\s*\{', content, re.MULTILINE)
             if functions:
                 log_info(f"  函数: {', '.join(functions[:10])}{'...' if len(functions) > 10 else ''}")
-            
-            # 检查 log 函数
-            has_log_info = "log_info" in content
-            has_log_error = "log_error" in content
-            if has_log_info and has_log_error:
-                log_pass(f"{script.name} 有日志函数")
-            elif not has_log_info:
-                log_warn(f"{script.name} 缺少 log_info 函数")
-            elif not has_log_error:
-                log_warn(f"{script.name} 缺少 log_error 函数")
-                
+
         except Exception as e:
             log_fail(f"{script.name} 读取错误: {str(e)}")
     
@@ -2015,6 +2030,258 @@ def test_delivery_consistency():
         log_pass("无「printf 实参含中文 + %-Ns」的按字节填充写法")
 
 
+def test_pydeps_fallback():
+    """测试 20: Python 依赖安装的降级链 (pip 缺失场景)"""
+    print("\n" + "=" * 60)
+    print("测试 20: Python 依赖降级链 (lib-pydeps.sh)")
+    print("=" * 60)
+
+    lib = SCRIPTS_DIR / "lib-pydeps.sh"
+    if not lib.exists():
+        log_fail("scripts/lib-pydeps.sh 缺失")
+        return
+    lsrc = lib.read_text(encoding="utf-8")
+
+    # ---- 静态断言 ----
+    needed = ["pydeps_pip_usable", "pydeps_try_ensurepip", "pydeps_try_apt_pip",
+              "pydeps_try_getpip", "pydeps_try_apt_pkgs", "pydeps_verify",
+              "pydeps_install", "pydeps_install_from_file"]
+    missing = [n for n in needed if f"{n}()" not in lsrc]
+    if not missing:
+        log_pass("lib-pydeps.sh 具备完整降级链函数")
+    else:
+        log_fail(f"lib-pydeps.sh 缺少函数: {missing}")
+
+    if 'python3-flask-cors' in lsrc and 'python3-flask' in lsrc:
+        log_pass("具备发行版包 (apt) 兜底映射")
+    else:
+        log_fail("缺少 apt 包名映射", "pip 不可用时无法兜底")
+
+    # 调用方必须复用同一实现, 不得再各自拼 pip 命令
+    dup = []
+    for sh in [PROJECT_ROOT / "init" / "init.sh", SCRIPTS_DIR / "setup.sh",
+               SCRIPTS_DIR / "install-services.sh", SCRIPTS_DIR / "lib-pydeps.sh"]:
+        if not sh.exists():
+            continue
+        if sh.name == "lib-pydeps.sh":
+            continue
+        for ln_no, ln in enumerate(sh.read_text(encoding="utf-8").splitlines(), 1):
+            s = ln.strip()
+            if s.startswith("#"):
+                continue
+            if re.search(r'(^|\s|\|)pip3\s+install', ln):
+                dup.append(f"{sh.name}:{ln_no}")
+    if not dup:
+        log_pass("无脚本再直接调用裸 pip3 (统一走 lib-pydeps.sh)")
+    else:
+        log_fail(f"仍有裸 pip3 调用: {dup[:4]}", "pip 缺失时会 command not found")
+
+    # init.sh 必须 source 该库
+    isrc = (PROJECT_ROOT / "init" / "init.sh").read_text(encoding="utf-8")
+    if "lib-pydeps.sh" in isrc and "panel_install_deps" in isrc:
+        log_pass("init.sh 已接入 lib-pydeps.sh")
+    else:
+        log_fail("init.sh 未接入 lib-pydeps.sh")
+
+    # 关键: panel_install_deps 不能只靠 --break-system-packages 救场
+    if "pydeps_pip_usable" in isrc and "python3-pip" in isrc:
+        log_pass("init.sh 会先检测 pip 是否可用, 并具备补齐路径")
+    else:
+        log_fail("init.sh 未检测 pip 可用性",
+                 "--break-system-packages 补不了缺失的 pip 自身")
+
+    # ---- 行为验证: 用 mock 解释器/包管理器跑真实降级链 ----
+    def _posix(p):
+        s = Path(p).as_posix()
+        m = re.match(r"^([A-Za-z]):/(.*)$", s)
+        return f"/{m.group(1).lower()}/{m.group(2)}" if m else s
+
+    tmpdir = Path(tempfile.mkdtemp(prefix="oc_t20_"))
+    harness = tmpdir / "harness.sh"
+
+    tmpl = r'''#!/bin/bash
+set -u
+LIB="__LIB__"
+ROOT="__ROOT__"
+M="$ROOT/mockbin"
+mkdir -p "$M"
+
+cat > "$M/python3" << 'PYMOCK'
+#!/bin/bash
+SD="${MOCK_STATE:-/tmp/nostate}"
+log() { printf '%s\n' "$*" >> "$SD/calls"; }
+mod_of() { printf '%s' "$1" | tr '-' '_'; }
+case "${1:-}" in
+  -m)
+    shift
+    case "${1:-}" in
+      pip)
+        shift
+        if [ ! -f "$SD/pip" ]; then echo "No module named pip" >&2; exit 1; fi
+        case "${1:-}" in
+          --version) echo "pip 24.0"; exit 0 ;;
+          install)
+            shift
+            brk=0; args=""
+            for a in "$@"; do
+              if [ "$a" = "--break-system-packages" ]; then brk=1; continue; fi
+              case "$a" in -*) continue ;; esac
+              args="$args $a"
+            done
+            if [ "$brk" = "1" ]; then
+              log "pip install --break-system-packages$args"
+              [ "${S_break:-0}" = "1" ] || { echo "error" >&2; exit 1; }
+            else
+              log "pip install$args"
+              [ "${S_plain:-0}" = "1" ] || { echo "externally-managed-environment" >&2; exit 1; }
+            fi
+            if [ "${S_touch:-1}" = "1" ]; then
+              for a in $args; do : > "$SD/inst_$(mod_of "$a")"; done
+            fi
+            exit 0
+            ;;
+        esac
+        exit 1
+        ;;
+      ensurepip)
+        log "ensurepip"
+        if [ "${S_ensurepip:-0}" = "1" ]; then : > "$SD/pip"; exit 0; fi
+        echo "No module named ensurepip" >&2
+        exit 1
+        ;;
+    esac
+    exit 1
+    ;;
+  -c)
+    mods="$(printf '%s' "${2:-}" | sed -e 's/^import //' -e 's/,/ /g')"
+    for m in $mods; do [ -f "$SD/inst_$m" ] || exit 1; done
+    exit 0
+    ;;
+esac
+exit 1
+PYMOCK
+
+cat > "$M/apt-get" << 'APTMOCK'
+#!/bin/bash
+SD="${MOCK_STATE:-/tmp/nostate}"
+[ "${1:-}" = "update" ] && exit 0
+[ "${1:-}" = "install" ] || exit 1
+shift
+pkgs=""
+for a in "$@"; do
+  case "$a" in -*) continue ;; esac
+  pkgs="$pkgs $a"
+done
+printf 'apt-get install%s\n' "$pkgs" >> "$SD/calls"
+for p in $pkgs; do
+  if [ "$p" = "python3-pip" ]; then
+    if [ "${S_apt_pip:-0}" = "1" ]; then : > "$SD/pip"; else exit 1; fi
+    continue
+  fi
+  case " ${S_avail:-} " in
+    *" $p "*) : > "$SD/inst_$(printf '%s' "$p" | sed -e 's/^python3-//' -e 's/-/_/g')" ;;
+    *) exit 1 ;;
+  esac
+done
+exit 0
+APTMOCK
+
+# 断网: 让 get-pip.py 兜底快速失败, 保证测试确定性
+printf '#!/bin/bash\nexit 1\n' > "$M/curl"
+cp "$M/curl" "$M/wget"
+chmod +x "$M"/*
+
+scenario() {
+    local name="$1" plain="$2" brk="$3" ens="$4" aptpip="$5" avail="$6" touch="$7" pre="$8"
+    local SC="$ROOT/$name"
+    mkdir -p "$SC"          # ROOT 由 mktemp 新建, 每个 SC 都是全新目录, 无需 rm
+    local p
+    for p in $pre; do : > "$SC/inst_$p"; done
+    [ "${9:-0}" = "1" ] && : > "$SC/pip"
+    echo "###CASE:$name"
+    # 固定 PATH: 只留本仓 mock 与系统工具。宿主 shell 会往 PATH 注入
+    # rm 安全 shim, 而这类 shim 会对 rm -rf 发起确认并挂起, 必须绕开。
+    MOCK_STATE="$SC" S_plain="$plain" S_break="$brk" S_ensurepip="$ens" \
+    S_apt_pip="$aptpip" S_avail="$avail" S_touch="$touch" \
+    PATH="$M:/usr/bin:/bin" \
+        bash -c '
+            source "$0"
+            pydeps_install "$1" "flask flask-cors" ""
+            rc=$?
+            echo "RC=$rc"
+            if [ "$rc" != "0" ]; then pydeps_hint "flask flask-cors" "$1" ""; fi
+        ' "$LIB" python3 2>&1 | sed 's/^/    /'
+    echo "    CALLS: $(cat "$SC/calls" 2>/dev/null | tr '\n' '|')"
+}
+
+scenario already_ok   0 0 0 0 ""                 1 "flask flask_cors" 0
+scenario pip_plain    1 0 0 0 ""                 1 "" 1
+scenario pep668       0 1 0 0 ""                 1 "" 1
+scenario via_ensure   1 0 1 0 ""                 1 "" 0
+scenario via_apt_pip  0 1 0 1 ""                 1 "" 0
+scenario via_apt_pkg  0 0 0 0 "python3-flask python3-flask-cors" 1 "" 0
+scenario all_fail     0 0 0 0 ""                 1 "" 0
+scenario pip_lied     1 0 0 0 "python3-flask python3-flask-cors" 0 "" 1
+'''
+    harness.write_text(
+        tmpl.replace("__LIB__", _posix(lib)).replace("__ROOT__", _posix(tmpdir)),
+        encoding="utf-8")
+
+    try:
+        r = subprocess.run(["bash", str(harness)], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace",
+                           stdin=subprocess.DEVNULL, timeout=240)
+        out = r.stdout
+
+        def case(tag):
+            m = re.search(rf"###CASE:{tag}\n(.*?)(?=\n###CASE:|\Z)", out, re.S)
+            return m.group(1) if m else ""
+
+        checks = [
+            ("pip_plain", "RC=0", "pip install flask flask-cors", "常规 pip 路线"),
+            ("pep668", "RC=0", "pip install --break-system-packages flask flask-cors",
+             "PEP 668 时自动加 --break-system-packages"),
+            ("via_ensure", "RC=0", "ensurepip", "ensurepip 补齐 pip"),
+            ("via_apt_pip", "RC=0", "apt-get install python3-pip",
+             "pip 缺失时用 apt 补齐 python3-pip"),
+            ("via_apt_pkg", "RC=0", "apt-get install python3-flask python3-flask-cors",
+             "pip 完全不可用时改走发行版包"),
+            ("all_fail", "RC=1", "--break-system-packages flask", "彻底失败时给出手工命令"),
+            ("pip_lied", "RC=0", "apt-get install python3-flask", "pip 谎报成功时靠 import 校验兜住"),
+        ]
+        for tag, want_rc, want_call, desc in checks:
+            c = case(tag)
+            ok = want_rc in c and want_call in c
+            if ok:
+                log_pass(desc)
+            else:
+                log_fail(f"{desc} —— 用例 {tag} 不符合预期",
+                         f"缺 [{want_rc}] 或 [{want_call}]; 实际: {c.strip()[:180]}")
+
+        # 依赖已齐时必须完全不动包管理器
+        c = case("already_ok")
+        if "依赖已就绪" in c and "pip install" not in c and "apt-get" not in c:
+            log_pass("依赖已齐时直接返回, 不调用 pip/apt")
+        else:
+            log_fail("依赖已齐时仍调用了包管理器", c.strip()[:180])
+
+        # via_apt_pip 场景不得退回装发行版包 (顺序必须是先补 pip)
+        c = case("via_apt_pip")
+        if "apt-get install python3-flask" not in c:
+            log_pass("补齐 pip 成功后不再多装发行版包 (降级顺序正确)")
+        else:
+            log_fail("补齐 pip 后仍安装了发行版包", "降级顺序不符预期")
+
+        # all_fail 必须给出可复制的手工命令
+        c = case("all_fail")
+        if "pip install --break-system-packages" in c and "apt-get install -y python3-flask" in c:
+            log_pass("失败提示含 pip 与 apt 两条可复制命令")
+        else:
+            log_fail("失败提示缺少可复制命令", c.strip()[:180])
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 # ============ 主程序 ============
 def main():
     print("=" * 60)
@@ -2043,6 +2310,7 @@ def main():
         ("bootstrap SD与风险", test_bootstrap_sd_and_risk),
         ("init 交互式入口", test_init_entrypoint),
         ("交付物一致性", test_delivery_consistency),
+        ("Python 依赖降级链", test_pydeps_fallback),
     ]
     
     for test_name, test_func in tests:

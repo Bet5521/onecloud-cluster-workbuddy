@@ -38,6 +38,29 @@ if [ -f "${SCRIPT_DIR_SETUP}/lib-nodes.sh" ]; then
     source "${SCRIPT_DIR_SETUP}/lib-nodes.sh"
 fi
 
+# ---- Python 依赖库 (pip 缺失时的多路降级) ----
+if [ -f "${SCRIPT_DIR_SETUP}/lib-pydeps.sh" ]; then
+    # shellcheck disable=SC1090
+    source "${SCRIPT_DIR_SETUP}/lib-pydeps.sh"
+fi
+
+# 统一安装 Python 依赖 (供 migpt / panel 复用, 不再各自拼 pip3 命令)
+install_py_deps() {
+    local pkgs="flask flask-cors pyyaml requests"
+    local py
+    py="$(pydeps_pick_python)" || {
+        log_warn "未检测到 python3, 跳过 Python 依赖安装"
+        return 1
+    }
+    if pydeps_install "$py" "$pkgs" ""; then
+        log_info "Python 依赖就绪: $pkgs"
+        return 0
+    fi
+    log_warn "Python 依赖安装失败, 手工兜底:"
+    pydeps_hint "$pkgs" "$py" "" >&2
+    return 1
+}
+
 # 当前机器所属节点: 用本机 IP 反查清单; 找不到时退化为本机主 IP
 current_node_ip() {
     local lip
@@ -854,9 +877,8 @@ install_migpt() {
     log_info "安装 migpt AI助手..."
     ensure_svc_dir "migpt"
 
-    # 安装 Python 依赖
-    apt-get install -y python3-pip python3-venv 2>/dev/null || true
-    pip3 install flask flask-cors pyyaml requests 2>/dev/null || true
+    # 安装 Python 依赖 (统一走 lib-pydeps.sh 的降级链, 不再各自拼 pip3)
+    install_py_deps || log_warn "Python 依赖不完整, 对应服务可能无法启动"
 
     # 生成代理脚本
     cat > "${DATA_DIR}/migpt/proxy.py" << 'PYEOF'
@@ -953,9 +975,8 @@ install_panel() {
     ensure_svc_dir "panel"
     local panel_dir="${DATA_DIR}/panel"
 
-    # 安装 Python 依赖
-    apt-get install -y python3-pip python3-venv 2>/dev/null || true
-    pip3 install flask flask-cors pyyaml requests 2>/dev/null || true
+    # 安装 Python 依赖 (统一走 lib-pydeps.sh 的降级链, 不再各自拼 pip3)
+    install_py_deps || log_warn "Python 依赖不完整, 对应服务可能无法启动"
 
     # 尝试从项目模板复制完整的面板文件
     local script_dir

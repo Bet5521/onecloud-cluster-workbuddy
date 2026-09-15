@@ -9,6 +9,7 @@
 | 脚本 | 用途 | 常用命令 |
 |------|------|---------|
 | `lib-nodes.sh` | 节点清单库（被其他脚本 source） | — |
+| `lib-pydeps.sh` | Python 依赖安装库（pip 缺失多路降级，被 init/setup/install-services source） | 直接 source |
 | `gen-panel-config.sh` | 从清单生成面板 config.json | 直接运行 |
 | `gen-node-env.sh` | 从清单渲染各节点 .env | `[节点名]` / `--dry-run` |
 | `bootstrap.sh` | 新节点初始化 | `--node <名> --yes` |
@@ -30,6 +31,11 @@ lib-nodes.sh          ← 所有运维脚本的底层依赖（自动 source）
     ├── inventory/nodes.yaml     节点数据源
     ├── inventory/nodes.local.yaml  本地覆盖（可选）
     └── inventory/services.yaml    服务映射
+
+lib-pydeps.sh         ← Python 依赖安装的单一实现（自动 source）
+    ├── init/init.sh                 面板依赖
+    ├── scripts/setup.sh             migpt / panel 依赖
+    └── scripts/install-services.sh  migpt 依赖
 
 gen-panel-config.sh   → panel/config.json
 gen-node-env.sh       → node-*/.env
@@ -54,6 +60,58 @@ node_resolve edge-01         # 简写 → 标准名
 node_name_by_role edge-gateway  # 按角色查节点
 node_of_service homeassistant   # 服务 → 节点映射
 ```
+
+### lib-pydeps.sh — Python 依赖安装库
+
+所有 Python 依赖安装的**单一实现**。init / setup / install-services 都 source 它，
+不再各自拼 `pip3 install`。
+
+它解决的现实故障（Debian 12+ / Armbian 玩客云上很常见）：
+
+```
+python3 exists  →  but pip module missing
+$ python3 -m pip install -r panel/requirements.txt
+/usr/bin/python3: No module named pip
+[WARN] 常规安装失败, 尝试 --break-system-packages (Debian 12+ / PEP 668)
+/usr/bin/python3: No module named pip        ← 加了旗标也没用
+[ERROR] Python 依赖安装失败
+```
+
+**`--break-system-packages` 只是 pip 的旗标**（用于绕过 PEP 668 的
+`externally-managed-environment` 限制），**补不了缺失的 pip 自身**。
+
+所以本库按「由轻到重」四路降级，任一路成功**且 import 校验通过**才算成功：
+
+| 路线 | 手段 | 适用 |
+|---|---|---|
+| 1 | `pip install` | 已有 pip |
+| 2 | `pip install --break-system-packages` | Debian 12+ 的 PEP 668 限制 |
+| 3 | `ensurepip` → `apt python3-pip` → `get-pip.py` | pip 缺失，先补 pip 再回路线 1/2 |
+| 4 | `apt install python3-flask python3-flask-cors` | pip 彻底不可用，完全绕开 pip |
+
+```bash
+source scripts/lib-pydeps.sh
+
+pydeps_pick_python                                  # python3 / python
+pydeps_pip_usable python3                           # pip 模块是否真的可用
+pydeps_try_ensurepip python3                        # 单独补 pip 的三条子路线
+pydeps_try_apt_pip ""
+pydeps_try_getpip python3 ""
+pydeps_ensure_pip python3 ""                        # 上面三条串起来
+pydeps_verify python3 flask flask_cors              # 断言模块可 import
+pydeps_install python3 "flask flask-cors" ""        # 主入口（自动降级 + 校验）
+pydeps_install_from_file python3 panel/requirements.txt ""
+pydeps_hint "flask flask-cors" python3 ""           # 失败时给人可复制的命令
+```
+
+要点：
+
+- **不轻信安装命令的退出码** —— 每路都跟一次 `import` 校验，pip 谎报成功也会继续降级
+- **依赖必须装进系统解释器**，不能用 venv：面板 systemd 单元执行的是 `/usr/bin/python3`
+- **只定义函数、不产生副作用**，`source` 即零操作；需要 root 的命令走调用方传入的 `SUDO`
+- **不定义 `log_*`**（各调用方命名不同），进度信息走 stderr，把 stdout 留给数据
+- 需要系统改动的步骤（装 `python3-pip`、装发行版包）在 `init.sh` 里**都会先问**，
+  以符合「纯交互、不预设默认」的约定
 
 ### bootstrap.sh — 节点初始化
 

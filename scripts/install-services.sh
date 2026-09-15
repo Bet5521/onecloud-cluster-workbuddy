@@ -15,6 +15,10 @@ log_info() { echo -e "${GREEN}[INFO]${NC} $*"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
 
+# Python 依赖安装公共库 (pip 缺失时的多路降级)
+# shellcheck source=lib-pydeps.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib-pydeps.sh"
+
 usage() {
     cat << EOF
 用法: $0 <服务名>
@@ -150,12 +154,22 @@ install_xiaomusic() {
 install_migpt() {
     log_info "安装 migpt 轻量代理依赖..."
     local pkgs="flask flask-cors pyyaml requests"
-    # Debian 12+ 默认启用 PEP 668 (externally-managed), 普通 pip3 install 会失败,
-    # 因此依次尝试: 普通安装 -> --break-system-packages -> apt 包
-    pip3 install $pkgs 2>/dev/null \
-        || pip3 install --break-system-packages $pkgs 2>/dev/null \
-        || apt-get install -y python3-flask python3-yaml python3-requests 2>/dev/null \
-        || { log_error "依赖安装失败, 请手动执行: pip3 install $pkgs"; return 1; }
+
+    # 统一走 scripts/lib-pydeps.sh 的降级链:
+    #   pip -> --break-system-packages -> ensurepip/apt 补 python3-pip
+    #   -> apt 发行版包 (python3-flask 等) -> import 校验
+    # 旧实现直接用裸 pip3, 在「装了 python3 但没装 python3-pip」的机器上
+    # 会以 command not found 起步, 且 --break-system-packages 救不了。
+    local py
+    py="$(pydeps_pick_python)" || {
+        log_error "未检测到 python3, 请先安装: apt-get install -y python3 python3-pip"
+        return 1
+    }
+    if ! pydeps_install "$py" "$pkgs" ""; then
+        log_error "依赖安装失败, 可手工执行:"
+        pydeps_hint "$pkgs" "$py" "" >&2
+        return 1
+    fi
     log_info "migpt proxy.py 已就绪, 使用 systemd 运行"
 }
 
