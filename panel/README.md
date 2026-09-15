@@ -48,13 +48,47 @@ PANEL_USER=admin PANEL_PASS='强密码' PANEL_PORT=9000 python3 app.py
 
 访问：`http://<edge节点IP>:9000`
 
+### 监听地址（`PANEL_HOST`）
+
+| 取值 | 含义 |
+|------|------|
+| `0.0.0.0` | 监听**全部网卡**（含 WireGuard / 外网网卡）—— 暴露面最大，需配合防火墙 |
+| 本机局域网地址（如 `192.168.1.101`） | **同网段可访问**，其它网段需经路由/防火墙 |
+| `127.0.0.1` | 仅本机（远端需 `ssh -L 9000:127.0.0.1:9000 <用户>@<节点IP>`） |
+
+> 想「同网段可访问」应填**本机在该网段的地址**，不要用 `0.0.0.0` ——
+> 后者会把 WireGuard 与外网网卡一起暴露出去。
+
+`app.py` 启动前会校验 `PANEL_HOST`：网段地址（`192.168.1.0`）、广播地址
+（`192.168.1.255`）、回环网段的网络地址（`127.0.0.0`）、组播/保留段、非 IPv4
+字面量都会**直接报错退出并说明该怎么改**，而不是留到 `bind()` 时抛出
+`Cannot assign requested address`（那条报错看不出真正原因）。
+
+```bash
+PANEL_HOST=127.0.0.0 python3 app.py
+# [ERROR] PANEL_HOST=127.0.0.0 不是可用监听地址 (保留段 / 回环网段 / 组播段)
+#         仅本机访问请用 127.0.0.1; 同网段访问请填本机局域网地址
+```
+
+经 `init/init.sh` 部署时，监听地址由菜单选择并走同一套校验
+（`scripts/lib-panel-host.sh`），会自动探测本机可用地址作为推荐项。
+
 ---
 
 ## 安装为 systemd 服务
 
 ```bash
 sudo bash install-service.sh
+
+# 自定义监听地址/端口（不传则用 unit 里的默认值）
+sudo env PANEL_HOST=192.168.1.101 PANEL_PORT=9000 bash install-service.sh
 ```
+
+`install-service.sh` 会在写 unit 之前**再校验一次** `PANEL_HOST`：即使绕过
+`init.sh` 直接调用，也不会把绑不上的地址写进服务配置（否则只会得到一个起不来的
+服务，`systemctl status` 里只有一行 `Cannot assign requested address`）。
+启动后会按监听类型打印真实入口（`0.0.0.0` 列出各网卡地址、`127.0.0.1` 提示
+仅本机并给出 `ssh -L` 命令）。
 
 ---
 
@@ -88,7 +122,7 @@ sudo bash install-service.sh
 ```json
 {
   "cluster_name": "OneCloud Cluster",
-  "version": "1.4.3",
+  "version": "1.4.4",
   "nodes": [
     {
       "name": "wk-edge-01",

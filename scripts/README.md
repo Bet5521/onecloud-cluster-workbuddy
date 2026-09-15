@@ -10,6 +10,7 @@
 |------|------|---------|
 | `lib-nodes.sh` | 节点清单库（被其他脚本 source） | — |
 | `lib-pydeps.sh` | Python 依赖安装库（pip 缺失多路降级，被 init/setup/install-services source） | 直接 source |
+| `lib-panel-host.sh` | 面板监听地址库（探测本机网卡、校验绑定地址，被 init/install-service source） | 直接 source |
 | `gen-panel-config.sh` | 从清单生成面板 config.json | 直接运行 |
 | `gen-node-env.sh` | 从清单渲染各节点 .env | `[节点名]` / `--dry-run` |
 | `bootstrap.sh` | 新节点初始化 | `--node <名> --yes` |
@@ -36,6 +37,10 @@ lib-pydeps.sh         ← Python 依赖安装的单一实现（自动 source）
     ├── init/init.sh                 面板依赖
     ├── scripts/setup.sh             migpt / panel 依赖
     └── scripts/install-services.sh  migpt 依赖
+
+lib-panel-host.sh     ← 面板监听地址的单一实现（自动 source）
+    ├── init/init.sh                 监听地址选择与校验
+    └── panel/install-service.sh     注入 PANEL_HOST 时再校验一次
 
 gen-panel-config.sh   → panel/config.json
 gen-node-env.sh       → node-*/.env
@@ -112,6 +117,46 @@ pydeps_hint "flask flask-cors" python3 ""           # 失败时给人可复制�
 - **不定义 `log_*`**（各调用方命名不同），进度信息走 stderr，把 stdout 留给数据
 - 需要系统改动的步骤（装 `python3-pip`、装发行版包）在 `init.sh` 里**都会先问**，
   以符合「纯交互、不预设默认」的约定
+
+### lib-panel-host.sh — 面板监听地址库
+
+面板 `PANEL_HOST` 的**单一实现**：探测本机网卡 + 校验绑定地址。`init.sh`
+（交互引导）与 `panel/install-service.sh`（入参防线）都 source 它。
+
+监听地址写错的代价很高：填成**网段地址**或**回环网段的网络地址**时不会当场报错，
+要等 systemd 拉起 `app.py` 才以 `Cannot assign requested address` 失败，
+日志里看不出真正原因。所以下面这些取值在校验阶段就被挡下：
+
+| 取值 | 问题 | 给出的替代值 |
+|---|---|---|
+| `127.0.0.0` | 回环网段的**网络地址**（不是 `127.0.0.1`） | `127.0.0.1` |
+| `192.168.1.0` | **网段地址** —— 面板只能绑到某台主机的地址 | 本机在该网段的地址（如 `192.168.1.101`） |
+| `192.168.1.255` | 广播地址 | 同上 |
+| `224.0.0.1` / `240.0.0.1` | 组播段 / 保留段 | 本机地址 |
+| `169.254.x.x` | 链路本地（APIPA） | 本机地址 |
+| `0.1.2.3` | `0/8` 保留（只有 `0.0.0.0` 合法） | `0.0.0.0` |
+| `abc` / `::1` / `192.168.1.256` | 非 IPv4 字面量 | 本机地址 |
+
+```bash
+source scripts/lib-panel-host.sh
+
+panel_detect_local_ipv4              # 列出本机可监听的 IPv4（ip → hostname -I → ifconfig 三级兜底）
+panel_host_check 127.0.0.0           # 校验；结果看两个变量
+echo "$PANEL_HOST_REASON"            #   失败原因
+echo "$PANEL_HOST_SUGGEST"           #   可直接采用的替代值
+panel_host_is_local 192.168.1.101    # 是否在本机某张网卡上
+panel_host_desc 192.168.1.101        # "本机网卡地址 (同网段 192.168.1.0/24 可访问)"
+panel_host_cidr 192.168.1.101        # 192.168.1.0/24（网络地址 + 前缀）
+```
+
+要点：
+
+- **想「同网段可访问」就绑本机在该网段的地址**，不要用 `0.0.0.0` ——
+  后者会在**所有**网卡上监听（含 WireGuard 与外网网卡），暴露面更大
+- **不校验就写盘**是这个库要消灭的问题：三层防线（`init.sh` 交互 / `install-service.sh`
+  入参 / `app.py` 运行时）共用同一套判定，避免各处实现漂移
+- 与 `lib-pydeps.sh` 同样的约定：**不 `set -e`、不定义 `log_*`**，只把结果写到
+  stdout 与结果变量，由调用方决定怎么呈现
 
 ### bootstrap.sh — 节点初始化
 

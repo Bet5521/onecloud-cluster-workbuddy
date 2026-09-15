@@ -5,6 +5,7 @@
 # ============================================================
 
 import os
+import sys
 import json
 import subprocess
 import threading
@@ -56,7 +57,7 @@ def load_config():
     except (FileNotFoundError, json.JSONDecodeError) as e:
         return {
             "cluster_name": "OneCloud Cluster",
-            "version": "1.4.3",
+            "version": "1.4.4",
             "nodes": []
         }
 
@@ -272,9 +273,40 @@ def topology():
     config = load_config()
     return jsonify(config)
 
+def resolve_bind_host(raw):
+    """校验 PANEL_HOST: 提前拒绝必然 bind 失败的取值, 并说明该怎么改。
+
+    这里是最末端的一道防线 —— 直接运行 app.py 时会绕过 init.sh 的校验。
+    监听地址必须是本机某张网卡的地址: 填成网段地址 (192.168.1.0) 或回环网段的
+    网络地址 (127.0.0.0) 只会以 "Cannot assign requested address" 收场, 报错
+    信息里看不出真正原因。
+    """
+    host = (raw or "0.0.0.0").strip()
+    parts = host.split(".")
+    if len(parts) != 4 or not all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
+        print(f"[ERROR] PANEL_HOST={host} 不是合法的 IPv4 地址", file=sys.stderr)
+        print("        请填写本机网卡地址 (如 192.168.1.101), 或 0.0.0.0 监听全部网卡", file=sys.stderr)
+        sys.exit(2)
+    octets = [int(p) for p in parts]
+    if host == "0.0.0.0" or host == "127.0.0.1":
+        return host
+    if octets[0] == 0 or octets[0] == 127 or octets[0] >= 224:
+        print(f"[ERROR] PANEL_HOST={host} 不是可用监听地址 (保留段 / 回环网段 / 组播段)", file=sys.stderr)
+        print("        仅本机访问请用 127.0.0.1; 同网段访问请填本机局域网地址", file=sys.stderr)
+        sys.exit(2)
+    if octets[3] in (0, 255):
+        kind = "网络地址 (整个网段)" if octets[3] == 0 else "广播地址"
+        print(f"[ERROR] PANEL_HOST={host} 是{kind}, 面板只能绑定到某台主机的地址", file=sys.stderr)
+        print("        如本机地址为 192.168.1.101 就填 192.168.1.101", file=sys.stderr)
+        sys.exit(2)
+    return host
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PANEL_PORT", 9000))
-    host = os.environ.get("PANEL_HOST", "0.0.0.0")
+    host = resolve_bind_host(os.environ.get("PANEL_HOST", "0.0.0.0"))
     print(f"OneCloud Cluster Panel 启动中...")
     print(f"  http://{host}:{port}")
+    if host == "0.0.0.0":
+        print("  (监听全部网卡, 请确保已用防火墙限制来源)")
     app.run(host=host, port=port, debug=False)

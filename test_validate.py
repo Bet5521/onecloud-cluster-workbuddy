@@ -2007,13 +2007,43 @@ def test_delivery_consistency():
     # 判据: printf 的「实参」里出现中文字面量, 且格式串含 %-Ns
     #   printf "  %-16s %s\n" "名称" "IP"      -> 实参有中文, 会被按字节填充 => 反模式
     #   printf "  %-24s (无固定端口)\n" "$name" -> 中文在格式串, 填充的是 ASCII 变量 => 正常
+    def _first_arg(rest):
+        """取 printf 之后的第一个实参文本（引号 / 命令替换 / ${} / 裸词）"""
+        rest = rest.lstrip()
+        if not rest:
+            return ""
+        ch = rest[0]
+        if ch in "'\"":
+            end = rest.find(ch, 1)
+            return rest[:end + 1] if end > 0 else rest
+        if rest.startswith("$("):
+            depth = 0
+            for i, c in enumerate(rest):
+                if c == "(":
+                    depth += 1
+                elif c == ")":
+                    depth -= 1
+                    if depth == 0:
+                        return rest[:i + 1]
+            return rest
+        if rest.startswith("${"):
+            end = rest.find("}", 2)
+            return rest[:end + 1] if end > 0 else rest
+        return rest.split()[0]
+
     def _cjk_printf_smell(line):
+        # 只看「被 %-Ns 填充的那个实参」是否含中文。
+        # 中文出现在 printf 之外是正常的, 例如:
+        #   "$(printf '%-15s' '0.0.0.0')   全部网卡 (含 WireGuard / 外网网卡)"
+        # 填充的是 ASCII 字面量, 中文只是同一行的说明文字。
         m = re.search(r'printf\s+(?:"([^"]*)"|\'([^\']*)\'|([^\s]+))', line)
         if not m:
             return False
         fmt = next((g for g in m.groups() if g is not None), "")
-        rest = line[m.end():]
-        return bool(re.search(r'%-\d+s', fmt) and re.search(r'[\u4e00-\u9fff]', rest))
+        if not re.search(r'%-\d+s', fmt):
+            return False
+        arg = _first_arg(line[m.end():])
+        return bool(re.search(r'[\u4e00-\u9fff]', arg))
 
     bad_tables = []
     for sh in sorted(SCRIPTS_DIR.glob("*.sh")) + [PROJECT_ROOT / "init" / "init.sh"]:
@@ -2845,6 +2875,336 @@ def test_bootstrap_dns_mode():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+# ============ 测试23: 面板监听地址 ============
+def test_panel_listen_host():
+    """测试 23: 面板监听地址 —— 拦截「网段地址 / 回环网络地址」等绑不上的取值
+
+    背景: 监听地址此前是自由文本、零校验。填成 127.0.0.0 (回环网段的网络地址)
+    或 192.168.1.0 (想表达"同网段"却写成了网段地址) 都不会当场报错, 要等
+    systemd 启动 app.py 才以 "Cannot assign requested address" 失败, 报错信息
+    里看不出真正原因。
+
+    本组验证三层防线:
+      1) init.sh           交互引导 —— 首选本机局域网地址, 误填时给出原因与替代值
+      2) install-service.sh 入参校验 —— 被直接调用时也不放行
+      3) app.py            运行时校验 —— 绕过前两层也拦得住
+    """
+    print("\n" + "=" * 60)
+    print("测试 23: 面板监听地址 (误填拦截 / 同网段引导)")
+    print("=" * 60)
+
+    lib = SCRIPTS_DIR / "lib-panel-host.sh"
+    entry = PROJECT_ROOT / "init" / "init.sh"
+    service = PANEL_DIR / "install-service.sh"
+    app_py = PANEL_DIR / "app.py"
+    missing = [str(p) for p in (lib, entry, service, app_py) if not p.exists()]
+    if missing:
+        log_fail(f"必要文件缺失: {missing}")
+        return
+
+    src = entry.read_text(encoding="utf-8")
+    ssrc = service.read_text(encoding="utf-8")
+    asrc = app_py.read_text(encoding="utf-8")
+    lsrc = lib.read_text(encoding="utf-8")
+
+    # ---- 1) 静态检查 ----
+    need_fns = ["panel_detect_local_ipv4", "panel_host_check", "panel_host_is_local",
+                "panel_host_desc", "panel_host_cidr"]
+    missing_fns = [fn for fn in need_fns
+                   if not re.search(r'^' + re.escape(fn) + r'\(\)\s*\{', lsrc, re.MULTILINE)]
+    if missing_fns:
+        log_fail(f"lib-panel-host.sh 缺少函数: {missing_fns}")
+    else:
+        log_pass(f"lib-panel-host.sh 函数齐全（{len(need_fns)} 个）")
+
+    if "${SCRIPTS_DIR}/lib-panel-host.sh" in src:
+        log_pass("init.sh 已接入 lib-panel-host.sh（校验逻辑单一实现）")
+    else:
+        log_fail("init.sh 未接入 lib-panel-host.sh", "监听地址校验不应各自实现")
+
+    if "请输入监听地址 (例 0.0.0.0 或 127.0.0.1)" in src:
+        log_fail("init.sh 仍用无校验的自由文本读监听地址",
+                 "该写法会原样放行 127.0.0.0 / 192.168.1.0")
+    else:
+        log_pass("init.sh 不再用无校验的自由文本读监听地址")
+
+    if re.search(r"^panel_choose_host\(\)\s*\{", src, re.MULTILINE):
+        log_pass("init.sh 提供面板监听地址选择流程 (panel_choose_host)")
+    else:
+        log_fail("init.sh 缺少 panel_choose_host")
+
+    if "本机局域网地址" in src and "手动输入其它 IPv4 地址" in src:
+        log_pass("监听地址菜单含「本机局域网地址」与手动输入选项")
+    else:
+        log_fail("监听地址菜单缺少「本机局域网地址」选项")
+
+    if "panel_host_check" in ssrc and "PANEL_HOST_SUGGEST" in ssrc:
+        log_pass("install-service.sh 对注入的 PANEL_HOST 做了校验")
+    else:
+        log_fail("install-service.sh 未校验 PANEL_HOST",
+                 "绕过 init.sh 直接调用时会写入绑不上的地址")
+
+    if "def resolve_bind_host" in asrc and "sys.exit(2)" in asrc:
+        log_pass("app.py 在启动前校验绑定地址 (resolve_bind_host)")
+    else:
+        log_fail("app.py 未校验 PANEL_HOST")
+
+    if "127.0.0.0" in asrc or "octets[3] in (0, 255)" in asrc:
+        log_pass("app.py 明确拦住了网段地址与广播地址")
+    else:
+        log_fail("app.py 未拦住网段地址")
+
+    # ---- 2) 行为验证: 用 mock `ip` 提供一张假网卡 ----
+    tmpdir = Path(tempfile.mkdtemp(prefix="oc_t23_"))
+    mockbin = tmpdir / "mockbin"
+    mockbin.mkdir(parents=True, exist_ok=True)
+
+    def _posix(p):
+        s = Path(p).as_posix()
+        m = re.match(r"^([A-Za-z]):/(.*)$", s)
+        return f"/{m.group(1).lower()}/{m.group(2)}" if m else s
+
+    # mock iproute2: 一台同时有 eth0 192.168.1.101/24 与 wg0 10.8.0.101/24 的机器
+    ip_mock = ("#!/bin/bash\n"
+               "case \"$*\" in\n"
+               "    *addr*)\n"
+               "        printf '2: eth0    inet 192.168.1.101/24 brd 192.168.1.255 scope global eth0\\n'\n"
+               "        printf '4: wg0     inet 10.8.0.101/24 scope global wg0\\n'\n"
+               "        ;;\n"
+               "esac\n"
+               "exit 0\n")
+    # 空壳 python3: 只为让 init.sh 的 pick_python 通过 (测试全程在确认环节取消)
+    for name, body in (("ip", ip_mock), ("python3", "#!/bin/bash\nexit 0\n")):
+        p = mockbin / name
+        p.write_text(body, encoding="utf-8", newline="\n")
+        try:
+            os.chmod(p, 0o755)
+        except OSError:
+            pass
+
+    def env_mock():
+        env = dict(os.environ)
+        env["PATH"] = f"{_posix(mockbin)}:/usr/bin:/bin"   # 白名单式 PATH, 不继承宿主注入
+        return env
+
+    def run_lib(script):
+        r = subprocess.run(["bash", "-c", script], capture_output=True, env=env_mock(),
+                           cwd=str(PROJECT_ROOT), timeout=60)
+        return r.returncode, r.stdout.decode("utf-8", "replace")
+
+    # 判定表: 地址 -> 是否可作监听地址
+    cases = [
+        ("127.0.0.0", False), ("127.0.0.1", True), ("192.168.1.0", False),
+        ("192.168.1.255", False), ("192.168.1.101", True), ("192.168.1.254", True),
+        ("10.8.0.101", True), ("0.0.0.0", True), ("0.1.2.3", False),
+        ("224.0.0.1", False), ("240.0.0.1", False), ("255.255.255.255", False),
+        ("169.254.1.1", False), ("192.168.1", False), ("192.168.1.256", False),
+        ("abc", False), ("::1", False),
+    ]
+    script = ('. "$PWD/scripts/lib-panel-host.sh"\n'
+              'for ip in ' + " ".join(f"'{c[0]}'" for c in cases) + '; do\n'
+              '    if panel_host_check "$ip"; then\n'
+              '        printf "%s|OK|%s\\n" "$ip" "${PANEL_HOST_SUGGEST}"\n'
+              '    else\n'
+              '        printf "%s|NG|%s\\n" "$ip" "${PANEL_HOST_SUGGEST}"\n'
+              '    fi\n'
+              'done\n')
+    _, out = run_lib(script)
+    got = {}
+    for ln in out.splitlines():
+        parts = ln.split("|")
+        if len(parts) == 3:
+            got[parts[0]] = (parts[1] == "OK", parts[2])
+
+    wrong = [(ip, want) for ip, want in cases if got.get(ip, (None,))[0] is not want]
+    if wrong:
+        log_fail(f"判定不符预期: {wrong}")
+    else:
+        log_pass(f"监听地址判定正确（{len(cases)} 个取值: 网络/广播/组播/保留/回环/非法格式/合法）")
+
+    # 误填时的替代值: 这正是「想同网段可访问」的落点
+    suggest_map = [("127.0.0.0", "127.0.0.1"), ("192.168.1.0", "192.168.1.101"),
+                   ("192.168.1.255", "192.168.1.101")]
+    bad_suggest = [(ip, got.get(ip, ("", ""))[1], want)
+                   for ip, want in suggest_map if got.get(ip, ("", ""))[1] != want]
+    if bad_suggest:
+        log_fail(f"替代值不符预期: {bad_suggest}")
+    else:
+        log_pass("误填网段地址/回环网络地址时给出可用替代值（含本机在该网段的地址）")
+
+    # 归属与本机网段
+    script = ('. "$PWD/scripts/lib-panel-host.sh"\n'
+              'for ip in 192.168.1.101 10.8.0.101 127.0.0.1 192.168.1.102; do\n'
+              '    if panel_host_is_local "$ip"; then echo "$ip|yes"; else echo "$ip|no"; fi\n'
+              'done\n'
+              'echo "cidr|$(panel_host_cidr 192.168.1.101)"\n'
+              'echo "desc|$(panel_host_desc 192.168.1.101)"\n')
+    _, out = run_lib(script)
+    if "192.168.1.101|yes" in out and "10.8.0.101|yes" in out and "127.0.0.1|yes" in out \
+            and "192.168.1.102|no" in out:
+        log_pass("本机地址归属判定正确 (含 127.0.0.1 特例)")
+    else:
+        log_fail("本机地址归属判定有误")
+
+    if "cidr|192.168.1.0/24" in out:
+        log_pass("网段展示取网络地址而非主机地址 (192.168.1.0/24)")
+    else:
+        log_fail("网段展示有误", "应显示 192.168.1.0/24 而不是 192.168.1.101/24")
+
+    if "同网段 192.168.1.0/24 可访问" in out:
+        log_pass("描述文案点明「同网段可访问」")
+    else:
+        log_fail("描述文案未说明访问范围")
+
+    # ---- 3) install-service.sh 入参校验 (截到写 unit 之前) ----
+    anchor = "cat > /etc/systemd/system/onecloud-panel.service << EOF"
+    probe = PANEL_DIR / "_probe_t23.sh"
+    probe.write_text(ssrc[:ssrc.index(anchor)] + "\nexit 0\n", encoding="utf-8", newline="\n")
+    try:
+        for host, want_ok in (("127.0.0.0", False), ("192.168.1.0", False), ("abc", False),
+                              ("192.168.1.101", True), ("0.0.0.0", True), ("127.0.0.1", True)):
+            env = env_mock()
+            env["PANEL_HOST"] = host
+            r = subprocess.run(["bash", _posix(probe)], capture_output=True, env=env,
+                               cwd=str(PROJECT_ROOT), timeout=60)
+            ok = r.returncode == 0
+            if ok != want_ok:
+                log_fail(f"install-service.sh 对 PANEL_HOST={host} 的处理不符预期",
+                         f"期望{'放行' if want_ok else '拒绝'}, 实际退出码 {r.returncode}")
+            else:
+                log_pass(f"install-service.sh {'放行' if want_ok else '拒绝'} PANEL_HOST={host}")
+
+        env = env_mock()
+        env["PANEL_HOST"] = "127.0.0.0"
+        r = subprocess.run(["bash", _posix(probe)], capture_output=True, env=env,
+                           cwd=str(PROJECT_ROOT), timeout=60)
+        msg = (r.stdout + r.stderr).decode("utf-8", "replace")
+        if "建议改用: 127.0.0.1" in msg:
+            log_pass("install-service.sh 拒绝时给出可采用的替代值")
+        else:
+            log_fail("install-service.sh 拒绝时未给出替代值")
+    finally:
+        try:
+            probe.unlink()
+        except OSError:
+            pass
+
+    # ---- 4) app.py 运行时校验 ----
+    m = re.search(r"^def resolve_bind_host\(raw\):.*?(?=\n\nif __name__)", asrc, re.S | re.MULTILINE)
+    if not m:
+        log_fail("未能从 app.py 抽出 resolve_bind_host")
+    else:
+        ns = {"sys": sys}
+        exec(compile(m.group(0), "app.py", "exec"), ns)
+        fn = ns["resolve_bind_host"]
+        import io as _io
+        from contextlib import redirect_stderr
+
+        rejects = ["127.0.0.0", "192.168.1.0", "192.168.1.255", "224.0.0.1",
+                   "0.1.2.3", "abc", "192.168.1.256"]
+        accepts = [("0.0.0.0", "0.0.0.0"), ("127.0.0.1", "127.0.0.1"),
+                   ("192.168.1.101", "192.168.1.101")]
+        bad = []
+        for host in rejects:
+            try:
+                with redirect_stderr(_io.StringIO()):
+                    fn(host)
+                bad.append(host)
+            except SystemExit:
+                pass
+        for host, want in accepts:
+            try:
+                with redirect_stderr(_io.StringIO()):
+                    val = fn(host)
+                if val != want:
+                    bad.append(host)
+            except SystemExit:
+                bad.append(host)
+        if bad:
+            log_fail(f"app.py 绑定地址校验不符预期: {bad}")
+        else:
+            log_pass(f"app.py 绑定地址校验正确（拒绝 {len(rejects)} 个 / 放行 {len(accepts)} 个）")
+
+        try:
+            with redirect_stderr(_io.StringIO()) as buf:
+                fn("127.0.0.0")
+        except SystemExit:
+            if "127.0.0.1" in buf.getvalue():
+                log_pass("app.py 拒绝时提示改用 127.0.0.1")
+            else:
+                log_fail("app.py 拒绝时未提示正确写法")
+
+    # ---- 5) init.sh 交互: 误填拦截与同网段引导 ----
+    def run_init(steps, timeout=120):
+        env = env_mock()
+        data = ("\n".join(steps) + "\n").encode("utf-8")   # stdin 必须按字节喂
+        r = subprocess.run(["bash", "init/init.sh"], cwd=str(PROJECT_ROOT), input=data,
+                           capture_output=True, env=env, timeout=timeout)
+        return r.stdout.decode("utf-8", "replace") + r.stderr.decode("utf-8", "replace")
+
+    # 主菜单: 部署面板 -> 前台试运行 -> 不重生成配置 -> 不装依赖
+    PRE = ["1", "2", "n", "n"]
+    TAIL = ["admin", "pw123456", "n", "", "4", "7"]   # 用户名/密码/取消部署/暂停/返回/退出
+
+    try:
+        # 选「本机局域网地址」= 同网段可访问
+        out = run_init(PRE + ["9000", "2"] + TAIL)
+        if "监听地址 : 192.168.1.101" in out and "同网段可直接访问" in out:
+            log_pass("菜单选「本机局域网地址」采用本机网卡地址（同网段可访问）")
+        else:
+            log_fail("菜单选「本机局域网地址」未采用本机地址")
+        if "同网段 192.168.1.0/24 可访问" in out:
+            log_pass("配置汇总标注访问范围与网段")
+        else:
+            log_fail("配置汇总未标注访问范围")
+
+        # 手动输入 127.0.0.0 -> 拒绝 + 建议 127.0.0.1 + 采纳
+        out = run_init(PRE + ["9000", "4", "127.0.0.0", "y"] + TAIL)
+        if "127.0.0.0 是回环网段的网络地址" in out and "建议改为: 127.0.0.1" in out:
+            log_pass("手动输入 127.0.0.0 被拒绝并给出原因")
+        else:
+            log_fail("127.0.0.0 未被正确拒绝")
+        if "监听地址 : 127.0.0.1" in out and "仅本机" in out:
+            log_pass("采纳建议后落到 127.0.0.1（仅本机）")
+        else:
+            log_fail("未采纳建议值")
+
+        # 手动输入 192.168.1.0（想表达"同网段"）-> 引导到本机地址
+        out = run_init(PRE + ["9000", "4", "192.168.1.0", "y"] + TAIL)
+        if "192.168.1.0 是网络地址" in out and "建议改为: 192.168.1.101" in out:
+            log_pass("手动输入网段地址被拒绝并引导到本机在该网段的地址")
+        else:
+            log_fail("网段地址未被正确引导")
+
+        # 非本机地址: 告警后仍须显式确认, 答 n 则要求重新输入
+        out = run_init(PRE + ["9000", "4", "192.168.9.9", "n", "192.168.1.101"] + TAIL)
+        if "不在本机任何网卡上" in out:
+            log_pass("非本机地址给出启动会失败的告警")
+        else:
+            log_fail("非本机地址未告警")
+        if "监听地址 : 192.168.1.101" in out:
+            log_pass("拒绝非本机地址后要求重新输入")
+        else:
+            log_fail("拒绝后未重新收集地址")
+
+        # 0.0.0.0 与 127.0.0.1 的暴露面提示
+        out = run_init(PRE + ["9000", "1"] + TAIL)
+        if "会在全部网卡上监听" in out and "全部网卡 (含 WireGuard / 外网网卡)" in out:
+            log_pass("选 0.0.0.0 时提示暴露面（含 WireGuard / 外网网卡）")
+        else:
+            log_fail("选 0.0.0.0 未提示暴露面")
+
+        out = run_init(PRE + ["9000", "3"] + TAIL)
+        if "仅监听 127.0.0.1" in out and "仅本机 (远端访问需 SSH 端口转发)" in out:
+            log_pass("选 127.0.0.1 时说明仅本机可访问")
+        else:
+            log_fail("选 127.0.0.1 未说明访问范围")
+    except subprocess.TimeoutExpired:
+        log_fail("init.sh 交互测试超时")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 # ============ 主程序 ============
 def main():
     print("=" * 60)
@@ -2876,6 +3236,7 @@ def main():
         ("Python 依赖降级链", test_pydeps_fallback),
         ("bootstrap apt 源与依赖", test_bootstrap_apt_sources),
         ("bootstrap DNS 模式", test_bootstrap_dns_mode),
+        ("面板监听地址", test_panel_listen_host),
     ]
     
     for test_name, test_func in tests:

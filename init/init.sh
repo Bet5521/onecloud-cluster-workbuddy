@@ -71,6 +71,15 @@ if [ -f "${SCRIPTS_DIR}/lib-pydeps.sh" ]; then
 fi
 
 # ------------------------------------------------------------
+# 2c. 面板监听地址工具 (探测本机网卡 / 校验监听地址)
+#     复用 scripts/lib-panel-host.sh, 不在此重复实现
+# ------------------------------------------------------------
+if [ -f "${SCRIPTS_DIR}/lib-panel-host.sh" ]; then
+    # shellcheck source=../scripts/lib-panel-host.sh
+    source "${SCRIPTS_DIR}/lib-panel-host.sh"
+fi
+
+# ------------------------------------------------------------
 # 3. 颜色与日志 (在 source lib-nodes.sh 之后定义, 覆盖同名函数)
 # ------------------------------------------------------------
 RED='\033[0;31m'
@@ -411,6 +420,110 @@ panel_install_deps() {
     return 1
 }
 
+# 由监听地址推导可访问地址 (0.0.0.0 / 127.0.0.1 都不能直接当访问地址用)
+panel_access_hint() {
+    local host="$1" port="$2" a out=""
+    case "$host" in
+        0.0.0.0)
+            while IFS= read -r a; do
+                out="${out}${out:+, }http://${a}:${port}"
+            done < <(panel_detect_local_ipv4)
+            if [ -n "$out" ]; then
+                printf '%s\n' "$out"
+            else
+                printf 'http://<本机IP>:%s\n' "$port"
+            fi
+            ;;
+        127.0.0.1)
+            printf 'http://127.0.0.1:%s (仅本机; 远端可 ssh -L %s:127.0.0.1:%s <用户>@<节点IP>)\n' \
+                "$port" "$port" "$port"
+            ;;
+        *)
+            printf 'http://%s:%s\n' "$host" "$port"
+            ;;
+    esac
+}
+
+# 手动输入监听地址: 非法值给原因与替代值, 非本机地址要求显式确认
+panel_choose_host_manual() {
+    local input
+    while :; do
+        input="$(read_input '请输入监听地址 (IPv4, 如 10.20.30.40): ')" || return 1
+
+        if ! panel_host_check "$input"; then
+            log_err "$PANEL_HOST_REASON"
+            if [ -n "$PANEL_HOST_SUGGEST" ]; then
+                log_info "建议改为: ${PANEL_HOST_SUGGEST}"
+                if ask_yes_no "是否改用 ${PANEL_HOST_SUGGEST}?"; then
+                    PANEL_HOST="$PANEL_HOST_SUGGEST"
+                    PANEL_HOST_DESC="$(panel_host_desc "$PANEL_HOST")"
+                    return 0
+                fi
+            fi
+            continue
+        fi
+
+        # 合法但不在本机网卡上: 绑定时会失败, 必须让用户明确知道
+        if [ "$input" != "0.0.0.0" ] && ! panel_host_is_local "$input"; then
+            log_warn "${input} 不在本机任何网卡上, 面板启动会失败 (Cannot assign requested address)"
+            ask_yes_no "仍然使用这个地址?" || continue
+        fi
+
+        PANEL_HOST="$input"
+        PANEL_HOST_DESC="$(panel_host_desc "$PANEL_HOST")"
+        return 0
+    done
+}
+
+# 选择监听地址: 先给三个常见取向, 需要别的地址再走手动输入
+#   要点: 想「同网段可访问」应绑定本机在该网段的地址 ——
+#   绑 0.0.0.0 会在所有网卡 (含 WireGuard / 外网) 上一起监听, 暴露面更大
+panel_choose_host() {
+    local lan_ip
+    lan_ip="$(panel_detect_local_ipv4 | head -n 1)"
+
+    while :; do
+        # 地址列按字节固定宽度对齐 (地址均为 ASCII; 中文描述不参与填充)
+        menu "请选择面板监听地址" \
+            "$(printf '%-15s' '0.0.0.0')   全部网卡 (含 WireGuard / 外网网卡, 暴露面最大)" \
+            "$(printf '%-15s' "${lan_ip:--}")   本机局域网地址 (同网段可访问, 推荐)" \
+            "$(printf '%-15s' '127.0.0.1')   仅本机 (远端访问需 SSH 端口转发)" \
+            "手动输入其它 IPv4 地址"
+
+        case "$MENU_CHOICE" in
+            1)
+                PANEL_HOST="0.0.0.0"
+                PANEL_HOST_DESC="$(panel_host_desc "$PANEL_HOST")"
+                log_warn "0.0.0.0 会在全部网卡上监听, 请确保已用防火墙限制来源并设置了面板认证"
+                return 0
+                ;;
+            2)
+                if [ -n "$lan_ip" ]; then
+                    PANEL_HOST="$lan_ip"
+                    PANEL_HOST_DESC="$(panel_host_desc "$PANEL_HOST")"
+                    log_ok "监听地址 ${PANEL_HOST} —— 同网段可直接访问, 其它网段需经路由/防火墙"
+                    return 0
+                fi
+                log_warn "未能自动探测到本机 IPv4 地址, 请手动输入"
+                if panel_choose_host_manual; then
+                    return 0
+                fi
+                ;;
+            3)
+                PANEL_HOST="127.0.0.1"
+                PANEL_HOST_DESC="$(panel_host_desc "$PANEL_HOST")"
+                log_warn "仅监听 127.0.0.1: 本机浏览器可访问; 远端访问需 SSH 端口转发"
+                return 0
+                ;;
+            *)
+                if panel_choose_host_manual; then
+                    return 0
+                fi
+                ;;
+        esac
+    done
+}
+
 panel_collect() {
     PANEL_PORT="$(read_input '请输入面板监听端口 (例 9000): ')" || return 1
     case "$PANEL_PORT" in
@@ -424,7 +537,7 @@ panel_collect() {
         return 1
     fi
 
-    PANEL_HOST="$(read_input '请输入监听地址 (例 0.0.0.0 或 127.0.0.1): ')" || return 1
+    panel_choose_host || return 1
     PANEL_USER="$(read_input '请输入面板登录用户名: ')" || return 1
     PANEL_PASS="$(read_secret '请输入面板登录密码 (输入时不回显): ')" || return 1
 
@@ -508,6 +621,7 @@ panel_deploy() {
     echo ""
     echo -e "  ${BOLD}配置汇总${NC}"
     echo "    监听地址 : ${PANEL_HOST}"
+    [ -n "${PANEL_HOST_DESC:-}" ] && echo "               ${PANEL_HOST_DESC}"
     echo "    监听端口 : ${PANEL_PORT}"
     echo "    登录用户 : ${PANEL_USER}"
     echo "    登录密码 : (已设置, ${#PANEL_PASS} 位)"
@@ -531,7 +645,7 @@ panel_deploy() {
         panel_install_systemd || { pause; return 1; }
         echo ""
         log_ok "面板部署完成"
-        log_info "访问地址: http://${PANEL_HOST}:${PANEL_PORT}  (用户: ${PANEL_USER})"
+        log_info "访问地址: $(panel_access_hint "$PANEL_HOST" "$PANEL_PORT")  (用户: ${PANEL_USER})"
         log_info "环境文件: /etc/onecloud/panel.env (权限 600)"
     fi
     pause
@@ -1057,7 +1171,8 @@ menu_selfcheck() {
     echo ""
     echo -e "${BOLD}关键脚本${NC}"
     local s
-    for s in lib-nodes.sh lib-pydeps.sh bootstrap.sh deploy.sh health-check.sh backup.sh \
+    for s in lib-nodes.sh lib-pydeps.sh lib-panel-host.sh bootstrap.sh deploy.sh \
+             health-check.sh backup.sh \
              restore.sh update-all.sh install-services.sh setup.sh \
              wireguard-setup.sh gen-panel-config.sh gen-node-env.sh; do
         if [ -f "${SCRIPTS_DIR}/${s}" ]; then
