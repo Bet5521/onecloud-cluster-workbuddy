@@ -28,6 +28,181 @@ log_warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
 
 # ------------------------------------------------------------
+# 发行版 / apt 辅助
+# ------------------------------------------------------------
+# 探测系统 ID 与代号, 输出 "<id> <codename>" (取不到则 unknown / 空)
+# 刻意不 source /etc/os-release, 避免污染全局变量
+# ONECLOUD_ETC_ROOT 仅用于测试/演练时把 /etc 指到别处 (默认 /etc)
+detect_distro() {
+    local _id="" _cn=""
+    local osrel="${ONECLOUD_ETC_ROOT:-/etc}/os-release"
+    if [ -r "$osrel" ]; then
+        _id="$(sed -n 's/^ID=//p' "$osrel" 2>/dev/null | tr -d '"' | head -n 1 || true)"
+        _cn="$(sed -n 's/^VERSION_CODENAME=//p' "$osrel" 2>/dev/null | tr -d '"' | head -n 1 || true)"
+    fi
+    if [ -z "$_cn" ] && command -v lsb_release >/dev/null 2>&1; then
+        _cn="$(lsb_release -sc 2>/dev/null || true)"
+    fi
+    if [ -z "$_id" ] && command -v lsb_release >/dev/null 2>&1; then
+        _id="$(lsb_release -si 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)"
+    fi
+    echo "${_id:-unknown} ${_cn:-}"
+}
+
+# 系统代号 (bullseye / bookworm / ...); 取不到回退 bullseye
+debian_codename_or_default() {
+    local _d _cn
+    _d="$(detect_distro)"
+    _cn="${_d#* }"
+    [ -n "$_cn" ] || _cn="bullseye"
+    echo "$_cn"
+}
+
+# 不同代号可用组件不同: bookworm 起 firmware 拆到 non-free-firmware
+apt_components_for() {
+    case "$1" in
+        bookworm|trixie|forky|sid|testing|unstable)
+            echo "main contrib non-free non-free-firmware" ;;
+        *)
+            echo "main contrib non-free" ;;
+    esac
+}
+
+# 5.6+ 内核已内置 wireguard 模块, 无需 dkms;
+# 更老的内核才需要 wireguard-dkms (且该包只有 buster/backports 提供)
+wireguard_kernel_builtin() {
+    local kver k1 k2
+    kver="$(uname -r)"
+    k1="${kver%%.*}"
+    k2="${kver#*.}"; k2="${k2%%.*}"
+    if [ "${k1:-0}" -gt 5 ] 2>/dev/null; then return 0; fi
+    if { [ "${k1:-0}" -eq 5 ] 2>/dev/null && [ "${k2:-0}" -ge 6 ] 2>/dev/null; }; then return 0; fi
+    return 1
+}
+
+# 备份一次原始文件 (已备份则跳过)
+apt_backup_once() {
+    local f="$1"
+    [ -f "$f" ] || return 0
+    [ -f "${f}.onecloud.bak" ] && return 0
+    cp -p "$f" "${f}.onecloud.bak" || true
+}
+
+# 注释掉 $1 里指向 Debian 源的 deb 行, 避免与 $2 (本次写入的源) 重复
+apt_disable_debian_lines() {
+    local f="$1" keep="$2"
+    [ -f "$f" ] || return 0
+    grep -qE '^[[:space:]]*deb[[:space:]]+[^[:space:]]*debian' "$f" 2>/dev/null || return 0
+    apt_backup_once "$f"
+    sed -i -E 's|^([[:space:]]*deb[[:space:]]+[^[:space:]]*debian.*)$|# [onecloud-disabled] \1|' "$f"
+    log_warn "已注释 ${f} 中的 Debian 源行 (避免与 ${keep} 重复; 原文件备份为 ${f}.onecloud.bak)"
+}
+
+# ------------------------------------------------------------
+# 写入 apt 源 —— 按系统实际代号渲染, 不再写死 bullseye
+#   * 已存在 deb822 源 (Debian 12 默认 /etc/apt/sources.list.d/debian.sources)
+#     -> 就地重写该文件
+#   * 否则写经典 /etc/apt/sources.list
+#   * 其余仍指向 Debian 的源文件一律注释/停用, 防止同一套源重复
+#   * 被改动的文件都会留 <file>.onecloud.bak
+# ------------------------------------------------------------
+configure_apt_sources() {
+    local codename="$1" mirror="$2" secmirror="$3"
+    # ONECLOUD_ETC_ROOT 仅用于测试/演练时把 /etc 指到别处 (默认 /etc)
+    local etc="${ONECLOUD_ETC_ROOT:-/etc}"
+    local components deb822="${etc}/apt/sources.list.d/debian.sources"
+    local classic="${etc}/apt/sources.list"
+    local sources_d="${etc}/apt/sources.list.d"
+    local keyring="/usr/share/keyrings/debian-archive-keyring.gpg"
+    local f
+    components="$(apt_components_for "$codename")"
+
+    if [ -f "$deb822" ]; then
+        APT_SOURCES_FILE="$deb822"
+        apt_backup_once "$deb822"
+        [ -f "$keyring" ] || log_warn "缺少 ${keyring}, deb822 源可能校验失败"
+        cat > "$deb822" << EOF
+# 由 bootstrap.sh 生成 — 镜像: ${mirror}
+Types: deb
+URIs: ${mirror}
+Suites: ${codename} ${codename}-updates ${codename}-backports
+Components: ${components}
+Signed-By: ${keyring}
+
+Types: deb
+URIs: ${secmirror}
+Suites: ${codename}-security
+Components: ${components}
+Signed-By: ${keyring}
+EOF
+        log_info "已写入 ${deb822} (deb822 格式)"
+        apt_disable_debian_lines "$classic" "$deb822"
+    else
+        APT_SOURCES_FILE="$classic"
+        apt_backup_once "$classic"
+        cat > "$classic" << EOF
+# 由 bootstrap.sh 生成 — 镜像: ${mirror}
+deb ${mirror} ${codename} ${components}
+deb ${mirror} ${codename}-updates ${components}
+deb ${mirror} ${codename}-backports ${components}
+deb ${secmirror} ${codename}-security ${components}
+EOF
+        log_info "已写入 ${classic} (经典格式)"
+    fi
+
+    for f in "${sources_d}"/*.list; do
+        [ -f "$f" ] || continue
+        [ "$f" = "$APT_SOURCES_FILE" ] && continue
+        apt_disable_debian_lines "$f" "$APT_SOURCES_FILE"
+    done
+
+    if [ "$APT_SOURCES_FILE" != "$deb822" ]; then
+        for f in "${sources_d}"/*.sources; do
+            [ -f "$f" ] || continue
+            grep -qE '^[[:space:]]*(URIs|deb)[[:space:]:]+[^[:space:]]*debian' "$f" 2>/dev/null || continue
+            apt_backup_once "$f"
+            mv "$f" "${f}.onecloud-disabled" || true
+            log_warn "已停用重复的 Debian 源文件: ${f} -> ${f}.onecloud-disabled"
+        done
+    fi
+}
+
+# ------------------------------------------------------------
+# 运行 apt 命令; 失败时打印真实报错与排查线索
+# (历史上 apt 出错只透传退出码 100, 看不出到底哪一步/为什么失败)
+# 注意: 失败时仍返回原退出码, 由调用方决定是致命还是继续
+# ------------------------------------------------------------
+apt_run() {
+    local desc="$1"; shift
+    local rc=0
+    "$@" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo ""
+        log_error "apt 步骤失败: ${desc}"
+        log_error "  命令: $*"
+        log_error "  退出码: ${rc}"
+        if [ "$rc" -eq 100 ]; then
+            log_error "  100 = apt/dpkg 处理失败 (源不可达 / 包不存在 / dpkg 锁被占用 / 依赖冲突)"
+        fi
+        log_error "  排查线索:"
+        log_error "    * 源文件: ${APT_SOURCES_FILE:-未写入}  (系统代号: $(debian_codename_or_default))"
+        log_error "    * dpkg 锁: fuser -v /var/lib/dpkg/lock-frontend"
+        log_error "    * 手工复核: apt update; apt install -y <包名>"
+        return "$rc"
+    fi
+    return 0
+}
+
+# 不致命的 apt 步骤: 失败只告警, 不让整机初始化中断
+apt_try() {
+    local desc="$1"; shift
+    if ! apt_run "$desc" "$@"; then
+        log_warn "该步骤失败但继续: ${desc}"
+    fi
+    return 0
+}
+
+# ------------------------------------------------------------
 # 网段计算: 由 IP + 前缀得到 "网络地址 网关"
 # 网关取网络地址 + 1 (家用网段惯例), 输出 "<网络地址> <网关>"
 # 纯算术实现, 不依赖 awk 的位运算函数 (mawk 没有 and()/lshift())
@@ -210,6 +385,15 @@ usage() {
 环境变量 (优先级最高):
   ONECLOUD_WK_EDGE_01_IP / _HOSTNAME / _WG_IP
   ONECLOUD_GATEWAY / ONECLOUD_DNS / ONECLOUD_LAN_SUBNET / ONECLOUD_DOMAIN
+  ONECLOUD_APT_MIRROR / ONECLOUD_APT_SECURITY_MIRROR  # 覆盖默认 apt 镜像
+  ONECLOUD_DEBIAN_CODENAME                            # 强制指定 apt 源代号
+  ONECLOUD_APT_SKIP_MIRROR=1                          # 完全不换源, 沿用系统原有源
+  ONECLOUD_ETC_ROOT                                   # 测试用: 把 /etc 指到别处 (默认 /etc)
+
+apt 源说明:
+  源按系统实际代号 (/etc/os-release 的 VERSION_CODENAME) 渲染, 不再写死 bullseye;
+  系统已用 deb822 格式 (/etc/apt/sources.list.d/debian.sources) 时就地重写该文件,
+  其余仍指向 Debian 的源会被注释/停用以免重复。被改动的文件都留 .onecloud.bak。
 
 示例:
   $0 --node wk-edge-01 --yes                                  # 全部取清单值
@@ -669,26 +853,54 @@ log_info "设置主机名: $HOSTNAME"
 hostnamectl set-hostname "$HOSTNAME"
 echo "$HOSTNAME" > /etc/hostname
 
-# ---- 3. 换国内源 ----
-log_info "配置国内 apt 源..."
-cat > /etc/apt/sources.list << 'EOF'
-deb https://mirrors.tuna.tsinghua.edu.cn/debian/ bullseye main contrib non-free
-deb https://mirrors.tuna.tsinghua.edu.cn/debian/ bullseye-updates main contrib non-free
-deb https://mirrors.tuna.tsinghua.edu.cn/debian/ bullseye-backports main contrib non-free
-deb https://mirrors.tuna.tsinghua.edu.cn/debian-security bullseye-security main contrib non-free
-EOF
+# ---- 3. 换国内源 (按系统实际代号渲染, 不再写死 bullseye) ----
+APT_MIRROR="${ONECLOUD_APT_MIRROR:-https://mirrors.tuna.tsinghua.edu.cn/debian}"
+APT_SEC_MIRROR="${ONECLOUD_APT_SECURITY_MIRROR:-https://mirrors.tuna.tsinghua.edu.cn/debian-security}"
+APT_SOURCES_FILE=""
+
+_distro_info="$(detect_distro)"
+DISTRO_ID="${_distro_info%% *}"
+DISTRO_CODENAME="${_distro_info#* }"
+APT_CODENAME="${ONECLOUD_DEBIAN_CODENAME:-${DISTRO_CODENAME:-bullseye}}"
+log_info "系统: ID=${DISTRO_ID} 代号=${DISTRO_CODENAME:-未知} -> 使用代号 ${APT_CODENAME}"
+
+if [ "${ONECLOUD_APT_SKIP_MIRROR:-0}" = "1" ]; then
+    log_warn "ONECLOUD_APT_SKIP_MIRROR=1: 跳过换源, 沿用系统原有源"
+elif [ "$DISTRO_ID" = "debian" ] || [ "$DISTRO_ID" = "armbian" ] || [ "$DISTRO_ID" = "unknown" ]; then
+    log_info "配置国内 apt 源 (镜像: ${APT_MIRROR})"
+    configure_apt_sources "$APT_CODENAME" "$APT_MIRROR" "$APT_SEC_MIRROR"
+else
+    log_warn "系统 ID=${DISTRO_ID} 非 Debian 系, 跳过换源 (保留系统原有源)"
+fi
 
 # ---- 4. 更新系统 ----
 log_info "更新系统包..."
-apt update
-apt upgrade -y
+# apt update 必须成功, 否则后面的安装没有索引可用 -> 失败即中断
+apt_run "更新软件包索引 (apt update)" apt update
+# 升级允许失败: 玩客云常因内核/firmware 升级失败或需重启而中断,
+# 不该因此让整机初始化停在一半 (主机名/源已改, 却什么都没配完)
+apt_try "升级已安装软件包 (apt upgrade)" apt upgrade -y
 
 # ---- 5. 安装基础工具 ----
+# 注意: 这里刻意不含 wireguard-dkms —— Debian 12 (bookworm) 起该包已从仓库移除
+#       (bullseye 尚在; 内核 5.6+ 已内置 wireguard 模块, 本就无需 dkms)。
+#       老内核且源里确实提供该包时才按需安装, 见下方。
 log_info "安装基础工具..."
-apt install -y curl wget git vim htop iotop net-tools dnsutils \
+apt_run "安装基础工具" apt install -y \
+    curl wget git vim htop iotop net-tools dnsutils \
     parted fdisk dosfstools rsync unzip jq ca-certificates \
     gnupg lsb-release software-properties-common \
-    wireguard-tools wireguard-dkms
+    wireguard-tools
+
+if wireguard_kernel_builtin; then
+    log_info "内核 $(uname -r) 已内置 wireguard 模块, 无需 wireguard-dkms"
+elif apt-cache show wireguard-dkms >/dev/null 2>&1; then
+    log_warn "内核 $(uname -r) 未见内置 wireguard, 源中提供 wireguard-dkms, 安装之"
+    apt_run "安装 wireguard-dkms" apt install -y wireguard-dkms
+else
+    log_warn "内核 $(uname -r) 较老且当前源不提供 wireguard-dkms, 已跳过"
+    log_warn "  如需 wireguard, 请先确认模块可用: modinfo wireguard"
+fi
 
 # ---- 6. 配置时区 ----
 log_info "设置时区: Asia/Shanghai"

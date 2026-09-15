@@ -2,7 +2,7 @@
 
 > 基于玩客云 WS1608 (Amlogic S805, ARMv7, 1GB RAM) 多节点组建的家庭服务集群
 
-**当前版本: v1.4.1**
+**当前版本: v1.4.2**
 
 ---
 
@@ -254,7 +254,9 @@ PANEL_USER=admin PANEL_PASS='强密码' PANEL_PORT=9000 python3 app.py
 | 3. 默认清单 | `inventory/nodes.yaml` | 集群的基准定义 |
 
 环境变量命名规则：节点名转大写、`-` 换 `_`，字段为 `IP` / `HOSTNAME` / `WG_IP` / `ROLE`；
-网络参数用 `ONECLOUD_GATEWAY` / `ONECLOUD_DNS` / `ONECLOUD_DOMAIN` / `ONECLOUD_WG_PORT` / `ONECLOUD_LAN_PREFIX` / `ONECLOUD_WG_SUBNET`。
+网络参数用 `ONECLOUD_GATEWAY` / `ONECLOUD_DNS` / `ONECLOUD_DOMAIN` / `ONECLOUD_WG_PORT` / `ONECLOUD_LAN_PREFIX` / `ONECLOUD_WG_SUBNET`；
+`bootstrap.sh` 换源相关用 `ONECLOUD_APT_MIRROR` / `ONECLOUD_APT_SECURITY_MIRROR`（自定义镜像）、
+`ONECLOUD_DEBIAN_CODENAME`（强制指定代号）、`ONECLOUD_APT_SKIP_MIRROR=1`（完全不换源）。
 
 示例 —— 把 edge 节点部署到 `10.20.30.41`、主机名 `edge-hk`：
 
@@ -315,10 +317,10 @@ vim inventory/nodes.local.yaml   # 填入你的 IP/主机名, 该文件已被 gi
 
 ## ✅ 功能验证
 
-项目自带验证套件，共 20 组，覆盖配置完整性、脚本语法、节点映射、服务一致性、
+项目自带验证套件，共 21 组，覆盖配置完整性、脚本语法、节点映射、服务一致性、
 **文档化 CLI 接口契约**、**IP/主机名可自定义性**、**安全健壮性回归**、
 **面板前后端契约**、**bootstrap 网络取值与 SD/风险预检**、**init 交互式入口契约**、
-**Python 依赖降级链**（当前 259 项）：
+**Python 依赖降级链**、**bootstrap apt 源与依赖安装回归**（当前 286 项）：
 
 ```bash
 python3 test_validate.py
@@ -327,8 +329,8 @@ python3 test_validate.py
 输出示例：
 
 ```
-  总计: 259 项
-  通过: 259
+  总计: 286 项
+  通过: 286
   失败: 0
   警告: 0
 ```
@@ -378,6 +380,65 @@ python3 test_validate.py
   校验功能脚本无硬编码 IP、每个节点 hostname 字段齐全、环境变量覆盖真实生效
 - 验证项从 176 扩至 **184**（全部通过、0 警告）
 - 新增 `inventory/nodes.local.yaml.example` 覆盖模板（真实覆盖文件已 gitignore）
+
+---
+
+## 🚀 v1.4.2 变更说明
+
+**修复：节点部署（`bootstrap.sh`）在 Debian 12 上以退出码 `100` 中断。**
+
+现象是跑到「节点部署 → 本机初始化」后只看到一行 `[ERR] bootstrap 退出码: 100`，
+没有任何可用的报错信息。根因有两条，叠加在一起：
+
+| # | 问题 | 说明 |
+|---|------|------|
+| 1 | `sources.list` **写死 bullseye** | 机器实际是 Debian 12（bookworm）时被写入错误的代号，且 Debian 12 默认用 deb822 格式（`/etc/apt/sources.list.d/debian.sources`），再写一个 classic 文件等于两套源打架 |
+| 2 | 基础工具里**无条件安装 `wireguard-dkms`** | 该包自 bookworm 起已从 Debian 移除（内核 5.6+ 已内置 wireguard 模块，本就无需 dkms）→ `E: Unable to locate package wireguard-dkms` |
+
+`apt`/`apt-get` 出错时的退出码恒为 **100**，而脚本开头是 `set -e`，
+于是这个 100 被原样透传出来，看不出是哪一步、为什么失败。
+
+### 修复内容
+
+- **源按系统实际代号渲染**：读 `/etc/os-release` 的 `VERSION_CODENAME`
+  （回退 `lsb_release`），不再写死 bullseye；组件随代号自适应
+  （bookworm 起见 `non-free-firmware`）
+- **兼容 deb822**：系统已用 `/etc/apt/sources.list.d/debian.sources` 时就地重写该文件；
+  其余仍指向 Debian 的源（含旧版脚本留下的 classic bullseye 行）会被注释掉，
+  避免同一套源重复生效
+- **改写前一律备份**：被改动的文件留 `<file>.onecloud.bak`
+- **非 Debian 系自动跳过**：`ID` 不是 debian/armbian 时不动系统源，只告警
+- **`wireguard-dkms` 改为按需安装**：内核 ≥ 5.6 直接跳过；
+  更老的内核先 `apt-cache show` 探一下，源里确实有才装
+- **apt 失败不再只有一个裸数字**：新增 `apt_run` 包装，失败时打印步骤名、
+  完整命令、退出码含义（100 = 源不可达 / 包不存在 / dpkg 锁被占用 / 依赖冲突）
+  以及源文件与系统代号，并**保留 apt 的原始报错**
+- **`apt update` 仍为致命**（没索引后续装不了东西），但 **`apt upgrade` 降为不致命** ——
+  玩客云常因内核/firmware 升级失败需重启，不该让整机初始化停在「主机名和源已改、
+  其他什么都没配」的半成品状态
+
+### 新增环境变量
+
+| 变量 | 作用 |
+|------|------|
+| `ONECLOUD_APT_MIRROR` | 覆盖默认 Debian 镜像（默认清华 TUNA） |
+| `ONECLOUD_APT_SECURITY_MIRROR` | 覆盖 security 镜像 |
+| `ONECLOUD_DEBIAN_CODENAME` | 强制指定源代号 |
+| `ONECLOUD_APT_SKIP_MIRROR=1` | 完全不换源，沿用系统原有源 |
+
+### 已踩坑的机器怎么救
+
+```bash
+. /etc/os-release; echo "$PRETTY_NAME / codename=$VERSION_CODENAME"
+sudo sed -i "s/bullseye/$VERSION_CODENAME/g" /etc/apt/sources.list   # 先把被污染的源改回来
+sudo apt update && sudo apt install -y wireguard-tools               # 不要 wireguard-dkms
+```
+
+验证：新增第 21 组测试 27 项，提取 helper 与步骤 3~5 用 mock `apt`/`apt-cache`/`uname`
+实测 10 个场景（bookworm 正常 / update 100 / upgrade 100 不致命 / 老内核有包无包两种 /
+deb822 布局 / 非 Debian / 跳过换源 / bullseye / 包真缺失），并静态校验不得再出现
+「写死 bullseye」与「无条件装 wireguard-dkms」。全量套件 259 → **286 项**，
+全部通过、0 失败 0 警告。
 
 ---
 

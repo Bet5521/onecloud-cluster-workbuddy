@@ -1,6 +1,6 @@
 {
   "cluster_name": "OneCloud Cluster",
-  "version": "1.4.1",
+  "version": "1.4.2",
   "update_interval": 10,
   "ssh_timeout": 3,
   "generated_by": "scripts/gen-panel-config.sh",

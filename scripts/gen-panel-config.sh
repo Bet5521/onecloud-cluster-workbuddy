@@ -17,7 +17,7 @@ ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 source "$SCRIPT_DIR/lib-nodes.sh"
 
 PANEL_CONFIG="${ROOT_DIR}/panel/config.json"
-VERSION="${ONECLOUD_PANEL_VERSION:-1.4.1}"
+VERSION="${ONECLOUD_PANEL_VERSION:-1.4.2}"
 
 # 通用日志
 log_info()  { echo -e "\033[0;32m[INFO]\033[0m $*"; }

@@ -159,6 +159,24 @@ pydeps_hint "flask flask-cors" python3 ""           # 失败时给人可复制�
 显式 `--gateway` 不参与推导，但网段对不上仍会告警。
 配置确认页会标注每个值的来源（命令行 / 本机探测 / 清单 / 由IP推导）。
 
+**apt 源按系统实际代号渲染**（v1.4.2 起）
+
+源不再写死 `bullseye` —— 读 `/etc/os-release` 的 `VERSION_CODENAME`（回退
+`lsb_release`），组件随代号自适应（bookworm 起含 `non-free-firmware`）。
+系统已用 deb822 格式（`/etc/apt/sources.list.d/debian.sources`）时就地重写该文件，
+其余仍指向 Debian 的源会被注释掉以免重复；**被改动的文件都留 `.onecloud.bak`**。
+
+| 环境变量 | 作用 |
+|---|---|
+| `ONECLOUD_APT_MIRROR` / `ONECLOUD_APT_SECURITY_MIRROR` | 覆盖默认镜像（默认清华 TUNA） |
+| `ONECLOUD_DEBIAN_CODENAME` | 强制指定源代号 |
+| `ONECLOUD_APT_SKIP_MIRROR=1` | 完全不换源，沿用系统原有源 |
+
+`wireguard-dkms` 仅在**老内核且源里确实有**时才装（内核 ≥ 5.6 已内置 wireguard）。
+`apt update` 失败即中断；`apt upgrade` 失败只告警继续，失败时都会打印
+步骤名、完整命令、退出码含义（100 = 源不可达 / 包不存在 / dpkg 锁 / 依赖冲突）
+与源文件位置，并保留 apt 原始报错。
+
 **启动即探测**：脚本在解析参数前先读取本机当前 IP/前缀/默认网关与可移动存储，
 用于网段比对和风险提示。
 

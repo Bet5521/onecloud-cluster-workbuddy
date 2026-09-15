@@ -2282,6 +2282,336 @@ scenario pip_lied     1 0 0 0 "python3-flask python3-flask-cors" 0 "" 1
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+# ============ 测试21: bootstrap apt 源与依赖安装回归 ============
+def test_bootstrap_apt_sources():
+    """测试 21: apt 源按系统代号渲染 / apt 失败诊断 / wireguard-dkms 条件安装
+
+    背景: 老实现把 sources.list 写死成 bullseye, 且在基础工具里无条件安装
+    wireguard-dkms。Debian 12 已移除该包, apt 会以退出码 100 失败, 又被
+    set -e 原样透传出去, 现场只看到一个裸 100, 无法定位。
+    """
+    print("\n" + "=" * 60)
+    print("测试 21: bootstrap apt 源与依赖安装回归")
+    print("=" * 60)
+
+    boot = SCRIPTS_DIR / "bootstrap.sh"
+    if not boot.exists():
+        log_fail("scripts/bootstrap.sh 缺失")
+        return
+    src = boot.read_text(encoding="utf-8")
+    lines = src.splitlines()
+
+    # ---- 1) 静态检查: 不允许再写死 bullseye / 不允许无条件装 dkms ----
+    if re.search(r"deb\s+https?://\S+\s+bullseye\s", src):
+        log_fail("bootstrap.sh 仍写死 bullseye 源", "Debian 12 机器会被写入错误代号")
+    else:
+        log_pass("apt 源不再写死 bullseye (按系统代号渲染)")
+
+    if "wireguard-tools wireguard-dkms" in src:
+        log_fail("基础工具仍无条件安装 wireguard-dkms", "Debian 12 起该包已移除 -> apt 退出 100")
+    else:
+        log_pass("wireguard-dkms 不再出现在无条件安装列表")
+
+    needed = ["detect_distro()", "apt_components_for()", "wireguard_kernel_builtin()",
+              "configure_apt_sources()", "apt_run()", "apt_try()"]
+    missing = [n for n in needed if n not in src]
+    if not missing:
+        log_pass("具备发行版探测 / 源写入 / apt 失败诊断等辅助函数")
+    else:
+        log_fail(f"缺少辅助函数: {missing}")
+
+    if "apt-cache show wireguard-dkms" in src and "apt_run \"安装 wireguard-dkms\"" in src:
+        log_pass("wireguard-dkms 改为按需安装 (仅源确实提供时)")
+    else:
+        log_fail("未实现 wireguard-dkms 按需安装")
+
+    if "ONECLOUD_APT_SKIP_MIRROR" in src and "ONECLOUD_APT_MIRROR" in src:
+        log_pass("提供换源逃生开关 (跳过/自定义镜像)")
+    else:
+        log_fail("缺少换源逃生开关", "镜像不可达时用户无法绕过")
+
+    # ---- 2) 行为验证: 提取 helper 与步骤3~5 逐场景跑 mock ----
+    i_log = next((i for i, l in enumerate(lines) if l.startswith("log_info()  {")), -1)
+    i_net = next((i for i, l in enumerate(lines) if l.startswith("# 网段计算")), -1)
+    i_s3 = next((i for i, l in enumerate(lines) if l.startswith("# ---- 3. 换国内源")), -1)
+    i_s6 = next((i for i, l in enumerate(lines) if l.startswith("# ---- 6. 配置时区")), -1)
+    if min(i_log, i_net, i_s3, i_s6) < 0:
+        log_fail("无法在 bootstrap.sh 定位 helper / 步骤锚点",
+                 "代码结构变了, 需同步更新本测试的锚点")
+        return
+
+    helpers = "\n".join(lines[i_log:i_net - 1])
+    flow = "\n".join(lines[i_s3:i_s6])
+
+    tmpdir = Path(tempfile.mkdtemp(prefix="oc_t21_"))
+    mockbin = tmpdir / "mockbin"
+    mockbin.mkdir()
+
+    def _posix(p):
+        s = Path(p).as_posix()
+        m = re.match(r"^([A-Za-z]):/(.*)$", s)
+        return f"/{m.group(1).lower()}/{m.group(2)}" if m else s
+
+    mocks = {
+        "apt": r"""#!/bin/bash
+echo "apt $*" >> "$APT_LOG"
+if [ "$1" = "update" ] && [ "$MOCK_FAIL_UPDATE" = "1" ]; then
+    echo "E: Failed to fetch http://mirrors.tuna.tsinghua.edu.cn/debian/dists/bookworm/InRelease  502  Bad Gateway" >&2
+    exit 100
+fi
+if [ "$1" = "upgrade" ] && [ "$MOCK_FAIL_UPGRADE" = "1" ]; then
+    echo "E: Unable to correct problems, you have held broken packages." >&2
+    exit 100
+fi
+for a in "$@"; do
+    if [ "$a" = "wireguard-dkms" ] && [ "$MOCK_DKMS_INSTALL_FAIL" = "1" ]; then
+        echo "E: Unable to locate package wireguard-dkms" >&2
+        exit 100
+    fi
+done
+exit 0
+""",
+        "apt-cache": r"""#!/bin/bash
+echo "apt-cache $*" >> "$APT_LOG"
+if [ "$1" = "show" ] && [ "$2" = "wireguard-dkms" ]; then
+    if [ "$MOCK_DKMS_AVAILABLE" = "1" ]; then
+        echo "Package: wireguard-dkms"
+        exit 0
+    fi
+    echo "E: No packages found" >&2
+    exit 100
+fi
+exit 0
+""",
+        "uname": r"""#!/bin/bash
+[ "$1" = "-r" ] && { echo "$MOCK_KERNEL"; exit 0; }
+echo Linux
+exit 0
+""",
+    }
+    for name, body in mocks.items():
+        p = mockbin / name
+        p.write_text(body, encoding="utf-8", newline="\n")
+        os.chmod(p, 0o755)
+
+    driver = r"""
+# ---------------- driver ----------------
+set +e
+WORK="@WORK@"
+M="@MOCK@"
+PATH="$M:/usr/bin:/bin"
+export PATH
+
+run_case() {
+    local tag="$1" id="$2" cn="$3" legacy="$4" deb822="$5"
+    shift 5
+    local root="$WORK/root_$tag"
+    mkdir -p "$root/apt/sources.list.d"
+    printf 'ID=%s\nVERSION_CODENAME=%s\n' "$id" "$cn" > "$root/os-release"
+    if [ "$deb822" = "1" ]; then
+        cat > "$root/apt/sources.list.d/debian.sources" <<'EOS'
+Types: deb
+URIs: http://deb.debian.org/debian
+Suites: bookworm bookworm-updates
+Components: main
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+EOS
+    fi
+    if [ "$legacy" = "1" ]; then
+        cat > "$root/apt/sources.list" <<'EOS'
+deb https://mirrors.tuna.tsinghua.edu.cn/debian/ bullseye main contrib non-free
+deb https://mirrors.tuna.tsinghua.edu.cn/debian-security bullseye-security main contrib non-free
+EOS
+    fi
+    export ONECLOUD_ETC_ROOT="$root"
+    export APT_LOG="$WORK/apt_$tag.log"
+    : > "$APT_LOG"
+    export MOCK_FAIL_UPDATE=0 MOCK_FAIL_UPGRADE=0 MOCK_DKMS_AVAILABLE=0
+    export MOCK_DKMS_INSTALL_FAIL=0 MOCK_KERNEL=5.10.63-rockchip
+    unset ONECLOUD_APT_SKIP_MIRROR
+    local kv
+    for kv in "$@"; do export "$kv"; done
+    ( set -e; step_apt_flow ) > "$WORK/out_$tag.txt" 2>&1
+    echo "###RC:$tag:$?"
+    echo "###OUT_BEGIN:$tag"
+    cat "$WORK/out_$tag.txt"
+    echo "###OUT_END:$tag"
+    echo "###SOURCES_BEGIN:$tag"
+    [ -f "$root/apt/sources.list" ] && cat "$root/apt/sources.list"
+    [ -f "$root/apt/sources.list.d/debian.sources" ] && cat "$root/apt/sources.list.d/debian.sources"
+    echo "###SOURCES_END:$tag"
+    echo "###APTLOG_BEGIN:$tag"
+    cat "$APT_LOG"
+    echo "###APTLOG_END:$tag"
+    echo "###BAK_BEGIN:$tag"
+    [ -f "$root/apt/sources.list.onecloud.bak" ] && echo "sources.list.onecloud.bak"
+    [ -f "$root/apt/sources.list.d/debian.sources.onecloud.bak" ] && echo "debian.sources.onecloud.bak"
+    echo "###BAK_END:$tag"
+}
+
+run_case s1_bookworm_ok       debian bookworm 1 0
+run_case s2_update_100        debian bookworm 1 0 MOCK_FAIL_UPDATE=1
+run_case s3_upgrade_100       debian bookworm 1 0 MOCK_FAIL_UPGRADE=1
+run_case s4_oldkern_nodkms    debian bookworm 1 0 MOCK_KERNEL=4.19.100-rockchip
+run_case s5_oldkern_dkms      debian bookworm 1 0 MOCK_KERNEL=4.19.100-rockchip MOCK_DKMS_AVAILABLE=1
+run_case s6_deb822            debian bookworm 1 1
+run_case s7_ubuntu            ubuntu jammy    1 0
+run_case s8_skip_mirror       debian bookworm 1 0 ONECLOUD_APT_SKIP_MIRROR=1
+run_case s9_bullseye          debian bullseye 1 0
+run_case s10_dkms_install_100 debian bookworm 1 0 MOCK_KERNEL=4.19.100-rockchip MOCK_DKMS_AVAILABLE=1 MOCK_DKMS_INSTALL_FAIL=1
+echo "###DONE"
+"""
+    probe = tmpdir / "probe.sh"
+    probe.write_text(
+        helpers + "\n\nstep_apt_flow() {\n" + flow + "\n}\n" + driver
+        .replace("@WORK@", _posix(tmpdir))
+        .replace("@MOCK@", _posix(mockbin)),
+        encoding="utf-8", newline="\n")
+
+    try:
+        r = subprocess.run(["bash", _posix(probe)], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace",
+                           stdin=subprocess.DEVNULL, timeout=420)
+        out = r.stdout
+
+        def sect(name, tag):
+            m = re.search(rf"###{name}_BEGIN:{tag}\n(.*?)\n###{name}_END:{tag}", out, re.S)
+            return (m.group(1) + "\n") if m else ""
+
+        def rc(tag):
+            m = re.search(rf"###RC:{tag}:(\d+)", out)
+            return int(m.group(1)) if m else None
+
+        if "###DONE" not in out:
+            log_fail("mock 驱动未跑完", f"stderr={r.stderr[-300:]}")
+            return
+
+        # --- s1: 核心回归 (bookworm 机器 + 旧 bullseye 源残留) ---
+        s1 = sect("SOURCES", "s1_bookworm_ok")
+        c1 = sect("OUT", "s1_bookworm_ok")
+        a1 = sect("APTLOG", "s1_bookworm_ok")
+        if rc("s1_bookworm_ok") == 0:
+            log_pass("bookworm 机器上初始化成功退出 (老实现此处 apt 100)")
+        else:
+            log_fail(f"bookworm 机器初始化退出码 {rc('s1_bookworm_ok')}")
+        if "bookworm main contrib non-free non-free-firmware" in s1 and "bullseye" not in s1:
+            log_pass("源按实际代号写成 bookworm (含 non-free-firmware), 无 bullseye 残留")
+        else:
+            log_fail("源代号或组件不正确", s1[:200])
+        if "-updates" in s1 and "-backports" in s1 and "bookworm-security" in s1:
+            log_pass("updates / backports / security 三类源齐全")
+        else:
+            log_fail("源条目不全", s1[:200])
+        if "wireguard-tools" in a1 and "wireguard-dkms" not in a1:
+            log_pass("基础工具装 wireguard-tools, 不再装 wireguard-dkms")
+        else:
+            log_fail("基础工具安装列表不正确", a1[:200])
+        if "已内置 wireguard" in c1:
+            log_pass("5.6+ 内核识别为内置 wireguard, 明确跳过 dkms")
+        else:
+            log_fail("未识别内置 wireguard 模块", c1[-200:])
+        if "sources.list.onecloud.bak" in sect("BAK", "s1_bookworm_ok"):
+            log_pass("改写前备份原 sources.list")
+        else:
+            log_fail("未备份原 sources.list", "出问题无法回滚")
+
+        # --- s2: apt update 返回 100 ---
+        c2 = sect("OUT", "s2_update_100")
+        if rc("s2_update_100") == 100:
+            log_pass("apt update 失败时退出码透传 100")
+        else:
+            log_fail(f"apt update 失败退出码异常: {rc('s2_update_100')}")
+        if "apt 步骤失败" in c2 and "100 = apt/dpkg 处理失败" in c2:
+            log_pass("失败时打印步骤名并解释 100 的含义")
+        else:
+            log_fail("未给出 100 的解释", c2[-300:])
+        if "源文件:" in c2 and "系统代号" in c2:
+            log_pass("给出源文件与系统代号等排查线索")
+        else:
+            log_fail("缺少排查线索")
+        if "502  Bad Gateway" in c2:
+            log_pass("保留 apt 原始报错 (不再只看到裸退出码)")
+        else:
+            log_fail("未保留 apt 原始输出")
+
+        # --- s3: apt upgrade 失败不应中断 ---
+        c3 = sect("OUT", "s3_upgrade_100")
+        if rc("s3_upgrade_100") == 0:
+            log_pass("apt upgrade 失败不致命, 不中断整机初始化")
+        else:
+            log_fail(f"升级失败导致整体退出 {rc('s3_upgrade_100')}", "主机名/源已改却什么都没配完")
+        if "该步骤失败但继续" in c3:
+            log_pass("升级失败时明确告警并继续")
+        else:
+            log_fail("升级失败未告警")
+        if "apt install" in sect("APTLOG", "s3_upgrade_100"):
+            log_pass("升级失败后仍继续安装基础工具")
+        else:
+            log_fail("升级失败后未继续安装基础工具")
+
+        # --- s4/s5: 老内核下 dkms 按需安装 ---
+        c4 = sect("OUT", "s4_oldkern_nodkms")
+        a4 = sect("APTLOG", "s4_oldkern_nodkms").replace("apt-cache show wireguard-dkms", "")
+        if rc("s4_oldkern_nodkms") == 0 and "不提供 wireguard-dkms" in c4 and "wireguard-dkms" not in a4:
+            log_pass("老内核 + 源无该包: 跳过而非硬装 (这是 100 的根因)")
+        else:
+            log_fail("源不提供该包时未正确跳过", c4[-200:])
+        a5 = sect("APTLOG", "s5_oldkern_dkms")
+        if rc("s5_oldkern_dkms") == 0 and "install -y wireguard-dkms" in a5:
+            log_pass("老内核 + 源提供该包: 按需安装")
+        else:
+            log_fail("应当按需安装时未安装", a5[:200])
+
+        # --- s6: deb822 布局就地重写 ---
+        s6 = sect("SOURCES", "s6_deb822")
+        b6 = sect("BAK", "s6_deb822")
+        if rc("s6_deb822") == 0 and "Suites: bookworm bookworm-updates bookworm-backports" in s6:
+            log_pass("识别 deb822 源文件并就地重写为实际代号")
+        else:
+            log_fail("deb822 源未正确重写", s6[:250])
+        active_bullseye = [ln for ln in s6.splitlines()
+                           if "bullseye" in ln and not ln.startswith("# [onecloud-disabled]")]
+        if "# [onecloud-disabled]" in s6 and not active_bullseye:
+            log_pass("残留的 classic bullseye 源被注释, 不再有生效的重复源")
+        else:
+            log_fail("仍存在生效的 bullseye 源条目", str(active_bullseye)[:200])
+        if "debian.sources.onecloud.bak" in b6 and "sources.list.onecloud.bak" in b6:
+            log_pass("deb822 与 classic 源文件均留备份")
+        else:
+            log_fail("备份不完整", b6[:200])
+
+        # --- s7/s8: 跳过换源的两种情况 ---
+        s7 = sect("SOURCES", "s7_ubuntu")
+        if rc("s7_ubuntu") == 0 and "非 Debian 系" in sect("OUT", "s7_ubuntu") \
+                and "bullseye main contrib non-free" in s7:
+            log_pass("非 Debian 系统跳过换源, 原源文件不被触碰")
+        else:
+            log_fail("非 Debian 系统处理不正确", s7[:200])
+        s8 = sect("SOURCES", "s8_skip_mirror")
+        if rc("s8_skip_mirror") == 0 and "跳过换源" in sect("OUT", "s8_skip_mirror") \
+                and "bullseye main contrib non-free" in s8:
+            log_pass("ONECLOUD_APT_SKIP_MIRROR=1 时完全不动源文件")
+        else:
+            log_fail("跳过换源开关未生效", s8[:200])
+
+        # --- s9: bullseye 机器 ---
+        s9 = sect("SOURCES", "s9_bullseye")
+        if rc("s9_bullseye") == 0 and "bullseye main contrib non-free" in s9 \
+                and "non-free-firmware" not in s9:
+            log_pass("bullseye 机器按实际代号写入, 且不写它没有的组件")
+        else:
+            log_fail("bullseye 代号或组件处理不正确", s9[:250])
+
+        # --- s10: 包真的不存在时仍能透出原因 ---
+        c10 = sect("OUT", "s10_dkms_install_100")
+        if rc("s10_dkms_install_100") == 100 and "Unable to locate package wireguard-dkms" in c10:
+            log_pass("apt 真失败时透出原始报错 (可定位到具体包)")
+        else:
+            log_fail("未透出 apt 原始报错", c10[-250:])
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 # ============ 主程序 ============
 def main():
     print("=" * 60)
@@ -2311,6 +2641,7 @@ def main():
         ("init 交互式入口", test_init_entrypoint),
         ("交付物一致性", test_delivery_consistency),
         ("Python 依赖降级链", test_pydeps_fallback),
+        ("bootstrap apt 源与依赖", test_bootstrap_apt_sources),
     ]
     
     for test_name, test_func in tests:
