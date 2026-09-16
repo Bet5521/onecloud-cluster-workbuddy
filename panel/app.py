@@ -57,7 +57,7 @@ def load_config():
     except (FileNotFoundError, json.JSONDecodeError) as e:
         return {
             "cluster_name": "OneCloud Cluster",
-            "version": "1.5.0",
+            "version": "1.5.1",
             "nodes": []
         }
 
@@ -182,7 +182,8 @@ def require_auth(f):
 
 @app.route("/")
 def index():
-    return render_template("index.html")
+    # 版本号由后端注入, 模板里不再硬编码 (避免改了版本忘了改页脚)
+    return render_template("index.html", version=load_config().get("version", "unknown"))
 
 @app.route("/api/status")
 @require_auth
@@ -266,12 +267,6 @@ def exec_command():
 
     result = run_ssh(node["ip"], command, timeout=30)
     return jsonify({"ok": result["ok"], "output": result["stdout"], "error": result["stderr"]})
-
-@app.route("/api/topology")
-@require_auth
-def topology():
-    config = load_config()
-    return jsonify(config)
 
 def resolve_bind_host(raw):
     """校验 PANEL_HOST: 提前拒绝必然 bind 失败的取值, 并说明该怎么改。

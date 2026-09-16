@@ -50,6 +50,17 @@ case "$BACKUP_TYPE" in
     -h|--help) usage; exit 0 ;;
 esac
 
+# 先校验类型再建目录: 否则非法类型会落下一个空的备份目录
+case "$BACKUP_TYPE" in
+    all|config|data|node|service) ;;
+    *)
+        log_error "未知的备份类型: $BACKUP_TYPE"
+        echo ""
+        usage
+        exit 1
+        ;;
+esac
+
 mkdir -p "$BACKUP_DIR/$TIMESTAMP"
 
 echo ""
@@ -64,10 +75,13 @@ backup_remote() {
     local REMOTE_PATH=$2
     local LOCAL_NAME=$3
     local DESC=$4
+    # 可选的额外 rsync 参数 (data 模式用它排除配置文件)
+    local EXTRA_OPTS=${5:-}
 
     if ssh -o ConnectTimeout=5 "root@${NODE_IP}" "test -e $REMOTE_PATH" 2>/dev/null; then
         log_info "备份 $DESC from $NODE_IP..."
-        rsync -az "root@${NODE_IP}:${REMOTE_PATH}" \
+        # shellcheck disable=SC2086
+        rsync -az $EXTRA_OPTS "root@${NODE_IP}:${REMOTE_PATH}" \
             "${BACKUP_DIR}/${TIMESTAMP}/${LOCAL_NAME}/" 2>/dev/null
     else
         log_warn "跳过 (不存在): $NODE_IP:$REMOTE_PATH"
@@ -104,6 +118,18 @@ case "$BACKUP_TYPE" in
             backup_remote "$IP" "/mnt/sd/srv/*/.env" "config-${HOSTNAME}-env" "env文件"
             backup_remote "$IP" "/etc/wireguard" "config-wg-${HOSTNAME}" "WireGuard"
             backup_remote "$IP" "/etc/systemd/system/mihomo.service" "config-svc-${HOSTNAME}" "systemd服务"
+        done
+        ;;
+
+    data)
+        # 只备份应用数据: 与 config 互补, 排除编排与环境变量文件
+        log_info "仅备份应用数据..."
+
+        for NODE in "${ALL_NODES[@]}"; do
+            IFS='|' read -r NAME HOSTNAME IP WG_IP ROLE <<< "$NODE"
+            [ -z "$IP" ] && { log_warn "跳过 $NAME (未配置 IP)"; continue; }
+            backup_remote "$IP" "/mnt/sd/srv/${NAME}" "data-${HOSTNAME}" "${NAME} 应用数据" \
+                "--exclude=docker-compose.yml --exclude=.env"
         done
         ;;
 

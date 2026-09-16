@@ -201,6 +201,9 @@ add_service "syncthing"   "Syncthing 同步"     "Docker服务" "docker" "8384/t
 add_service "aria2"       "aria2 下载"         "Docker服务" "docker" "6800/tcp,6888/tcp,6888/udp"            "install_aria2"      "多线程下载工具, 含AriaNg"
 add_service "cupsd"       "CUPS 打印服务"      "Docker服务" "docker" "631/tcp"                                "install_cupsd"      "网络打印服务器"
 add_service "cups_web"    "CUPS-Web 管理"      "Docker服务" "docker" "632/tcp"                                "install_cups_web"   "CUPS 网页管理界面"
+add_service "typecho"     "Typecho 博客"       "Docker服务" "docker" "8083/tcp"                               "install_typecho"    "轻量博客/CMS, 数据卷持久化"
+add_service "gitea"       "Gitea 代码托管"     "Docker服务" "docker" "3000/tcp,222/tcp"                       "install_gitea"      "自托管 Git, SSH 克隆端口 222"
+add_service "ariang"      "AriaNg 前端"        "Docker服务" "docker" "6880/tcp"                               "install_ariang"     "aria2 网页管理前端"
 
 # ---- 原生服务 ----
 add_service "clash"       "Clash/mihomo 代理"   "原生服务" "native" "9090/tcp"                               "install_clash"      "Clash Meta 代理, ARM 优化"
@@ -727,6 +730,68 @@ install_cups_web() {
         -e CUPS_PORT=631 \
         nkn-ts/cups-web:latest
     log_success "CUPS-Web 已启动 -> http://$(hostname -I | awk '{print $1}'):632"
+}
+
+install_typecho() {
+    log_info "安装 Typecho 博客..."
+    ensure_docker
+    ensure_svc_dir "typecho/usr"
+    remove_old_container "typecho"
+
+    # 与 node-wk-iot-02/docker-compose.yml 保持一致
+    docker run -d --name typecho \
+        --restart unless-stopped \
+        -p 8083:80 \
+        -e TZ=$TZ \
+        -v "${DATA_DIR}/typecho/usr:/app/usr" \
+        -v /etc/localtime:/etc/localtime:ro \
+        joyqi/typecho:latest
+    log_success "Typecho 已启动 -> http://$(hostname -I | awk '{print $1}'):8083"
+    log_info "首次访问按向导完成安装 (数据卷已持久化到 ${DATA_DIR}/typecho/usr)"
+}
+
+install_gitea() {
+    log_info "安装 Gitea 代码托管..."
+    ensure_docker
+    ensure_svc_dir "gitea"
+    remove_old_container "gitea"
+
+    local root_url
+    read -p "Gitea 访问地址 (留空用 http://本机IP:3000): " root_url
+    [ -z "$root_url" ] && root_url="http://$(hostname -I | awk '{print $1}'):3000"
+
+    # 与 node-wk-storage-03/docker-compose.yml 保持一致 (含 SSH 克隆端口 222)
+    docker run -d --name gitea \
+        --restart unless-stopped \
+        -p 3000:3000 -p 222:22 \
+        -e TZ=$TZ -e PUID=$PUID -e PGID=$PGID \
+        -e USER_UID=$PUID -e USER_GID=$PGID \
+        -e GITEA__server__SSH_PORT=222 \
+        -e GITEA__server__ROOT_URL="$root_url" \
+        -v "${DATA_DIR}/gitea:/data" \
+        -v /etc/localtime:/etc/localtime:ro \
+        gitea/gitea:latest
+    log_success "Gitea 已启动 -> $root_url"
+    log_info "SSH 克隆端口: 222 (防火墙清单已包含该端口)"
+}
+
+install_ariang() {
+    log_info "安装 AriaNg 前端..."
+    ensure_docker
+    remove_old_container "ariang"
+
+    local rpc_addr
+    read -p "aria2 RPC 地址 (留空用 本机IP:6800): " rpc_addr
+    [ -z "$rpc_addr" ] && rpc_addr="$(hostname -I | awk '{print $1}'):6800"
+
+    # 纯前端, 无数据卷 (与 node-wk-storage-03/docker-compose.yml 一致)
+    docker run -d --name ariang \
+        --restart unless-stopped \
+        -p 6880:80 \
+        -e TZ=$TZ \
+        p3terx/ariang:latest
+    log_success "AriaNg 已启动 -> http://$(hostname -I | awk '{print $1}'):6880"
+    log_info "首次打开后在「AriaNg 设置 → RPC」里填: $rpc_addr"
 }
 
 # ============================================================

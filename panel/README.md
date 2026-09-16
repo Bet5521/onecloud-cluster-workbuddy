@@ -145,7 +145,7 @@ sudo env PANEL_HOST=192.168.1.101 PANEL_PORT=9000 bash install-service.sh -y
 ```json
 {
   "cluster_name": "OneCloud Cluster",
-  "version": "1.5.0",
+  "version": "1.5.1",
   "nodes": [
     {
       "name": "wk-edge-01",

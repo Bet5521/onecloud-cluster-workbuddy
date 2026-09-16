@@ -48,6 +48,8 @@ systemctl start mihomo
 ### 3.1 手动备份
 ```bash
 ./scripts/backup.sh all
+./scripts/backup.sh config    # 只要 compose / .env / wireguard / systemd
+./scripts/backup.sh data      # 只要应用数据 (排除 compose 与 .env)
 ./scripts/backup.sh node edge-01
 ./scripts/backup.sh service homeassistant
 ./scripts/backup.sh service typecho
@@ -70,6 +72,9 @@ crontab -e
 ```
 > 备份 ID 是 `backup.sh` 生成的时间戳目录名 (如 `20260814_030000`),
 > 位于各节点的 `/mnt/sd/backups/` 下, `latest` 表示最新一份。
+>
+> 服务名与节点名都从 `inventory/` 解析, **凡是 `services.yaml` 里有的服务都能按服务恢复**
+> (简写会自动识别是服务还是节点; 认不出来时脚本会打印可选清单)。
 
 ## 4. 更新策略
 

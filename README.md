@@ -2,7 +2,7 @@
 
 > 基于玩客云 WS1608 (Amlogic S805, ARMv7, 1GB RAM) 多节点组建的家庭服务集群
 
-**当前版本: v1.5.0**
+**当前版本: v1.5.1**
 
 ---
 
@@ -345,7 +345,7 @@ vim inventory/nodes.local.yaml   # 填入你的 IP/主机名, 该文件已被 gi
 | `deploy.sh` | rsync 分发配置到各节点 | `-n <节点>` / `--exec <命令>` / `-t` / `-d` |
 | `install-services.sh` | 安装原生二进制或启动节点容器 | `mihomo` / `edge` / `all-native` |
 | `health-check.sh` | 集群健康巡检（SSH/容器/端口/负载/OOM） | 直接运行 |
-| `backup.sh` | 备份配置与数据（`BACKUP_DIR` 可自定义） | `all` / `config` / `node <名>` / `service <名>` |
+| `backup.sh` | 备份配置与数据（`BACKUP_DIR` 可自定义） | `all` / `config` / `data` / `node <名>` / `service <名>` |
 | `restore.sh` | 从备份恢复 | `<备份ID> <目标>` 或 `<备份ID> service <名>` |
 | `update-all.sh` | 批量更新镜像/系统包（不升 Docker Engine） | `-d` / `-s` / `-a` / `-n <节点>` |
 
@@ -355,14 +355,15 @@ vim inventory/nodes.local.yaml   # 填入你的 IP/主机名, 该文件已被 gi
 
 ## ✅ 功能验证
 
-项目自带验证套件，共 27 组，覆盖配置完整性、脚本语法、节点映射、服务一致性、
+项目自带验证套件，共 28 组，覆盖配置完整性、脚本语法、节点映射、**服务清单五方一致性**、
 **文档化 CLI 接口契约**、**IP/主机名可自定义性**、**安全健壮性回归**、
 **面板前后端契约**、**bootstrap 网络取值与 SD/风险预检**、**init 交互式入口契约**、
 **Python 依赖降级链**、**bootstrap apt 源与依赖安装回归**、
 **bootstrap DNS 模式（DHCP 自动获取）**、**面板监听地址校验（误填拦截 / 同网段引导）**、
 **通路 / 防火墙 / SSH 通道自检**、**面板安装参数（监听地址与访问地址分离）**、
-**部署侧零防火墙改动 + 防火墙建议清单生成**
-（当前 426 项）：
+**部署侧零防火墙改动 + 防火墙建议清单生成**、
+**脚本 usage 与实现一致性（声明的子命令必须有 case 分支）**
+（当前 441 项）：
 
 ```bash
 python3 test_validate.py
@@ -371,8 +372,8 @@ python3 test_validate.py
 输出示例：
 
 ```
-  总计: 426 项
-  通过: 426
+  总计: 441 项
+  通过: 441
   失败: 0
   警告: 0
 ```
@@ -426,6 +427,37 @@ python3 test_validate.py
   校验功能脚本无硬编码 IP、每个节点 hostname 字段齐全、环境变量覆盖真实生效
 - 验证项从 176 扩至 **184**（全部通过、0 警告）
 - 新增 `inventory/nodes.local.yaml.example` 覆盖模板（真实覆盖文件已 gitignore）
+
+---
+
+## 🚀 v1.5.1 变更说明
+
+**主题：补齐两条部署路径的能力差，并把「声明 vs 实现」的契约纳入回归测试。**
+
+### 修复
+
+- **`setup.sh` 补齐 3 个安装入口**：新增 `install_typecho` / `install_gitea` /
+  `install_ariang`（镜像、端口、数据卷与 `docker-compose.yml` 对齐）。
+  此前这三个服务只在 compose 路径能装，走「统一安装」菜单装不上，巡检随后报容器未运行。
+- **`restore.sh` 服务白名单改为读 inventory**：原来硬编码 6 个服务，其余 12 个
+  「备份得到、恢复不了」；现在与 `backup.sh` 同一口径（`service_names`），
+  节点候选也改用 `node_resolve`，不再硬编码节点名。
+- **`backup.sh` 补上 usage 承诺的 `data` 类型**（只备份应用数据，排除 compose 与 `.env`）；
+  同时把类型校验提到 `mkdir` 之前，非法类型不再留下空备份目录。
+- **面板页脚版本号改为后端注入**（原来硬编码 `v1.0`）。
+- `deploy.sh` 远程预建目录补 `memos/data`、`typecho/usr`、`cups-web/config`。
+- 删除未被前端调用的 `/api/topology` 死端点；清理顶层空目录 `wireguard/`
+  与 `.gitignore` 里被整目录规则覆盖的重复条目。
+
+### 验证增强
+
+- **第 11 组升级为「服务清单五方比对」**：`nodes.yaml` / `services.yaml` /
+  `docker-compose.yml` / `panel/config.json` / `setup.sh add_service` 五个数据源
+  互相比对，任一处漂移直接 `log_fail`（原来只比两处且只 `log_warn`，
+  所以上面的安装入口缺口能长期存在而测试全绿）。
+- **新增第 28 组「脚本 usage 与实现一致性」**：usage 声明的子命令必须在 `case`
+  里有分支（双向比对）、backup/restore 服务口径一致、非法参数不产生副作用、
+  文档里写出来的命令必须真实存在。
 
 ---
 

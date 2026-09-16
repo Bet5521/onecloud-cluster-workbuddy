@@ -65,7 +65,9 @@ normalize_node() {
 #   $0 <备份ID> <节点名或服务名>        (自动识别, 运维手册中的简写形式)
 RESTORE_TARGET=""
 RESTORE_NAME=""
-KNOWN_SERVICES="homeassistant piwigo typecho aria2 syncthing gitea"
+# 服务清单统一从 inventory/services.yaml 读取 (与 backup.sh 同一口径);
+# 硬编码白名单会让「备份得到但恢复不了」的服务悄悄累积
+KNOWN_SERVICES="$(service_names | tr '\n' ' ')"
 
 case "$ARG2" in
     all|config)
@@ -79,26 +81,22 @@ case "$ARG2" in
         RESTORE_TARGET="all"
         ;;
     *)
-        NODE_CANDIDATE=$(normalize_node "$ARG2")
-        case "$NODE_CANDIDATE" in
-            wk-edge-01|wk-iot-02|wk-storage-03)
-                RESTORE_TARGET="node"
-                RESTORE_NAME="$NODE_CANDIDATE"
-                ;;
-            *)
-                if echo " $KNOWN_SERVICES " | grep -q " $ARG2 "; then
-                    RESTORE_TARGET="service"
-                    RESTORE_NAME="$ARG2"
-                else
-                    log_error "无法识别的恢复目标: $ARG2"
-                    echo ""
-                    echo "  可选: all | config | node <节点名> | service <服务名>"
-                    echo "  已知节点: wk-edge-01 wk-iot-02 wk-storage-03 (可简写 edge-01)"
-                    echo "  已知服务: $KNOWN_SERVICES"
-                    exit 1
-                fi
-                ;;
-        esac
+        # 先用 inventory 解析节点 (支持标准名 / 短名 / 主机名), 避免硬编码节点清单
+        NODE_CANDIDATE="$(node_resolve "$ARG2" 2>/dev/null || true)"
+        if [ -n "$NODE_CANDIDATE" ]; then
+            RESTORE_TARGET="node"
+            RESTORE_NAME="$NODE_CANDIDATE"
+        elif echo " $KNOWN_SERVICES " | grep -q " $ARG2 "; then
+            RESTORE_TARGET="service"
+            RESTORE_NAME="$ARG2"
+        else
+            log_error "无法识别的恢复目标: $ARG2"
+            echo ""
+            echo "  可选: all | config | node <节点名> | service <服务名>"
+            echo "  已知节点: $(node_names | tr '\n' ' ')"
+            echo "  已知服务: $KNOWN_SERVICES"
+            exit 1
+        fi
         ;;
 esac
 

@@ -11,12 +11,8 @@ inventory/nodes.local.yaml
 # 工作区元数据
 .workbuddy/
 
-# WireGuard 私钥
-wireguard/*.key
-wireguard/*.privkey
-wireguard/peer-*/config/*.client.conf
-
 # WireGuard 密钥库与生成产物 (由 scripts/wireguard-setup.sh 生成, 含私钥)
+# 整目录忽略, 已覆盖下面三条细粒度规则 (保留注释以说明忽略范围)
 wireguard/
 node-*/wireguard/wg0.conf
 

@@ -1085,63 +1085,320 @@ def test_panel_install_service():
     return True
 
 # ============ 测试11: 节点服务与 services.yaml 一致性 ============
-def test_service_consistency():
-    """验证节点服务配置一致性"""
-    print("\n" + "="*60)
-    print("测试 11: 节点服务配置一致性验证")
-    print("="*60)
-    
-    try:
-        # 读取 services.yaml
-        with open(INVENTORY_DIR / "services.yaml", encoding='utf-8') as f:
-            services_text = f.read()
-        services_data = simple_yaml_parse(services_text)
-        
-        # 读取 panel config.json
-        with open(PANEL_DIR / "config.json", encoding='utf-8') as f:
-            panel_data = json.load(f)
-        
-        # 交叉验证
-        log_info("交叉验证 services.yaml 与 panel/config.json:")
-        
-        yaml_services = services_data.get("services", {})
-        panel_services = {}
-        
-        for node in panel_data.get("nodes", []):
-            node_name = node["name"]
-            svc_names = {s["name"] for s in node.get("services", [])}
-            panel_services[node_name] = svc_names
-        
-        for node_name, panel_svcs in panel_services.items():
-            yaml_node_svcs = {
-                name for name, config in yaml_services.items()
-                if config.get("node") == node_name
-            }
-            
-            missing_in_panel = yaml_node_svcs - panel_svcs
-            extra_in_panel = panel_svcs - yaml_node_svcs
-            
-            if not missing_in_panel and not extra_in_panel:
-                log_pass(f"节点 {node_name}: services.yaml 与 panel 一致")
+def _norm_svc(name: str) -> str:
+    """服务名归一化
+
+    setup.sh 的 add_service 用下划线 (cups_web), inventory / compose / panel
+    用连字符 (cups-web)。比对前统一成连字符, 否则每次都会误报。
+    """
+    return name.strip().replace("_", "-")
+
+
+def _parse_nodes_yaml_services() -> Dict[str, set]:
+    """inventory/nodes.yaml -> {节点名: 服务集合} (支持行内数组与块列表)"""
+    nodes: Dict[str, set] = {}
+    cur = None
+    section = None
+    for line in (INVENTORY_DIR / "nodes.yaml").read_text(encoding="utf-8").splitlines():
+        m = re.match(r'^\s*-\s*name:\s*(\S+)', line)
+        if m:
+            cur = m.group(1)
+            nodes[cur] = set()
+            section = None
+            continue
+        if cur is None:
+            continue
+        m = re.match(r'^\s*services:\s*\[([^\]]*)\]\s*$', line)
+        if m:
+            nodes[cur] = {x.strip() for x in m.group(1).split(",") if x.strip()}
+            section = None
+            continue
+        if re.match(r'^\s*services:\s*$', line):
+            section = "services"
+            continue
+        m = re.match(r'^\s*-\s*(\S+)\s*$', line)
+        if m and section == "services":
+            nodes[cur].add(m.group(1))
+            continue
+        if re.match(r'^\s*[a-z_]+:', line):
+            section = None
+    return nodes
+
+
+def _parse_services_yaml() -> Dict[str, dict]:
+    """inventory/services.yaml -> {服务名: {node, container, ports, volumes}}"""
+    svcs: Dict[str, dict] = {}
+    cur = None
+    section = None
+    text = (INVENTORY_DIR / "services.yaml").read_text(encoding="utf-8")
+    for line in text.splitlines():
+        m = re.match(r'^  ([A-Za-z0-9_.\-]+):\s*$', line)
+        if m:
+            cur = m.group(1)
+            svcs[cur] = {"node": None, "container": False, "ports": [], "volumes": []}
+            section = None
+            continue
+        if cur is None:
+            continue
+        m = re.match(r'^    ([a-z_]+):\s*(.*)$', line)
+        if m:
+            key, val = m.group(1), m.group(2).strip()
+            if key in ("ports", "volumes"):
+                section = key
             else:
-                if missing_in_panel:
-                    log_warn(f"节点 {node_name}: panel 缺少服务 {missing_in_panel}")
-                if extra_in_panel:
-                    log_warn(f"节点 {node_name}: panel 多出服务 {extra_in_panel}")
-        
-        # 验证端口配置
-        log_info("验证服务端口配置:")
-        for svc_name, svc_config in yaml_services.items():
-            if svc_config.get("container"):
-                ports = svc_config.get("ports", [])
-                for port_entry in ports:
-                    port = port_entry.split(":")[0] if ":" in port_entry else port_entry
-                    log_info(f"  {svc_name}: 端口 {port}")
-    
+                section = None
+                if key == "node":
+                    svcs[cur]["node"] = val
+                elif key == "container":
+                    svcs[cur]["container"] = (val == "true")
+            continue
+        m = re.match(r'^\s+-\s*(.+)$', line)
+        if m and section:
+            svcs[cur][section].append(m.group(1).strip().strip("\"'"))
+    return svcs
+
+
+def _parse_compose(path: Path) -> Dict[str, dict]:
+    """docker-compose.yml -> {服务名: {ports, volumes, network_mode}}
+
+    只取顶层 services 下的一层结构, 够比对用; 不引第三方 YAML 依赖。
+    """
+    svcs: Dict[str, dict] = {}
+    cur = None
+    section = None
+    in_services = False
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        # 只在顶层 services: 段内取值 —— 顶层的 volumes:/networks: 缩进同样是
+        # 2 空格, 不区分会把具名卷 (cloudflared-config) 误当成服务
+        if not line[0].isspace():
+            in_services = line.startswith("services:")
+            cur = None
+            section = None
+            continue
+        if not in_services:
+            continue
+        m = re.match(r'^  ([A-Za-z0-9_.\-]+):\s*$', line)
+        if m:
+            cur = m.group(1)
+            svcs[cur] = {"ports": [], "volumes": [], "network_mode": None}
+            section = None
+            continue
+        if cur is None:
+            continue
+        m = re.match(r'^    ([a-z_]+):\s*(.*)$', line)
+        if m:
+            key, val = m.group(1), m.group(2).strip()
+            if key in ("ports", "volumes"):
+                section = key
+            else:
+                section = None
+                if key == "network_mode":
+                    svcs[cur]["network_mode"] = val
+            continue
+        m = re.match(r'^\s+-\s*(.+)$', line)
+        if m and section:
+            item = m.group(1).strip().strip("\"'")
+            svcs[cur][section].append(item.split(":")[0] if section == "ports" else item)
+    return svcs
+
+
+def _parse_setup_services() -> set:
+    """scripts/setup.sh 的 add_service 注册表 (归一化后的服务名)"""
+    src = (SCRIPTS_DIR / "setup.sh").read_text(encoding="utf-8")
+    return {_norm_svc(m.group(1))
+            for m in re.finditer(r'^add_service\s+"([^"]+)"', src, re.M)}
+
+
+def _parse_panel_services() -> Dict[str, set]:
+    """panel/config.json -> {节点名: 服务集合}"""
+    with open(PANEL_DIR / "config.json", encoding="utf-8") as f:
+        data = json.load(f)
+    out = {}
+    for node in data.get("nodes", []):
+        out[node["name"]] = {s["name"] for s in node.get("services", [])}
+    return out
+
+
+def _expand_brace(s: str):
+    """展开 bash 花括号: a/{b,c}/d -> [a/b/d, a/c/d] (支持嵌套)
+
+    没有花括号时按逗号切分 —— 顶层 `x,{a,b},y` 的逗号也要展开,
+    否则整串会变成一个"目录名"。
+    """
+    m = re.search(r'\{([^{}]*)\}', s)
+    if not m:
+        return [p for p in s.split(",") if p]
+    out = []
+    for alt in m.group(1).split(","):
+        out.extend(_expand_brace(s[:m.start()] + alt + s[m.end():]))
+    return out
+
+
+def test_service_consistency():
+    """测试 11: 服务清单五方一致性
+
+    五个数据源描述同一件事 —— 「集群里有哪些服务、在哪个节点、开哪个端口」:
+      A. inventory/nodes.yaml        节点 -> 服务列表
+      B. inventory/services.yaml     服务 -> 节点/是否容器/端口  (权威)
+      C. node-*/docker-compose.yml   compose 实际定义
+      D. panel/config.json           面板展示
+      E. scripts/setup.sh add_service 统一安装入口
+    任一处漂移都会表現成「装不上」或「巡检报容器不存在」, 所以这里用 log_fail。
+    """
+    print("\n" + "=" * 60)
+    print("测试 11: 服务清单五方一致性验证")
+    print("=" * 60)
+
+    try:
+        A = _parse_nodes_yaml_services()
+        B = _parse_services_yaml()
+        D = _parse_panel_services()
+        E = _parse_setup_services()
+
+        C: Dict[str, set] = {}
+        cid: Dict[str, dict] = {}
+        for node in A:
+            p = PROJECT_ROOT / f"node-{node}" / "docker-compose.yml"
+            if not p.exists():
+                log_fail(f"节点 {node} 缺少 docker-compose.yml", str(p))
+                continue
+            cid[node] = _parse_compose(p)
+            C[node] = set(cid[node])
+
+        allA = set().union(*A.values()) if A else set()
+        allC = set().union(*C.values()) if C else set()
+        allD = set().union(*D.values()) if D else set()
+        setB = set(B)
+
+        log_info(f"数据源规模: nodes={len(allA)} services.yaml={len(setB)} "
+                 f"compose={len(allC)} panel={len(allD)} setup.sh={len(E)}")
+
+        # ---- 1. nodes.yaml 声明的服务必须在 services.yaml 有定义 ----
+        missing = {_norm_svc(s) for s in allA} - {_norm_svc(s) for s in setB}
+        if not missing:
+            log_pass("nodes.yaml 声明的服务都在 services.yaml 有定义")
+        else:
+            log_fail("nodes.yaml 声明但 services.yaml 未定义", ", ".join(sorted(missing)))
+
+        # ---- 2. services.yaml 的服务必须被所属节点的 nodes.yaml 列出 ----
+        bad = []
+        for svc, meta in B.items():
+            node = meta["node"]
+            if node and node in A and _norm_svc(svc) not in {_norm_svc(x) for x in A[node]}:
+                bad.append(f"{svc}(应属于 {node})")
+        if not bad:
+            log_pass("services.yaml 的服务都被所属节点的 nodes.yaml 列出")
+        else:
+            log_fail("services.yaml 服务未登记到所属节点", ", ".join(sorted(bad)))
+
+        # ---- 3. 容器服务必须在对应节点的 compose 里有定义 ----
+        bad = []
+        for svc, meta in B.items():
+            if not meta["container"]:
+                continue
+            node = meta["node"]
+            if node in C and _norm_svc(svc) not in {_norm_svc(x) for x in C[node]}:
+                bad.append(f"{svc}({node})")
+        if not bad:
+            log_pass("所有容器服务都在对应节点的 compose 有定义")
+        else:
+            log_fail("容器服务在 compose 中缺失", ", ".join(sorted(bad)))
+
+        # ---- 4. compose 里出现的服务必须能在 services.yaml 找到 ----
+        extra = {_norm_svc(s) for s in allC} - {_norm_svc(s) for s in setB}
+        if not extra:
+            log_pass("compose 未定义 services.yaml 之外的服务")
+        else:
+            log_fail("compose 存在未登记的服务", ", ".join(sorted(extra)))
+
+        # ---- 5. services.yaml 的服务必须在 setup.sh 有安装入口 ----
+        # (磁盘管理项 usb_mount / sd_mount 不是服务, 不参与比对)
+        disk_ops = {"usb-mount", "sd-mount"}
+        missing = {_norm_svc(s) for s in setB} - E - disk_ops
+        if not missing:
+            log_pass("services.yaml 的服务都能在 setup.sh 里安装")
+        else:
+            log_fail("services.yaml 有服务在 setup.sh 里没有安装入口",
+                     ", ".join(sorted(missing)))
+
+        # ---- 6. panel 与 services.yaml 双向一致 ----
+        miss_panel = {_norm_svc(s) for s in setB} - {_norm_svc(s) for s in allD}
+        extra_panel = {_norm_svc(s) for s in allD} - {_norm_svc(s) for s in setB}
+        if not miss_panel and not extra_panel:
+            log_pass("panel/config.json 与 services.yaml 服务集合一致")
+        else:
+            log_fail("panel 与 services.yaml 服务集合不一致",
+                     f"panel 缺: {sorted(miss_panel)}; panel 多: {sorted(extra_panel)}")
+
+        # panel 里的服务必须挂在正确节点下
+        bad = []
+        for node, svcs in D.items():
+            for svc in svcs:
+                meta = B.get(svc) or B.get(_norm_svc(svc).replace("-", "_"))
+                if meta and meta["node"] and meta["node"] != node:
+                    bad.append(f"{svc} 在 panel 里挂到 {node}, services.yaml 里属于 {meta['node']}")
+        if not bad:
+            log_pass("panel 各服务的归属节点与 services.yaml 一致")
+        else:
+            log_fail("panel 服务归属节点不一致", "; ".join(sorted(bad)))
+
+        # ---- 7. 端口: services.yaml 与 compose 的宿主端口必须一致 ----
+        bad = []
+        checked = 0
+        for svc, meta in B.items():
+            node = meta["node"]
+            comp = (cid.get(node) or {}).get(svc)
+            if comp is None:
+                continue
+            if not meta["ports"] and not comp["ports"]:
+                continue
+            if comp["network_mode"] == "host":
+                continue  # host 网络不走 ports 映射, 由 firewall-recommend 单独处理
+            # 变量端口 (如 ${MEMOS_PORT}) 的值在 .env 里, 静态比对无意义 ——
+            # firewall-recommend.sh 会把它单列成「需人工确认」
+            if any("${" in str(p) for p in meta["ports"]) or \
+               any("${" in str(p) for p in comp["ports"]):
+                log_info(f"  {svc}: 端口含变量引用, 跳过静态比对")
+                continue
+            y = sorted(str(p).split(":")[0] for p in meta["ports"])
+            c = sorted(str(p).split(":")[0] for p in comp["ports"])
+            checked += 1
+            if y != c:
+                bad.append(f"{svc}: services.yaml={y} compose={c}")
+        if not bad:
+            log_pass(f"容器服务宿主端口 services.yaml 与 compose 一致 (校验 {checked} 个)")
+        else:
+            log_fail("宿主端口两处不一致", "; ".join(sorted(bad)))
+
+        # ---- 8. deploy.sh 远程预建目录必须覆盖 compose 的相对挂载 ----
+        dep = (SCRIPTS_DIR / "deploy.sh").read_text(encoding="utf-8")
+        # 贪婪匹配到行尾最后一个 }, 否则嵌套花括号只会被截到第一层
+        m = re.search(r'mkdir -p \$\{REMOTE_BASE\}/\{(.*)\}"\s*$', dep, re.M)
+        prebuilt = set(_expand_brace(m.group(1))) if m else set()
+        if not m:
+            log_fail("deploy.sh 未找到远程目录预建语句")
+        else:
+            need = {}
+            for node, svcs in cid.items():
+                for name, meta_c in svcs.items():
+                    for v in meta_c["volumes"]:
+                        if v.startswith("./"):
+                            # ./memos/data:/var/opt/memos -> memos/data
+                            need.setdefault(v[2:].split(":")[0], []).append(f"{node}:{name}")
+            miss = [p for p in need
+                    if not any(p == d or p.startswith(d + "/") for d in prebuilt)]
+            if not miss:
+                log_pass(f"deploy.sh 预建目录覆盖 compose 全部相对挂载 ({len(need)} 个)")
+            else:
+                log_fail("deploy.sh 未预建的挂载目录",
+                         "; ".join(f"{p} <- {','.join(need[p])}" for p in sorted(miss)))
+
     except Exception as e:
         log_fail(f"服务一致性验证错误: {str(e)}")
         return False
-    
+
     return True
 
 # ============ 测试12: 生成测试报告 ============
@@ -4296,6 +4553,180 @@ def test_deploy_no_firewall():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+# ============ 测试 28: 脚本 usage 与实现的一致性 ============
+def _usage_text(path: Path) -> str:
+    """取脚本 usage() 里 heredoc 的文本"""
+    m = re.search(r"cat <<\s*'?EOF'?\n(.*?)\nEOF", path.read_text(encoding="utf-8"), re.S)
+    return m.group(1) if m else ""
+
+
+def _case_branch_tokens(src: str, var: str):
+    """取 `case "$var" in ... esac` 的分支标签 (a|b) 展开后的 token 集合
+
+    同一个变量可能被多个 case 匹配 (例如先做 --help / 合法性校验, 再进主分发),
+    所以取全部出现位置的并集。
+    """
+    toks = set()
+    found = False
+    for m in re.finditer(r'case "\$' + re.escape(var) + r'" in\n(.*?)\nesac', src, re.S):
+        found = True
+        for line in m.group(1).splitlines():
+            mm = re.match(r"^\s{4}([^\s)]+)\)\s*(;;)?\s*$", line)
+            if mm:
+                for t in mm.group(1).split("|"):
+                    t = t.strip().strip('"')
+                    if t:
+                        toks.add(t)
+    return toks if found else None
+
+
+def test_cli_usage_contract():
+    """测试 28: 脚本 usage 承诺的能力必须真的实现
+
+    这类问题不会让脚本报错, 只会让照文档操作的人失败:
+      - usage 列了 `data`, case 里没有 -> 照抄必错 (backup.sh 曾如此)
+      - 恢复白名单只有 6 个服务 -> 备份得到却恢复不了 (restore.sh 曾如此)
+    所以这里对「声明 vs 实现」做双向比对, 并对关键路径做一次真实执行。
+    """
+    print("\n" + "=" * 60)
+    print("测试 28: 脚本 usage 与实现一致性 (CLI 契约)")
+    print("=" * 60)
+
+    def _posix(p):
+        s = Path(p).as_posix()
+        m = re.match(r"^([A-Za-z]):/(.*)$", s)
+        return f"/{m.group(1).lower()}/{m.group(2)}" if m else s
+
+    def run_sh(args, env_extra=None, timeout=120):
+        env = dict(os.environ)
+        if env_extra:
+            env.update(env_extra)
+        return subprocess.run(["bash"] + args, cwd=str(PROJECT_ROOT),
+                              capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", stdin=subprocess.DEVNULL,
+                              timeout=timeout)
+
+    try:
+        # ---- A. backup.sh: usage 声明的类型 <-> case 分支 ----
+        bpath = SCRIPTS_DIR / "backup.sh"
+        bsrc = bpath.read_text(encoding="utf-8")
+        busage = _usage_text(bpath)
+        declared = {m.group(1) for m in re.finditer(r"^  ([a-z]+)\s+\S", busage, re.M)}
+        branches = _case_branch_tokens(bsrc, "BACKUP_TYPE")
+
+        if branches is None:
+            log_fail("backup.sh 未找到 case \"$BACKUP_TYPE\" 分发")
+        else:
+            miss = declared - branches
+            hide = branches - declared - {"*", "-h", "--help"}
+            if not miss:
+                log_pass(f"backup.sh usage 声明的类型都有实现: {sorted(declared)}")
+            else:
+                log_fail("backup.sh usage 声明但 case 里没有分支", f"缺失: {sorted(miss)}")
+            if not hide:
+                log_pass("backup.sh 没有 usage 未声明的隐藏分支")
+            else:
+                log_fail("backup.sh 存在 usage 未声明的分支", f"多余: {sorted(hide)}")
+
+        # ---- B. restore.sh: usage 恢复目标 <-> case 分支 ----
+        rpath = SCRIPTS_DIR / "restore.sh"
+        rsrc = rpath.read_text(encoding="utf-8")
+        rusage = _usage_text(rpath)
+        rt = re.search(r"恢复目标:\s*(.*)$", rusage, re.M)
+        r_declared = set()
+        if rt:
+            for part in rt.group(1).split("|"):
+                w = part.strip().split()
+                if w:
+                    r_declared.add(w[0])
+        r_branches = _case_branch_tokens(rsrc, "RESTORE_TARGET")
+
+        if not r_declared:
+            log_fail("restore.sh usage 未声明恢复目标枚举")
+        elif r_branches is None:
+            log_fail("restore.sh 未找到 case \"$RESTORE_TARGET\" 分发")
+        else:
+            miss = r_declared - r_branches
+            if not miss:
+                log_pass(f"restore.sh usage 声明的恢复目标都有实现: {sorted(r_declared)}")
+            else:
+                log_fail("restore.sh usage 声明但 case 里没有分支", f"缺失: {sorted(miss)}")
+
+        # ---- C. backup / restore 服务口径一致 (不得硬编码白名单) ----
+        if re.search(r'KNOWN_SERVICES="\$\(service_names', rsrc):
+            log_pass("restore.sh 服务清单来自 inventory (service_names), 无硬编码白名单")
+        else:
+            log_fail("restore.sh 仍在硬编码服务白名单",
+                     "应当改成 KNOWN_SERVICES=\"$(service_names | tr '\\n' ' ')\"")
+
+        both = all(re.search(r"node_of_service", s) for s in (bsrc, rsrc))
+        if both:
+            log_pass("backup.sh / restore.sh 都用 node_of_service 定位服务所在节点")
+        else:
+            log_fail("backup.sh / restore.sh 服务定位方式不一致")
+
+        # ---- D. 真实执行: 非法类型不得留下空备份目录 ----
+        tmp = Path(tempfile.mkdtemp(prefix="oc_t28_"))
+        try:
+            r = run_sh([_posix(bpath), "bogus"], {"BACKUP_DIR": _posix(tmp)})
+            leftovers = [p.name for p in tmp.iterdir()]
+            if r.returncode != 0 and not leftovers:
+                log_pass("backup.sh 收到非法类型: 退出非 0 且不产生空备份目录")
+            else:
+                log_fail("backup.sh 非法类型处理不当",
+                         f"rc={r.returncode} 残留={leftovers}")
+
+            # 白名单外的服务也必须被识别 (ariang / cups-web / panel 曾被拒)
+            rejected = []
+            for svc in ("ariang", "cups-web", "panel", "adguard"):
+                rr = run_sh([_posix(rpath), "20990101_000000", svc])
+                if "无法识别的恢复目标" in (rr.stdout + rr.stderr):
+                    rejected.append(svc)
+            if not rejected:
+                log_pass("restore.sh 接受全部 inventory 服务名 (含原先白名单外的 4 个)")
+            else:
+                log_fail("restore.sh 拒绝的服务名", ", ".join(rejected))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+        # ---- E. 面板版本号由后端注入, 模板不硬编码 ----
+        html = (PANEL_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+        appsrc = (PANEL_DIR / "app.py").read_text(encoding="utf-8")
+        hardcoded = re.search(r"OneCloud Cluster v\d+\.\d+", html)
+        if hardcoded:
+            log_fail("index.html 页脚硬编码了版本号", hardcoded.group(0))
+        elif "{{ version }}" in html and re.search(
+                r'render_template\("index\.html",\s*version=', appsrc):
+            log_pass("index.html 页脚版本号由后端注入 (改版本只需改一处)")
+        else:
+            log_fail("index.html 未使用后端注入的 version")
+
+        # ---- F. 文档里写出来的命令必须对得上脚本实现 ----
+        bad = []
+        checked = 0
+        for doc in ("README.md", "docs/operations.md", "init/README.md"):
+            p = PROJECT_ROOT / doc
+            if not p.exists():
+                continue
+            text = p.read_text(encoding="utf-8")
+            for m in re.finditer(r"scripts/backup\.sh\s+([a-z]+)", text):
+                sub = m.group(1)
+                if sub in declared:
+                    checked += 1
+                else:
+                    bad.append(f"{doc}: scripts/backup.sh {sub}")
+        if not bad:
+            log_pass(f"文档里出现的 backup.sh 子命令都真实存在 (校验 {checked} 处)")
+        else:
+            log_fail("文档引用了 backup.sh 不存在的子命令", "; ".join(sorted(set(bad))))
+
+    except Exception as e:
+        log_fail(f"CLI 契约验证错误: {str(e)}")
+        return False
+
+    return True
+
+
 # ============ 主程序 ============
 def main():
     print("=" * 60)
@@ -4332,6 +4763,7 @@ def main():
         ("防火墙与 SSH 自检", test_network_audit),
         ("面板安装参数", test_panel_install_params),
         ("部署零防火墙改动与建议清单", test_deploy_no_firewall),
+        ("脚本 usage 与实现一致性 (CLI 契约)", test_cli_usage_contract),
     ]
     
     for test_name, test_func in tests:
