@@ -150,3 +150,27 @@ done
 echo "=========================================="
 log_info "分发完成"
 echo "=========================================="
+
+# ------------------------------------------------------------
+# 节点部署完毕 -> 生成防火墙设置建议清单
+#
+# onecloud 的部署脚本**不改任何节点的防火墙**: 不写 iptables / ip6tables,
+# 不下发 ufw / firewall-cmd / nft, 也不生成任何 PostUp 规则。
+# 这里只在控制端**静态**算出一份「该放行哪些端口」的建议清单
+# (docs/firewall/<节点>.txt), 由你带着清单到节点上执行 setup_firewall.sh。
+#
+# 清单生成失败不影响分发结果 (节点已经部署好了), 因此不中断、只告警。
+# ------------------------------------------------------------
+if [ "$DRY_RUN" != "--dry-run" ] && [ "$TEST_ONLY" != true ]; then
+    echo ""
+    if [ -f "${SCRIPT_DIR}/firewall-recommend.sh" ]; then
+        log_info "生成防火墙设置建议清单 (不改防火墙)"
+        if bash "${SCRIPT_DIR}/firewall-recommend.sh"; then
+            log_info "清单已生成 → docs/firewall/ , 由你执行 setup_firewall.sh 逐条应用"
+        else
+            log_warn "建议清单生成失败 (不影响节点分发)"
+        fi
+    else
+        log_warn "未找到 scripts/firewall-recommend.sh, 跳过防火墙建议清单"
+    fi
+fi

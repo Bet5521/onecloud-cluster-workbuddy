@@ -49,8 +49,16 @@ for peer in 01 02 03; do
 done
 
 echo "[*] 生成 wg0.conf (WireGuard 地址: ${WG_ADDR}/32)..."
-# 注意: PostUp/PostDown 每个只能出现一次, 多条规则用分号连接
-# (重复写 PostUp 时 wg-quick 只保留最后一个, 前面会被静默丢弃)
+
+# 是否在 wg0.conf 里写 iptables 规则 —— 默认 **不写**。
+# 防火墙策略统一由 setup_firewall.sh 管理, 免得 wg-quick 与它互相覆盖,
+# 也免得反复 up/down 之后没人说得清规则是谁加的。
+WG_FIREWALL="${ONECLOUD_WG_FIREWALL:-0}"
+case "$WG_FIREWALL" in
+    1|true|yes|on) WG_FIREWALL=1 ;;
+    *)             WG_FIREWALL=0 ;;
+esac
+
 cat > wg0.conf << EOF
 [Interface]
 Address = ${WG_ADDR}/32
@@ -58,6 +66,13 @@ ListenPort = ${WG_PORT}
 PrivateKey = $(cat server_private.key)
 
 # DNS 路由到 AdGuard
+EOF
+
+if [ "$WG_FIREWALL" = "1" ]; then
+    # 注意: PostUp/PostDown 每个只能出现一次, 多条规则用分号连接
+    # (重复写 PostUp 时 wg-quick 只保留最后一个, 前面会被静默丢弃)
+    cat >> wg0.conf << EOF
+
 # 转发 + NAT + 放行 WireGuard 入站
 #   - 每条都用 -C 先探测再添加: 反复 up 不会把规则堆成一摞
 #     (堆起来后 PostDown 只删一条, 残留规则会让"到底谁在拦"变得很难查)
@@ -66,6 +81,24 @@ PostUp = iptables -C FORWARD -i wg0 -j ACCEPT 2>/dev/null || iptables -A FORWARD
 PostDown = iptables -D FORWARD -i wg0 -j ACCEPT 2>/dev/null; iptables -D FORWARD -o wg0 -j ACCEPT 2>/dev/null; iptables -t nat -D POSTROUTING -o ${WG_EGRESS_IF} -j MASQUERADE 2>/dev/null; iptables -D INPUT -p udp --dport ${WG_PORT} -j ACCEPT 2>/dev/null || true
 
 EOF
+else
+    cat >> wg0.conf << 'EOF'
+
+# 本配置**不含任何防火墙规则** (默认行为)。
+# 防火墙策略统一由 setup_firewall.sh 管理 —— 免得两边互相覆盖。
+#
+# 本机作为 Hub 转发流量, 需要下面三条 (手工或由集中式防火墙落地):
+#   iptables -C FORWARD -i wg0 -j ACCEPT || iptables -A FORWARD -i wg0 -j ACCEPT
+#   iptables -C FORWARD -o wg0 -j ACCEPT || iptables -A FORWARD -o wg0 -j ACCEPT
+#   WG_IF=$(ip -4 route show default scope global | awk '{print $5; exit}')
+#   iptables -t nat -C POSTROUTING -o "$WG_IF" -j MASQUERADE || \
+#       iptables -t nat -A POSTROUTING -o "$WG_IF" -j MASQUERADE
+#
+# 入站端口用 DSL 表达即可:  in accept udp <WG端口> - -
+# 若要恢复成 wg-quick 自带规则: ONECLOUD_WG_FIREWALL=1 重跑本脚本
+
+EOF
+fi
 
 echo "[✓] WireGuard 密钥和基础配置已生成在 $WG_DIR"
 echo ""

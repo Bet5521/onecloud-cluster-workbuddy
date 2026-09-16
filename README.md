@@ -2,7 +2,7 @@
 
 > 基于玩客云 WS1608 (Amlogic S805, ARMv7, 1GB RAM) 多节点组建的家庭服务集群
 
-**当前版本: v1.4.5**
+**当前版本: v1.5.0**
 
 ---
 
@@ -81,7 +81,9 @@ onecloud-cluster/
 │   ├── architecture.md       # 架构设计、网络拓扑、存储规划
 │   ├── topology.md           # 可视化拓扑图 (Mermaid + ASCII)
 │   ├── operations.md         # 运维手册
-│   └── cloudflare-setup.md   # Cloudflare Tunnel 配置
+│   ├── cloudflare-setup.md   # Cloudflare Tunnel 配置
+│   └── firewall/             # 防火墙建议清单 (每节点一份, deploy 后自动生成)
+│       └── <节点名>.txt      # 可直接录入 setup_firewall.sh 的规则行
 ├── inventory/                # 集群清单 (单一数据源)
 │   ├── nodes.yaml
 │   └── services.yaml
@@ -338,7 +340,8 @@ vim inventory/nodes.local.yaml   # 填入你的 IP/主机名, 该文件已被 gi
 | `gen-node-env.sh` | 从清单渲染各节点 `.env`（保留已填密钥） | `[节点名]` / `--dry-run` |
 | `bootstrap.sh` | 新节点初始化（主机名/swap/SD卡/Docker/静态IP；apt 换源与更新默认跳过） | `--node <名> [--ip <IP>] [--gateway <IP>] [--sd <DEV>] [--no-sd] [--mirror] [--apt-update] [--no-apt] [--dry-run] --yes` |
 | `setup.sh` | 统一安装（端口检测 + 多选批量安装 + 磁盘挂载） | `sudo bash setup.sh` |
-| `wireguard-setup.sh` | WireGuard mesh 配置生成 | `gen` / `add peer` / `list` |
+| `wireguard-setup.sh` | WireGuard mesh 配置生成（**默认不写防火墙规则**） | `gen` / `add peer` / `list`；`--with-wg-firewall` 可恢复自带规则 |
+| `firewall-recommend.sh` | 生成防火墙建议清单（静态推算，不改任何防火墙） | 直接运行 / `[节点名]` / `--emit-dsl` / `--out DIR` / `--lan <网段>` |
 | `deploy.sh` | rsync 分发配置到各节点 | `-n <节点>` / `--exec <命令>` / `-t` / `-d` |
 | `install-services.sh` | 安装原生二进制或启动节点容器 | `mihomo` / `edge` / `all-native` |
 | `health-check.sh` | 集群健康巡检（SSH/容器/端口/负载/OOM） | 直接运行 |
@@ -352,12 +355,14 @@ vim inventory/nodes.local.yaml   # 填入你的 IP/主机名, 该文件已被 gi
 
 ## ✅ 功能验证
 
-项目自带验证套件，共 23 组，覆盖配置完整性、脚本语法、节点映射、服务一致性、
+项目自带验证套件，共 27 组，覆盖配置完整性、脚本语法、节点映射、服务一致性、
 **文档化 CLI 接口契约**、**IP/主机名可自定义性**、**安全健壮性回归**、
 **面板前后端契约**、**bootstrap 网络取值与 SD/风险预检**、**init 交互式入口契约**、
 **Python 依赖降级链**、**bootstrap apt 源与依赖安装回归**、
-**bootstrap DNS 模式（DHCP 自动获取）**、**面板监听地址校验（误填拦截 / 同网段引导）**
-（当前 341 项）：
+**bootstrap DNS 模式（DHCP 自动获取）**、**面板监听地址校验（误填拦截 / 同网段引导）**、
+**通路 / 防火墙 / SSH 通道自检**、**面板安装参数（监听地址与访问地址分离）**、
+**部署侧零防火墙改动 + 防火墙建议清单生成**
+（当前 426 项）：
 
 ```bash
 python3 test_validate.py
@@ -366,11 +371,15 @@ python3 test_validate.py
 输出示例：
 
 ```
-  总计: 341 项
-  通过: 341
+  总计: 426 项
+  通过: 426
   失败: 0
   警告: 0
 ```
+
+> 在 Windows / Git Bash 上跑一轮约 15–20 分钟（被测脚本每调一次外部命令都是一次
+> 进程创建）。最重的几个 bash harness 默认给 900 秒上限，机器慢或同时跑别的任务时
+> 可以调大：`ONECLOUD_TEST_HARNESS_TIMEOUT=1800 python3 test_validate.py`。
 
 报告同时写入 `test_report.txt`（已被 gitignore）。
 
@@ -417,6 +426,55 @@ python3 test_validate.py
   校验功能脚本无硬编码 IP、每个节点 hostname 字段齐全、环境变量覆盖真实生效
 - 验证项从 176 扩至 **184**（全部通过、0 警告）
 - 新增 `inventory/nodes.local.yaml.example` 覆盖模板（真实覆盖文件已 gitignore）
+
+---
+
+## 🚀 v1.5.0 变更说明
+
+**主题：部署脚本彻底不碰防火墙，防火墙改由一份"建议清单"统一交给你执行。**
+
+### 1. 部署脚本不再写任何防火墙规则
+
+`wireguard-setup.sh`（控制端生成）与 `node-wk-edge-01/wireguard/generate-keys.sh`
+（节点本地生成）**默认不再往 `wg0.conf` 里写 `PostUp`/`PostDown`**。
+
+原因：`wg-quick` 的 PostUp 会在节点上直接 `iptables -A`，而 onecloud 的定位是
+"只部署、不碰系统安全策略"。谁在什么时候改了防火墙，必须只有一个入口。
+
+- 需要恢复自带规则时：`ONECLOUD_WG_FIREWALL=1 ./scripts/wireguard-setup.sh gen`
+  或 `--with-wg-firewall`；反向开关 `--no-wg-firewall`
+- 不写规则时，脚本会在 `wg0.conf` 里留注释，并打印 Hub 节点需要手工执行的那几条命令
+
+### 2. 新增防火墙建议清单生成器
+
+```bash
+./scripts/firewall-recommend.sh              # 全部节点 -> docs/firewall/<节点>.txt
+./scripts/firewall-recommend.sh wk-edge-01   # 只出某个节点
+./scripts/firewall-recommend.sh --emit-dsl   # 只打印可录入的规则行
+./scripts/firewall-recommend.sh --stdout     # 打印完整报告不落盘
+./scripts/firewall-recommend.sh --lan 192.168.1.0/24
+```
+
+清单**只做静态推算**（读 `inventory/nodes.yaml` + `inventory/services.yaml`），
+不发任何网络请求、不碰节点：
+
+- 默认策略建议（INPUT DROP / OUTPUT ACCEPT / FORWARD ACCEPT）
+- 必需规则（SSH、面板、WireGuard）与内网规则（AdGuard 53、Grafana 3000…）分开列
+- 只给**放行**建议，不替你决定封禁谁
+- 容器变量端口（如 `${MEMOS_PORT}`）单独列出，标明"需人工确认"，不静默丢弃
+- Hub 节点额外给一段 WireGuard 转发/NAT 命令（`sysctl`、`FORWARD`、`MASQUERADE`）
+  —— 这部分 DSL 表达不了，必须手工录入
+
+### 3. 部署流程接入
+
+- `scripts/deploy.sh` 分发完成后自动生成清单（`--dry-run` / `-t` 时跳过；
+  生成失败只告警，不影响节点分发）
+- `init/init.sh` 维护菜单新增「生成防火墙设置建议清单」
+
+### 4. 唯一执行入口
+
+真正改防火墙**只有**一条路：把清单带到节点上，逐条录进 `setup_firewall.sh`
+（`/etc/fw-setup/rules.dsl`）后由你手动应用。本仓库不含该脚本，也不调用它。
 
 ---
 

@@ -27,6 +27,13 @@ NODE_DIRS = {
 INVENTORY_DIR = PROJECT_ROOT / "inventory"
 PANEL_DIR = PROJECT_ROOT / "panel"
 
+# 跑 bash harness 的超时。
+# Windows / Git Bash 上被测脚本每调一次外部命令就是一次进程创建（约 0.7s/次），
+# 最重的 harness（bootstrap 的多场景交互）单跑就要 ~170s，180s 的上限在
+# "同时跑着其它测试"时必然假失败（实测踩到：超时异常被记成测试失败）。
+# 留足余量，并允许用环境变量按机器调。
+HARNESS_TIMEOUT = int(os.environ.get("ONECLOUD_TEST_HARNESS_TIMEOUT", "900"))
+
 # 节点IP映射 —— 从 inventory/nodes.yaml 动态读取, 避免硬编码 (支持用户自定义 IP)
 def load_node_ip_map():
     """读取 inventory/nodes.yaml, 返回 {节点名: IP} 映射"""
@@ -1705,14 +1712,12 @@ run sd_noauto 0 gw --node wk-edge-01 --ip 192.168.6.101 --no-sd-automount --dry-
 run cross_seg 0 gw --node wk-edge-01 --ip 10.0.0.9 --dry-run
 run ip_clash 0 all --node wk-edge-01 --ip 192.168.6.101 --dry-run
 run nodetect 0 gw --node wk-edge-01 --ip 10.0.0.9 --no-detect --dry-run
-
-rm -f "$PROBE"
 """, encoding="utf-8")
 
     try:
         r = subprocess.run(["bash", str(harness)], capture_output=True, text=True,
                            encoding="utf-8", errors="replace",
-                           stdin=subprocess.DEVNULL, timeout=180)
+                           stdin=subprocess.DEVNULL, timeout=HARNESS_TIMEOUT)
         out = r.stdout
 
         def case(tag):
@@ -3483,10 +3488,11 @@ echo "###DONE"
 def test_network_audit():
     """测试 25: 网络通路 / 防火墙 / SSH 通道自检
 
-    背景: 本仓库脚本不主动改防火墙 (唯一动 iptables 的是 wg-quick 的
-    PostUp/PostDown), 但现场真正把人挡在门外的是别的: INPUT 策略 DROP
-    却没放行 SSH、ufw 启用后没放行、Docker 把 FORWARD 置 DROP 打断 wg 转发、
-    以及通过 SSH 远端改静态 IP 把自己的连接改断。
+    背景: 本仓库脚本不主动改防火墙 (wg0.conf 的 PostUp/PostDown 规则自
+    v1.4.5 起默认关闭, 改由 setup_firewall.sh 统一管理), 但现场真正把人
+    挡在门外的是别的: INPUT 策略 DROP 却没放行 SSH、ufw 启用后没放行、
+    Docker 把 FORWARD 置 DROP 打断 wg 转发、以及通过 SSH 远端改静态 IP
+    把自己的连接改断。
     """
     print("\n" + "=" * 60)
     print("测试 25: 防火墙与 SSH 通道自检")
@@ -3701,7 +3707,7 @@ echo "###DONE"
     try:
         r = subprocess.run(["bash", _posix(probe)], capture_output=True, text=True,
                            encoding="utf-8", errors="replace",
-                           stdin=subprocess.DEVNULL, timeout=180)
+                           stdin=subprocess.DEVNULL, timeout=HARNESS_TIMEOUT)
         out = r.stdout
 
         def case_block(tag):
@@ -3794,8 +3800,12 @@ exit 0
 
         env_g = dict(os.environ)
         env_g["PATH"] = f"{_posix(mockbin)}:/usr/bin:/bin"
+        # 2026-09-15 起 wg0.conf 默认**不**写 PostUp/PostDown（防火墙统一交给
+        # setup_firewall.sh）。这里要验证的是那段规则本身的正确性，所以显式打开开关
+        # 把它取出来 —— 默认关闭的行为由测试 27 负责断言。
+        env_g["ONECLOUD_WG_FIREWALL"] = "1"
         subprocess.run(["bash", "scripts/wireguard-setup.sh"], cwd=str(gk_root),
-                       capture_output=True, env=env_g, timeout=180)
+                       capture_output=True, env=env_g, timeout=HARNESS_TIMEOUT)
         conf = gk_root / "node-wk-edge-01" / "wireguard" / "wg0.conf"
         if not conf.exists():
             log_fail("临时副本里未生成 wg0.conf", str(conf))
@@ -3806,7 +3816,7 @@ exit 0
                     post_up = line.split("=", 1)[1].strip()
                     break
             if not post_up:
-                log_fail("wg0.conf 里没有 PostUp 行")
+                log_fail("ONECLOUD_WG_FIREWALL=1 时 wg0.conf 仍未生成 PostUp 行")
             else:
                 env = dict(os.environ)
                 env["PATH"] = f"{_posix(mockbin)}:/usr/bin:/bin"
@@ -4020,6 +4030,272 @@ def test_panel_install_params():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_deploy_no_firewall():
+    """测试 27: 部署脚本零防火墙写入 + 防火墙建议清单生成
+
+    约定 (2026-09-15):
+      1. onecloud 的部署脚本**不改节点防火墙** —— 不写 iptables/ip6tables,
+         不下发 ufw / firewall-cmd / nft, 生成的 wg0.conf 默认也不带
+         PostUp/PostDown 规则;
+      2. 节点部署完毕后生成一份「防火墙设置建议清单」(docs/firewall/<节点>.txt),
+         清单里的 DSL 行可直接录入 setup_firewall.sh;
+      3. 真正调整防火墙的唯一入口是人手动执行 setup_firewall.sh。
+    """
+    print("\n" + "=" * 60)
+    print("测试 27: 部署零防火墙改动 + 防火墙建议清单")
+    print("=" * 60)
+
+    rec = SCRIPTS_DIR / "firewall-recommend.sh"
+    dep = SCRIPTS_DIR / "deploy.sh"
+    wg = SCRIPTS_DIR / "wireguard-setup.sh"
+    gk = PROJECT_ROOT / "node-wk-edge-01" / "wireguard" / "generate-keys.sh"
+    init_sh = PROJECT_ROOT / "init" / "init.sh"
+    missing = [str(p) for p in (rec, dep, wg, gk, init_sh) if not p.exists()]
+    if missing:
+        log_fail(f"必要文件缺失: {missing}")
+        return
+
+    # ---------------- A) 静态: 部署侧不出现"会写入"的防火墙命令 ----------------
+    # 判定: 去掉注释与 heredoc 正文后, 以防火墙命令开头且带写动作的行 = 违规。
+    #       (firewall-recommend.sh 的 heredoc 里是给人看的示例命令, 不算执行)
+    fw_bin_re = re.compile(r"^(?:sudo\s+)?(iptables|ip6tables|nft|ufw|firewall-cmd)\b")
+    fw_write_re = re.compile(
+        r"(?<![-\w])(-A|-I|-D|-P|-F|-X|-N|-R)\b"
+        r"|(?<![-\w])(add|delete|flush|allow|deny|enable|disable|reload)\b"
+        r"|--(?:add|remove|permanent|reload|set-default-zone)"
+    )
+
+    def _executable_lines(path):
+        """粗略取出"会真正执行"的行: 跳过注释与 heredoc 正文。"""
+        out, heredoc = [], None
+        for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if heredoc is not None:
+                if raw.strip() == heredoc:
+                    heredoc = None
+                continue
+            s = raw.strip()
+            if not s or s.startswith("#"):
+                continue
+            m = re.search(r"<<-?\s*[\"']?([A-Za-z_][A-Za-z0-9_]*)[\"']?", raw)
+            if m:
+                heredoc = m.group(1)
+            out.append(raw)
+        return out
+
+    scan_files = sorted(SCRIPTS_DIR.glob("*.sh")) + [init_sh, gk]
+    offenders = []
+    for f in scan_files:
+        for ln, line in enumerate(_executable_lines(f), 1):
+            s = line.strip()
+            if not fw_bin_re.match(s):
+                continue
+            # 先把引号里的内容抹掉: `ufw status ... | grep -qi 'Default: allow'`
+            # 是在**读**状态, 里面的 allow 不是动作。
+            probe = re.sub(r"'[^']*'", "''", s)
+            probe = re.sub(r'"[^"]*"', '""', probe)
+            if fw_write_re.search(probe):
+                offenders.append(f"{f.name}:{ln}: {s[:90]}")
+    if not offenders:
+        log_pass(f"部署侧 {len(scan_files)} 个脚本均无会写入的防火墙命令")
+    else:
+        log_fail("部署脚本里出现会改防火墙的命令",
+                 "改防火墙只能由 setup_firewall.sh 执行:\n     " + "\n     ".join(offenders[:8]))
+
+    wsrc = wg.read_text(encoding="utf-8")
+    gsrc = gk.read_text(encoding="utf-8")
+    for tag, src, has_flags in (("wireguard-setup.sh", wsrc, True),
+                                ("generate-keys.sh", gsrc, False)):
+        if 'WG_FIREWALL="${ONECLOUD_WG_FIREWALL:-0}"' in src:
+            log_pass(f"{tag}: ONECLOUD_WG_FIREWALL 默认 0 (默认不写防火墙规则)")
+        else:
+            log_fail(f"{tag}: 缺少 WG_FIREWALL 默认关闭的判定")
+        if has_flags:
+            if "--with-wg-firewall" in src and "--no-wg-firewall" in src:
+                log_pass(f"{tag}: 保留显式开关 (--with-wg-firewall / --no-wg-firewall)")
+            else:
+                log_fail(f"{tag}: 缺少显式开关")
+        else:
+            if "ONECLOUD_WG_FIREWALL=1" in src:
+                log_pass(f"{tag}: 节点本地一次性脚本, 用 ONECLOUD_WG_FIREWALL=1 恢复自带规则")
+            else:
+                log_fail(f"{tag}: 未说明如何恢复自带规则")
+
+    if "firewall-recommend.sh" in dep.read_text(encoding="utf-8"):
+        log_pass("deploy.sh 分发完成后生成防火墙建议清单 (控制端静态生成, 不碰节点)")
+    else:
+        log_fail("deploy.sh 未接入建议清单生成")
+
+    isrc = init_sh.read_text(encoding="utf-8")
+    if "maint_fw_recommend" in isrc and "firewall-recommend.sh" in isrc:
+        log_pass("init.sh 维护菜单提供「生成防火墙设置建议清单」入口")
+    else:
+        log_fail("init.sh 未提供建议清单入口")
+
+    # ---------------- B/C 行为验证 ----------------
+    def _posix(p):
+        s = Path(p).as_posix()
+        m = re.match(r"^([A-Za-z]):/(.*)$", s)
+        return f"/{m.group(1).lower()}/{m.group(2)}" if m else s
+
+    tmpdir = Path(tempfile.mkdtemp(prefix="oc_t27_"))
+    try:
+        # 复制一份最小项目树: 让 wireguard-setup.sh 的产物落在临时目录里
+        proj = tmpdir / "proj"
+        shutil.copytree(SCRIPTS_DIR, proj / "scripts",
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        shutil.copytree(PROJECT_ROOT / "inventory", proj / "inventory",
+                        ignore=shutil.ignore_patterns("*.local.yaml", "*.bak"))
+
+        # mock wg: genkey 输出固定私钥, pubkey 把 stdin 加前缀
+        mockbin = tmpdir / "mockbin"
+        mockbin.mkdir()
+        (mockbin / "wg").write_text(
+            "#!/bin/bash\n"
+            'case "${1:-}" in\n'
+            '  genkey) echo "cHJpdmF0ZS1rZXktZm9yLXRlc3QtMDAwMDAwMDAwMDAwMDA9" ;;\n'
+            '  pubkey) sed "s/^/PUBKEY_/" ;;\n'
+            "  *) exit 1 ;;\n"
+            "esac\n", encoding="utf-8", newline="\n")
+        try:
+            os.chmod(mockbin / "wg", 0o755)
+        except OSError:
+            pass
+
+        env = dict(os.environ)
+        env["PATH"] = _posix(mockbin) + ":/usr/bin:/bin"
+        env["BASH_ENV"] = ""
+        env.pop("ONECLOUD_WG_FIREWALL", None)
+        env.pop("ENV", None)
+
+        def run_sh(argv, extra_env=None, cwd=proj, timeout=120):
+            # 注意: argv 里的路径要用 POSIX 形式 (给 bash), 但 cwd 必须是
+            # Windows 原生路径 —— Python 的 CreateProcess 不认 /d/... 形式。
+            e = dict(env)
+            if extra_env:
+                e.update(extra_env)
+            return subprocess.run(["bash"] + argv, env=e, cwd=str(cwd),
+                                  capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace",
+                                  stdin=subprocess.DEVNULL, timeout=timeout)
+
+        wg_script = _posix(proj / "scripts" / "wireguard-setup.sh")
+        conf = proj / "node-wk-edge-01" / "wireguard" / "wg0.conf"
+
+        # ---- B1) 默认: wg0.conf 不带任何防火墙规则 ----
+        r1 = run_sh([wg_script, "gen"])
+        if r1.returncode == 0 and conf.exists():
+            body = conf.read_text(encoding="utf-8", errors="replace")
+            # 只看会生效的行: 注释里刻意留了"手工该怎么做"的示例命令, 那是说明
+            bad = [l for l in body.splitlines()
+                   if not l.lstrip().startswith("#")
+                   and ("iptables" in l or "PostUp" in l or "PostDown" in l)]
+            if not bad:
+                log_pass("默认生成的 wg0.conf 不含生效的 PostUp/PostDown/iptables 行")
+            else:
+                log_fail("默认 wg0.conf 仍自带防火墙规则", "\n".join(bad))
+            if "setup_firewall.sh" in body:
+                log_pass("wg0.conf 内注明「防火墙规则由 setup_firewall.sh 统一管理」")
+            else:
+                log_fail("wg0.conf 未说明防火墙归属", "现场会误以为规则已由 wg 自带")
+        else:
+            log_fail(f"wireguard-setup.sh gen 未生成 wg0.conf (rc={r1.returncode})",
+                     (r1.stdout + r1.stderr)[-400:])
+
+        # ---- B2) 显式开关: 才写规则, 且幂等、不写死网卡 ----
+        r2 = run_sh([wg_script, "gen"], extra_env={"ONECLOUD_WG_FIREWALL": "1"})
+        if r2.returncode == 0 and conf.exists():
+            body2 = conf.read_text(encoding="utf-8", errors="replace")
+            if "PostUp" in body2 and "PostDown" in body2 and "iptables -C" in body2:
+                log_pass("ONECLOUD_WG_FIREWALL=1 时才写 PostUp/PostDown, 且用 -C 探测 (幂等)")
+            else:
+                log_fail("显式开关未按预期生成规则",
+                         "\n".join(l for l in body2.splitlines()
+                                   if "Post" in l or "iptables" in l)[:400])
+            if "-o eth0" in body2 or "-o end0" in body2:
+                log_fail("MASQUERADE 写死了网卡", "玩客云可能是 end0, NAT 会静默失效")
+            else:
+                log_pass("MASQUERADE 的出网网卡由节点侧探测 (不写死 eth0/end0)")
+        else:
+            log_fail(f"开关模式下 gen 失败 (rc={r2.returncode})",
+                     (r2.stdout + r2.stderr)[-300:])
+
+        # ---- C1) 建议清单: DSL 语法 ----
+        rec_path = _posix(rec)
+        dsl = run_sh([rec_path, "--emit-dsl"], cwd=PROJECT_ROOT, timeout=60)
+        lines = [l.strip() for l in dsl.stdout.splitlines() if l.strip()]
+        dsl_re = re.compile(
+            r"^(in|out)\s+(accept|drop)\s+(tcp|udp|any)\s+(\S+)\s+(\S+)\s+(\S+)$")
+        bad_lines = [l for l in lines if not dsl_re.match(l)]
+        if lines and not bad_lines:
+            log_pass(f"建议清单输出 {len(lines)} 条 DSL 行, 全部符合 6 列语法 (可直接录入)")
+        else:
+            log_fail("建议清单 DSL 行格式不合法",
+                     f"bad={bad_lines[:3]} lines={lines[:3]}")
+
+        not_accept = [l for l in lines if not l.startswith("in accept")]
+        if lines and not not_accept:
+            log_pass("建议清单只给放行建议 (无 drop/out 行, 不替用户做封禁决策)")
+        elif not_accept:
+            log_fail("建议清单里混入了非放行建议", str(not_accept[:3]))
+
+        # ---- C2) 端口来源与 services.yaml / 节点清单一致 ----
+        got = set()
+        for l in lines:
+            m = dsl_re.match(l)
+            if m:
+                got.add((m.group(3), m.group(4)))
+        need = [("tcp", "22"), ("udp", "51820"), ("tcp", "9000"), ("tcp", "3000"),
+                ("udp", "53"), ("tcp", "9090"), ("tcp", "8123"), ("tcp", "8080"),
+                ("tcp", "8083"), ("tcp", "8384"), ("tcp", "22000"), ("udp", "21027"),
+                ("tcp", "6800"), ("tcp", "631"), ("tcp", "222")]
+        absent = [f"{p}/{n}" for p, n in need if (p, n) not in got]
+        if not absent:
+            log_pass(f"清单覆盖 {len(need)} 个清单声明的端口 (SSH/面板/WG/host 网络/容器映射)")
+        else:
+            log_fail("清单漏了 services.yaml 里声明的端口", f"缺失: {absent}")
+
+        # ---- C3) 完整报告: 变量端口要显式提示人工确认 ----
+        rep = run_sh([rec_path, "--stdout"], cwd=PROJECT_ROOT, timeout=60)
+        text = rep.stdout
+        if "onecloud 的部署脚本不会改防火墙" in text and "setup_firewall.sh" in text:
+            log_pass("清单开宗明义说明「部署脚本不改防火墙」并指明唯一执行入口")
+        else:
+            log_fail("清单未说明防火墙归属")
+
+        edge_txt = rep.stdout.split(" OneCloud 防火墙建议清单 — wk-iot-02")[0]
+        iot_txt = text.split(" OneCloud 防火墙建议清单 — wk-iot-02")[-1]
+        if "MASQUERADE" in edge_txt and "sysctl" in edge_txt:
+            log_pass("Hub 节点给出 WireGuard 转发/NAT 命令段 (DSL 表达不了的部分)")
+        else:
+            log_fail("Hub 节点缺少 FORWARD/NAT 命令段", "wg 客户端会上不了网")
+        if "MASQUERADE" not in iot_txt:
+            log_pass("非 Hub 节点不给转发/NAT 命令段 (避免误导)")
+        else:
+            log_fail("非 Hub 节点也给了转发命令")
+
+        if "MEMOS_PORT" in text and "人工确认" in text:
+            log_pass("变量端口 (如 ${MEMOS_PORT}) 单独列出要求人工确认, 未静默丢弃")
+        else:
+            log_fail("变量端口被静默丢弃", "清单必须显式提示人工确认")
+
+        # ---- C4) 落盘 ----
+        outdir = tmpdir / "fwout"
+        r5 = run_sh([rec_path, "--out", _posix(outdir)], cwd=PROJECT_ROOT, timeout=60)
+        made = sorted(p.name for p in outdir.glob("*.txt")) if outdir.exists() else []
+        if r5.returncode == 0 and len(made) >= 3:
+            okfile = all("in accept tcp 22" in (outdir / n).read_text(
+                encoding="utf-8", errors="replace") for n in made)
+            if okfile:
+                log_pass(f"建议清单按节点落盘: {', '.join(made)}")
+            else:
+                log_fail("落盘的清单缺少 SSH 放行行", str(made))
+        else:
+            log_fail(f"建议清单落盘失败 (rc={r5.returncode})", (r5.stdout + r5.stderr)[-300:])
+
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 # ============ 主程序 ============
 def main():
     print("=" * 60)
@@ -4055,6 +4331,7 @@ def main():
         ("bootstrap apt 可选化", test_bootstrap_apt_optional),
         ("防火墙与 SSH 自检", test_network_audit),
         ("面板安装参数", test_panel_install_params),
+        ("部署零防火墙改动与建议清单", test_deploy_no_firewall),
     ]
     
     for test_name, test_func in tests:

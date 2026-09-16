@@ -1,0 +1,95 @@
+================================================================
+ OneCloud 防火墙建议清单 — wk-edge-01 (Edge Gateway)
+ 生成时间: 2026-09-15 18:03:41
+ 节点地址: 192.168.1.101    WireGuard: 10.8.0.101    主机名: edge-01
+ 角色    : edge-gateway
+================================================================
+
+【0】先读这段
+  这是**建议**清单, 不是配置。onecloud 的部署脚本不会改防火墙:
+  改防火墙的唯一入口是你手动执行的 setup_firewall.sh。
+  确认下面的内容符合预期后, 再逐条录入并应用。
+
+【1】建议的默认策略  (setup_firewall.sh 主菜单 4)
+  INPUT   = DROP      入站白名单: 没列出来的都不放行
+  OUTPUT  = ACCEPT    出站放行; 只有在你有明确出站管控需求时才改成 DROP
+  FORWARD = ACCEPT    **保持 ACCEPT** —— Docker / 容器网络 / 网桥依赖它,
+                      改成 DROP 会让容器直接断网
+
+【2】建议放行的入站规则  (主菜单 2 → 1/2/3 录入)
+
+  ── 必需 (任意来源) ──
+in accept tcp 22 - -
+in accept udp 51820 - -
+
+  ── 仅内网 (来源限定 192.168.1.0/24) ──
+in accept tcp 9000 192.168.1.0/24 -
+in accept tcp 3000 192.168.1.0/24 -
+in accept tcp 53 192.168.1.0/24 -
+in accept udp 53 192.168.1.0/24 -
+in accept tcp 9090 192.168.1.0/24 -
+
+  逐条说明:
+  * tcp/22  SSH 管理入口 —— 需从任意来源可达
+  * tcp/9000  集群面板 (PANEL_PORT) —— 仅内网 (已限定来源 192.168.1.0/24)
+  * udp/51820  WireGuard 端点 (外网客户端接入) —— 需从任意来源可达
+  * tcp/3000  adguard (host 网络) —— 公网经 Cloudflare Tunnel, 无需开公网端口; 下面按"仅内网"给
+  * tcp/53  adguard (host 网络) —— 公网经 Cloudflare Tunnel, 无需开公网端口; 下面按"仅内网"给
+  * udp/53  adguard (host 网络) —— 公网经 Cloudflare Tunnel, 无需开公网端口; 下面按"仅内网"给
+  * tcp/9090  clash —— 仅内网 (已限定来源 192.168.1.0/24)
+
+  说明: 内网服务不限定来源也能用, 但一旦这台机器有别的网段可达 (WireGuard
+        客户端、访客网络), 未限来源就等于对所有网段开放。限定来源更安全。
+
+  ── 需要你人工确认 (端口不是字面值, 无法直接写成规则) ──
+  ?  tcp/${MEMOS_PORT}  memos
+
+  这些端口在 services.yaml 里写的是变量 (如 ${MEMOS_PORT}), 实际取值在
+  节点 .env 里。确认后用  in accept tcp <真实端口> 192.168.1.0/24 -  录入。
+
+【3】SSH 防暴力破解  (主菜单 5)
+  建议: 启用 / 端口 22 / 时间窗 60 秒 / 触发 5 次
+  各后端的实现: iptables 用 recent, nftables 用 meter, firewalld 用 rich
+  rule limit, ufw 用 limit —— 语义一致, 换后端不用改思路。
+
+【4】DSL 表达不了的部分 —— WireGuard 转发 (本节点是 Hub, 必做)
+  转发 + NAT 不是"放行端口", DSL 里没有对应写法, 需要在节点上单独执行:
+
+    WG_IF=$(ip -4 route show default scope global | awk '{print $5; exit}')
+    iptables -C FORWARD -i wg0 -j ACCEPT || iptables -A FORWARD -i wg0 -j ACCEPT
+    iptables -C FORWARD -o wg0 -j ACCEPT || iptables -A FORWARD -o wg0 -j ACCEPT
+    iptables -t nat -C POSTROUTING -o "$WG_IF" -j MASQUERADE || \
+        iptables -t nat -A POSTROUTING -o "$WG_IF" -j MASQUERADE
+
+  三条注意:
+    1. $WG_IF 必须在节点上探测 —— 玩客云刷 Armbian 后网卡常是 end0 而非
+       eth0, 写死会让 MASQUERADE 静默失效 (wg 握手正常, 客户端上不了网)。
+    2. 用 -C 探测后再 -A, 反复 up/down 才不会把规则堆成一摞。
+    3. 本机的 wg0.conf 默认**不**自带这些规则 (见 wg0.conf 里的注释),
+       就是为了避免和这份清单里的规则互相覆盖。
+
+  另外确认内核转发已开:
+    sysctl -w net.ipv4.ip_forward=1
+    # 持久化: 写入 /etc/sysctl.d/99-onecloud.conf
+
+【5】应用与验证步骤
+  1. 先确认你当前 SSH 占用的端口就是上面放行的那个:
+       ss -tlnp | grep sshd      # 或 grep -i '^Port' /etc/ssh/sshd_config
+     setup_firewall.sh 会自动读 SSH_CONNECTION / sshd_config, 通常在 22。
+  2. 在节点上执行:  sudo bash setup_firewall.sh
+  3. 按【2】录入规则, 按【1】设默认策略, 按【3】开 SSH 防暴破。
+  4. 主菜单 7) 应用规则到运行时(试运行, 需确认)
+     —— 应用后会给你 20 秒确认窗口: **另开一个 SSH 窗口**验证能登录,
+        确认没问题再在原窗口按 y; 不按或超时会自动回滚。
+  5. 主菜单 8) 保存并持久化(开机自启)
+  6. 主菜单 1) 查看当前状态 复核。
+
+【6】回滚
+  * setup_firewall.sh 主菜单 9) 备份与回滚
+  * 主菜单 10) 重置为全放行
+  * 应急(本地终端): iptables -P INPUT ACCEPT; iptables -F
+
+【7】本次未做的事
+  * 没有检查节点上的现有规则 —— 本清单是静态生成的, 不含任何实际查询。
+    应用前请先用主菜单 1) 看一眼现状, 避免覆盖掉别的工具写的规则。
+  * 没有开任何端口。防火墙仍然是"没动过"的状态。

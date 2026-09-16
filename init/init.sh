@@ -927,6 +927,23 @@ maint_update() {
     pause
 }
 
+# 生成防火墙设置建议清单
+#
+# 部署脚本不改防火墙, 所以"该开哪些端口"这件事需要一个显式出口:
+# 本函数只做静态生成 (读 nodes.yaml + services.yaml), 不碰运行时规则。
+maint_fw_recommend() {
+    header "生成防火墙设置建议清单"
+    echo -e "  ${DIM}onecloud 的部署脚本不改任何节点的防火墙。${NC}"
+    echo -e "  ${DIM}本操作按节点清单与服务声明, 静态算出「该放行哪些端口」,${NC}"
+    echo -e "  ${DIM}写入 docs/firewall/<节点>.txt; 真正改规则的是你手动执行的 setup_firewall.sh。${NC}"
+    echo ""
+    if run_script "生成防火墙建议清单" \
+        bash "${SCRIPTS_DIR}/firewall-recommend.sh"; then
+        log_info "下一步: 把清单拷到对应节点, 执行 setup_firewall.sh 逐条录入并应用"
+    fi
+    pause
+}
+
 menu_maintenance() {
     while :; do
         header "节点维护"
@@ -935,13 +952,15 @@ menu_maintenance() {
             "备份配置与数据" \
             "从备份恢复" \
             "批量更新镜像 / 系统包" \
+            "生成防火墙设置建议清单 (不改防火墙, 供 setup_firewall.sh 使用)" \
             "返回主菜单"
         case "$MENU_CHOICE" in
             1) maint_health ;;
             2) maint_backup ;;
             3) maint_restore ;;
             4) maint_update ;;
-            5) return ;;
+            5) maint_fw_recommend ;;
+            6) return ;;
         esac
     done
 }
@@ -1187,7 +1206,8 @@ menu_selfcheck() {
              bootstrap.sh deploy.sh \
              health-check.sh backup.sh \
              restore.sh update-all.sh install-services.sh setup.sh \
-             wireguard-setup.sh gen-panel-config.sh gen-node-env.sh; do
+             wireguard-setup.sh gen-panel-config.sh gen-node-env.sh \
+             firewall-recommend.sh; do
         if [ -f "${SCRIPTS_DIR}/${s}" ]; then
             log_ok "存在: scripts/${s}"
         else

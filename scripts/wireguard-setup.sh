@@ -43,6 +43,20 @@ HUB_NODE="$(node_name_by_role edge-gateway 2>/dev/null || echo "${NODE_NAMES[0]}
 WG_PORT="$NET_WG_PORT"
 WG_DNS="$(node_wg_ip "$HUB_NODE" 2>/dev/null || true)"
 
+# 是否让生成的 wg0.conf 自带 iptables 规则 (PostUp/PostDown)
+#
+# 默认 **关闭**: 防火墙策略统一由一个入口 (setup_firewall.sh) 管理。
+# 让 wg-quick 的 PostUp/PostDown 也跟着改防火墙, 会带来两个麻烦:
+#   1) 反复 wg-quick up/down 后规则会与 setups 叠加, 出问题时很难判断
+#      "到底是谁在拦";
+#   2) 与集中式防火墙脚本互相覆盖 —— 后跑的那个说了算。
+# 需要恢复成"自带规则"时用 --with-wg-firewall 或 ONECLOUD_WG_FIREWALL=1。
+WG_FIREWALL="${ONECLOUD_WG_FIREWALL:-0}"
+case "$WG_FIREWALL" in
+    1|true|yes|on) WG_FIREWALL=1 ;;
+    *)             WG_FIREWALL=0 ;;
+esac
+
 # wg0.conf 的 DNS 必须是具体地址: 清单里若写 dhcp/auto 等标记 (= 由 DHCP 自动获取),
 # 客户端拿到这个字面值无法解析, 这里统一回退到公共 DNS
 case "$(printf '%s' "${NET_DNS:-}" | tr '[:upper:]' '[:lower:]' | tr -d ' ')" in
@@ -70,10 +84,19 @@ usage() {
 
 选项 (用于 gen):
   -d, --domain DOMAIN    WireGuard 端点域名 (默认: ${DOMAIN})
+      --with-wg-firewall 让 wg0.conf 自带 iptables 规则 (PostUp/PostDown)
+      --no-wg-firewall   不写任何防火墙规则 (默认)
+
+说明:
+  默认**不**在 wg0.conf 里写防火墙规则。Hub 节点需要的 FORWARD / NAT 转发
+  规则请用 ./scripts/firewall-recommend.sh 生成的清单, 由 setup_firewall.sh
+  或手工统一落地 —— 避免 wg-quick 与集中式防火墙脚本互相覆盖。
+  也可用环境变量 ONECLOUD_WG_FIREWALL=1 打开自带规则。
 
 示例:
   $0
   $0 gen --domain example.com
+  $0 gen --with-wg-firewall
   $0 add peer wk-backup-04 <LAN_IP> <WG_IP>
 EOF
 }
@@ -154,26 +177,42 @@ write_node_conf() {
         echo "DNS = ${WG_DNS}, ${WG_NET_DNS}"
         echo ""
         if [ "$name" = "$HUB_NODE" ]; then
-            # 作为 Hub 转发流量 (PostUp/PostDown 各只允许出现一次)
-            #
-            # 两条硬约束 (都是实测踩过的):
-            #   1) 先 -C 探测再 -A: wg-quick 反复 up 时规则不会越堆越多
-            #      (堆起来之后 PostDown 只删一条, 剩下的会永久留在表里,
-            #       默认策略被改成 DROP 的机器上尤其难查)。PostDown 同理。
-            #   2) 出网网卡在**节点上**运行时探测, 不写死 eth0。
-            #      玩客云刷 Armbian 后网卡常是 end0, 写死 eth0 会让 MASQUERADE
-            #      静默失效 —— 表现是 wg 握手正常、但客户端上不了网。
-            #
-            # 注意: 下面这些 \$ 是刻意转义的 —— 要让它们原样写进 wg0.conf,
-            #       由节点上的 wg-quick(eval) 展开, 而不是在控制端生成时就展开。
-            local hub_up hub_down
-            hub_up='WG_IF=$(ip -4 route show default scope global 2>/dev/null | awk "{print \$5; exit}"); [ -n "$WG_IF" ] || WG_IF=eth0; iptables -C FORWARD -i wg0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -i wg0 -j ACCEPT; iptables -C FORWARD -o wg0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -o wg0 -j ACCEPT; iptables -t nat -C POSTROUTING -o "$WG_IF" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o "$WG_IF" -j MASQUERADE'
-            hub_down='WG_IF=$(ip -4 route show default scope global 2>/dev/null | awk "{print \$5; exit}"); [ -n "$WG_IF" ] || WG_IF=eth0; iptables -D FORWARD -i wg0 -j ACCEPT 2>/dev/null; iptables -D FORWARD -o wg0 -j ACCEPT 2>/dev/null; iptables -t nat -D POSTROUTING -o "$WG_IF" -j MASQUERADE 2>/dev/null'
-            echo "# 转发 + NAT + 放行 WireGuard 入站"
-            echo "#   - 规则用 -C 探测后再添加, 重复 up 不会堆积"
-            echo "#   - 出网网卡在节点上运行时探测 (玩客云可能是 end0 而非 eth0)"
-            echo "PostUp = ${hub_up}; iptables -C INPUT -p udp --dport ${WG_PORT} -j ACCEPT 2>/dev/null || iptables -A INPUT -p udp --dport ${WG_PORT} -j ACCEPT"
-            echo "PostDown = ${hub_down}; iptables -D INPUT -p udp --dport ${WG_PORT} -j ACCEPT 2>/dev/null || true"
+            if [ "$WG_FIREWALL" = "1" ]; then
+                # 作为 Hub 转发流量 (PostUp/PostDown 各只允许出现一次)
+                #
+                # 两条硬约束 (都是实测踩过的):
+                #   1) 先 -C 探测再 -A: wg-quick 反复 up 时规则不会越堆越多
+                #      (堆起来之后 PostDown 只删一条, 剩下的会永久留在表里,
+                #       默认策略被改成 DROP 的机器上尤其难查)。PostDown 同理。
+                #   2) 出网网卡在**节点上**运行时探测, 不写死 eth0。
+                #      玩客云刷 Armbian 后网卡常是 end0, 写死 eth0 会让 MASQUERADE
+                #      静默失效 —— 表现是 wg 握手正常、但客户端上不了网。
+                #
+                # 注意: 下面这些 \$ 是刻意转义的 —— 要让它们原样写进 wg0.conf,
+                #       由节点上的 wg-quick(eval) 展开, 而不是在控制端生成时就展开。
+                local hub_up hub_down
+                hub_up='WG_IF=$(ip -4 route show default scope global 2>/dev/null | awk "{print \$5; exit}"); [ -n "$WG_IF" ] || WG_IF=eth0; iptables -C FORWARD -i wg0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -i wg0 -j ACCEPT; iptables -C FORWARD -o wg0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -o wg0 -j ACCEPT; iptables -t nat -C POSTROUTING -o "$WG_IF" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o "$WG_IF" -j MASQUERADE'
+                hub_down='WG_IF=$(ip -4 route show default scope global 2>/dev/null | awk "{print \$5; exit}"); [ -n "$WG_IF" ] || WG_IF=eth0; iptables -D FORWARD -i wg0 -j ACCEPT 2>/dev/null; iptables -D FORWARD -o wg0 -j ACCEPT 2>/dev/null; iptables -t nat -D POSTROUTING -o "$WG_IF" -j MASQUERADE 2>/dev/null'
+                echo "# 转发 + NAT + 放行 WireGuard 入站"
+                echo "#   - 规则用 -C 探测后再添加, 重复 up 不会堆积"
+                echo "#   - 出网网卡在节点上运行时探测 (玩客云可能是 end0 而非 eth0)"
+                echo "PostUp = ${hub_up}; iptables -C INPUT -p udp --dport ${WG_PORT} -j ACCEPT 2>/dev/null || iptables -A INPUT -p udp --dport ${WG_PORT} -j ACCEPT"
+                echo "PostDown = ${hub_down}; iptables -D INPUT -p udp --dport ${WG_PORT} -j ACCEPT 2>/dev/null || true"
+            else
+                # 默认: 本文件不含任何防火墙规则
+                echo "# 本节点是 Hub, 转发需要以下规则, 但**本文件不写它们**。"
+                echo "# 防火墙策略统一由 setup_firewall.sh 管理, 见 node-${name}/firewall-recommend.txt"
+                echo "#"
+                echo "# 需要手工落地时 (在 ${name} 上执行):"
+                echo "#   WG_IF=\$(ip -4 route show default scope global | awk '{print \$5; exit}')"
+                echo "#   iptables -C FORWARD -i wg0 -j ACCEPT  || iptables -A FORWARD -i wg0 -j ACCEPT"
+                echo "#   iptables -C FORWARD -o wg0 -j ACCEPT  || iptables -A FORWARD -o wg0 -j ACCEPT"
+                echo "#   iptables -t nat -C POSTROUTING -o \"\$WG_IF\" -j MASQUERADE || \\"
+                echo "#       iptables -t nat -A POSTROUTING -o \"\$WG_IF\" -j MASQUERADE"
+                echo "#"
+                echo "# 入站端口用 DSL 表达即可:  in accept udp ${WG_PORT} - -"
+                echo "# 若要恢复成 wg-quick 自带规则: ./scripts/wireguard-setup.sh gen --with-wg-firewall"
+            fi
             echo ""
         fi
     } > "$conf"
@@ -247,7 +286,12 @@ cmd_gen() {
     log_warn "  1. 运行 ./scripts/deploy.sh 分发配置到各节点"
     log_warn "  2. 在节点上: cp wg0.conf /etc/wireguard/wg0.conf && chmod 600 /etc/wireguard/wg0.conf"
     log_warn "  3. systemctl enable --now wg-quick@wg0"
-    log_warn "  4. ${HUB_NODE} 节点放行 UDP ${WG_PORT}"
+    log_warn "  4. 放行 UDP ${WG_PORT}（Hub 还需要 FORWARD / MASQUERADE）:"
+    log_warn "     ./scripts/firewall-recommend.sh          # 生成防火墙建议清单"
+    log_warn "     # 清单可直接投喂 setup_firewall.sh, 本脚本不会自己改防火墙"
+    if [ "$WG_FIREWALL" = "1" ]; then
+        log_warn "  注意: 本次用 --with-wg-firewall 生成了自带规则, 与集中式防火墙可能互相覆盖"
+    fi
 }
 
 cmd_add_peer() {
@@ -314,6 +358,8 @@ case "$COMMAND" in
         while [[ $# -gt 0 ]]; do
             case "$1" in
                 -d|--domain) DOMAIN="$2"; shift 2 ;;
+                --with-wg-firewall) WG_FIREWALL=1; shift ;;
+                --no-wg-firewall)   WG_FIREWALL=0; shift ;;
                 *) log_error "未知选项: $1"; usage; exit 1 ;;
             esac
         done

@@ -165,6 +165,37 @@ fsck.ext4 /dev/mmcblk1p1
 4. AdGuard/Clash/aria2 Secret 使用强密码
 5. 不要开放不必要的外部端口
 
+### 7.1 防火墙（v1.5.0 起：部署脚本不碰）
+
+**本项目的部署脚本不改任何节点的防火墙** —— 不写 `iptables`/`ip6tables`，
+不下发 `ufw`/`firewall-cmd`/`nft`，生成 `wg0.conf` 时也**默认不带** `PostUp`/`PostDown`
+规则。改防火墙只有一个入口：你手动执行 `setup_firewall.sh`。
+
+部署完节点后生成「该放行哪些端口」的建议清单：
+
+```bash
+./scripts/firewall-recommend.sh              # 全部节点 -> docs/firewall/<节点>.txt
+./scripts/firewall-recommend.sh --emit-dsl   # 只打印可直接录入的规则行
+```
+
+清单是**静态推算**（读 `inventory/nodes.yaml` + `inventory/services.yaml`），
+不发网络请求、不连节点。内容分三块：
+
+1. **必需规则**：SSH、控制面板、WireGuard（`udp/51820`）
+2. **内网规则**：AdGuard `53`、Grafana `3000` 等只对 LAN 开放的端口
+3. **Hub 节点附加段**：WireGuard 转发/NAT（`sysctl ip_forward`、`FORWARD`、
+   `MASQUERADE`）—— DSL 表达不了，需手工录入
+
+变量端口（如 `${MEMOS_PORT}`）会单独列出并标注"需人工确认"，不会被静默丢弃。
+
+拿到清单后，到对应节点上：把规则行录进 `setup_firewall.sh` →
+`/etc/fw-setup/rules.dsl` → 应用。**应用前务必确认 SSH 放行规则已生效**，
+否则 INPUT 置 DROP 会把自己关在门外。
+
+> 特殊需求：确实要让 WireGuard 自带 iptables 规则（老教程的用法），
+> 用 `ONECLOUD_WG_FIREWALL=1 ./scripts/wireguard-setup.sh gen` 显式打开，
+> 但那会绕开统一入口，需自行确认与清单不冲突。
+
 ## 8. 节点重建
 
 ```bash

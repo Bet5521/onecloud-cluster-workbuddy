@@ -40,7 +40,8 @@ bash init/init.sh
 │     ├── 集群健康巡检
 │     ├── 备份配置与数据
 │     ├── 从备份恢复
-│     └── 批量更新镜像 / 系统包
+│     ├── 批量更新镜像 / 系统包
+│     └── 生成防火墙设置建议清单（静态生成，不改任何防火墙）
 ├── 4) 配置与分发
 │     ├── 分发配置到节点（deploy.sh）
 │     ├── 仅测试节点 SSH 连接
@@ -70,6 +71,7 @@ bash init/init.sh
 | 本机节点初始化 | `scripts/bootstrap.sh`（**不带参数**，由 bootstrap 自己提问） |
 | 集群健康巡检 | `scripts/health-check.sh` |
 | 备份 / 恢复 | `scripts/backup.sh`、`scripts/restore.sh`（`BACKUP_DIR` 由菜单询问后传入） |
+| 生成防火墙设置建议清单 | `scripts/firewall-recommend.sh`（只读清单静态推算，落到 `docs/firewall/`） |
 | 批量更新 | `scripts/update-all.sh`（`-d` / `-s` / `-a`，由菜单选择） |
 | 分发配置 / 测连通 / 预览 / 远程执行 | `scripts/deploy.sh` |
 | 面板配置 / 节点 .env | `scripts/gen-panel-config.sh`、`scripts/gen-node-env.sh` |
