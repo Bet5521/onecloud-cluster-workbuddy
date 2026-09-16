@@ -2,7 +2,7 @@
 
 > 基于玩客云 WS1608 (Amlogic S805, ARMv7, 1GB RAM) 多节点组建的家庭服务集群
 
-**当前版本: v1.5.3**
+**当前版本: v1.5.4**
 
 ---
 
@@ -462,6 +462,54 @@ python3 test_validate.py
   校验功能脚本无硬编码 IP、每个节点 hostname 字段齐全、环境变量覆盖真实生效
 - 验证项从 176 扩至 **184**（全部通过、0 警告）
 - 新增 `inventory/nodes.local.yaml.example` 覆盖模板（真实覆盖文件已 gitignore）
+
+---
+
+## 🚀 v1.5.4 变更说明
+
+**主题：SD 卡工具箱 —— 格式化 / 迁移 / 更换备份，闭环 SD 卡全生命周期管理。**
+
+### 背景
+
+v1.5.3 已实现「安装路径自适应」：无 SD 卡时回退 eMMC 的 `/opt/onecloud`，有 SD 卡时落到 SD。
+但还缺少把「eMMC 上的存量 → SD」「SD 内容 → 换卡备份」打通的运维手段。本版本补上工具箱。
+
+### 新增脚本
+
+- **`scripts/sd-format.sh`**：将 SD 卡整卡分区并格式化为单一 ext4 分区。仅对「可移动 SD 卡」操作，
+  绝不格式化根磁盘；已是 ext4 默认跳过（`--force-fmt` 强制）；支持 `--dry-run` / `--yes`。
+  迁移 / 更换流程检测到「SD 卡非 ext4」时会**自动触发**它。
+- **`scripts/sd-migrate.sh`**：把无 SD 卡期间装在 eMMC 回退目录（`/opt/onecloud`）的组件 / 配置 /
+  依赖文件，经 `rsync -aHAX` 完整迁移到已挂载 SD 卡；若 Docker 数据仍在 eMMC，则一并迁移到
+  `<SD>/docker` 并改写 `/etc/docker/daemon.json` 的 `data-root`。默认保留来源（`--clean` 才删），
+  `--dry-run` 只读预演、不破坏数据。
+- **`scripts/sd-replace.sh`**：更换 SD 卡前，把 SD 卡全部内容 `tar -czf` 打包并转存到已插入的
+  USB 设备（归档名 `onecloud-sd-backup-<主机>-<时间>.tar.gz`，附 SHA256 校验和）。执行前**先校验**
+  USB 已挂载且剩余空间 ≥ SD 数据量 + 预留（默认 512MB），不满足直接中止；绝不把根盘 / SD 自身当 USB。
+- **`scripts/sd-tools.sh`**：交互式入口（菜单 1 迁移 / 2 更换 / 3 格式化 / 0 退出）；
+  也支持非交互透传 `migrate|replace|format [参数]`。
+
+### 共同设计原则
+
+- 设备 / 分区 / 挂载点一律**运行时探测**（`lib-install-path.sh` 的 `sd_probe` / `findmnt` / `lsblk`），
+  不写死 `/dev/mmcblk1` 或 `/mnt/sd`。
+- 复用 `ensure_sd_ready`（探测 → 必要时格式化 ext4 → 挂载 → 评估），与安装路径决策引擎一致。
+- 全部支持 `--dry-run` 预演。
+
+### 前置条件与注意事项
+
+- 前置依赖：`rsync`、`parted`/`sfdisk` + `mkfs.ext4`（e2fsprogs）、`tar`；无头服务器核心装包档已含 `rsync` 与 `parted`。
+- 格式化会清空 SD 卡数据，确认前务必确认无需备份。
+- 迁移建议在**停止相关容器 / 服务**后进行，避免写入导致不一致。
+- 更换备份须先插入空间足够的 USB 设备；大容量 SD 打包可能耗时，可先用 `--dry-run` 预估。
+- 详细功能 / 前置 / 用法 / 注意事项见 [docs/sd-tools.md](docs/sd-tools.md)。
+
+### 验证
+
+- 新增第 **31** 组测试「**SD 卡工具箱（格式化/迁移/更换）**」**24 项**：脚本存在 + 语法 8 + 行为 16
+  （格式化 4 / 迁移 5 / 更换 3 / 调度 3），覆盖自动格式化、根盘拦截、无 SD / 无 USB 拒绝、空间不足拒绝、
+  备份校验与菜单透传。
+- 全量 **496 项 / 31 组**，全部通过。
 
 ---
 

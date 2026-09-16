@@ -5189,6 +5189,215 @@ def test_install_path_adaptive():
 
 
 # ============ 主程序 ============
+def test_sd_tools():
+    """SD 卡工具箱: 格式化 / 迁移 / 更换(备份到 USB) 脚本的行为与前置校验。"""
+    import shutil as _shutil, subprocess as _sp, os as _os, tempfile as _tf, re as _re
+    from pathlib import Path as _P
+
+    _GIT = "C:/Users/betyk/.workbuddy/binaries/PortableGit/versions/1.2.0"
+    BASH_BIN = f"{_GIT}/bin/bash.exe"
+
+    sd_format = SCRIPTS_DIR / "sd-format.sh"
+    sd_migrate = SCRIPTS_DIR / "sd-migrate.sh"
+    sd_replace = SCRIPTS_DIR / "sd-replace.sh"
+    sd_tools = SCRIPTS_DIR / "sd-tools.sh"
+
+    def check(c, m):
+        log_pass(m) if c else log_fail(m)
+
+    # 1. 脚本存在 + 语法
+    for f in (sd_format, sd_migrate, sd_replace, sd_tools):
+        if not f.exists():
+            check(False, f"脚本存在: {f.name}")
+            continue
+        check(True, f"脚本存在: {f.name}")
+        r = _sp.run([BASH_BIN, "-n", str(f)], capture_output=True, text=True,
+                    encoding="utf-8", errors="replace")
+        check(r.returncode == 0, f"语法正确: {f.name}"
+              + ("" if r.returncode == 0 else f" -> {r.stderr[:200]}"))
+
+    # 准备 mockbin
+    tmp = _P(_tf.mkdtemp(prefix="sdt_"))
+    mockbin = tmp / "mockbin"
+    mockbin.mkdir()
+
+    def _pp(x):
+        s = str(x)
+        m = _re.match(r"^([A-Za-z]):/(.*)$", s)
+        return f"/{m.group(1).lower()}/{m.group(2)}" if m else s
+
+    def mock(name, body):
+        p = mockbin / name
+        p.write_text(body, encoding="utf-8", newline="\n")
+        p.chmod(0o755)
+
+    mock("lsblk", '''#!/bin/bash
+if [ "$1" = "-f" ] || [ "$1" = "-fno" ]; then echo "$MOCK_FSTYPE"; exit 0; fi
+case "${MOCK_SCENARIO:-full}" in
+  nousb) echo "mmcblk0 0 disk"; echo "mmcblk1 1 disk" ;;
+  nosd)  echo "mmcblk0 0 disk" ;;
+  *)     echo "mmcblk0 0 disk"; echo "mmcblk1 1 disk"; echo "sdb 1 disk usb" ;;
+esac
+exit 0
+''')
+    mock("findmnt", '''#!/bin/bash
+dev="${!#}"
+if [ "$dev" = "/" ] || [ "$dev" = "/dev/mmcblk0p1" ] || [ "$dev" = "/dev/mmcblk0" ]; then echo "${MOCK_ROOT_SRC:-/}"; exit 0; fi
+if [ "$dev" = "/dev/mmcblk1p1" ] || [ "$dev" = "/dev/mmcblk1" ]; then echo "${MOCK_SD_MP}"; exit 0; fi
+if [ "$dev" = "/dev/sdb1" ] || [ "$dev" = "/dev/sdb" ]; then echo "${MOCK_USB_MP}"; exit 0; fi
+exit 0
+''')
+    mock("mountpoint", '''#!/bin/bash
+case "$2" in "${MOCK_SD_MP}"|"${MOCK_USB_MP}"|"/") exit 0 ;; esac
+exit 1
+''')
+    mock("blkid", '''#!/bin/bash
+echo "$MOCK_FSTYPE"; exit 0
+''')
+    mock("df", '''#!/bin/bash
+p="$2"
+if [ "$p" = "${MOCK_USB_MP}" ]; then free="${MOCK_USB_FREE:-100000}"; else free="90000"; fi
+echo -e "Filesystem\\t1024-blocks\\tUsed\\tAvailable\\tUse%\\tMounted"
+echo -e "dev\\t100000\\t100\\t${free}\\t1%\\t${p}"
+exit 0
+''')
+    mock("du", '''#!/bin/bash
+if [ "$1" = "-sm" ]; then echo "50\\t$2"; exit 0; fi
+if [ "$1" = "-h" ]; then echo "10M\\t$2"; exit 0; fi
+echo "50\\t$2"; exit 0
+''')
+    mock("tar", '''#!/bin/bash
+f=""
+while [ $# -gt 0 ]; do case "$1" in -f) f="$2"; shift 2;; *) shift;; esac; done
+echo backup > "$f"; exit 0
+''')
+    mock("sha256sum", '''#!/bin/bash
+echo "abc123  $1"; exit 0
+''')
+    mock("hostname", '''#!/bin/bash
+echo testhost; exit 0
+''')
+    mock("rsync", '''#!/bin/bash
+echo "rsync $*" >> "${FMT_LOG}"; exit 0
+''')
+    for c in ("parted", "mkfs.ext4", "sfdisk", "partprobe", "mount"):
+        mock(c, f'''#!/bin/bash
+echo "{c} $*" >> "$FMT_LOG"; exit 0
+''')
+
+    sdmount = tmp / "sdmount"; sdmount.mkdir()
+    usbmount = tmp / "usbmount"; usbmount.mkdir()
+    src = tmp / "src"; src.mkdir(); (src / "app.conf").write_text("x")
+    fmtlog = tmp / "fmt.log"
+
+    env = dict(_os.environ)
+    env["PATH"] = f"{_pp(mockbin)};{_GIT}/usr/bin;{_GIT}/bin;{env.get('PATH', '')}"
+    env["OC_TEST_NO_SYSBLOCK"] = "1"
+    env["MOCK_SD_MP"] = _pp(sdmount)
+    env["MOCK_USB_MP"] = _pp(usbmount)
+    env["ONECLOUD_USB_TEST_PART"] = "/dev/sdb1"
+    env["FMT_LOG"] = _pp(fmtlog)
+
+    def run(script, args, extra=None):
+        e = dict(env)
+        if extra:
+            e.update(extra)
+        return _sp.run([BASH_BIN, str(script), *args], capture_output=True, text=True,
+                      encoding="utf-8", errors="replace",
+                      cwd=str(PROJECT_ROOT), env=e, timeout=120)
+
+    # A) sd-format: 已是 ext4 -> 不格式化
+    fmtlog.write_text("")
+    r = run(sd_format, ["--dev", "mmcblk1", "--yes"],
+            {"MOCK_FSTYPE": "ext4", "ONECLOUD_SD_TEST_DEV": "mmcblk1"})
+    check("MKFS" not in fmtlog.read_text() and r.returncode == 0,
+          "sd-format: 已为 ext4 时不重复格式化")
+
+    # B) sd-format: vfat -> 格式化
+    fmtlog.write_text("")
+    r = run(sd_format, ["--dev", "mmcblk1", "--yes"],
+            {"MOCK_FSTYPE": "vfat", "ONECLOUD_SD_TEST_DEV": "mmcblk1"})
+    t = fmtlog.read_text()
+    check("MKFS" in t and "parted" in t, "sd-format: 非 ext4 时执行分区+格式化")
+
+    # C) sd-format: 拒绝格式化根磁盘
+    fmtlog.write_text("")
+    r = run(sd_format, ["--dev", "mmcblk1", "--yes"],
+            {"MOCK_FSTYPE": "vfat", "ONECLOUD_SD_TEST_DEV": "mmcblk1",
+             "MOCK_ROOT_SRC": "/dev/mmcblk1"})
+    check("MKFS" not in fmtlog.read_text(), "sd-format: 拒绝格式化根磁盘")
+
+    # D) sd-format: dry-run 不执行
+    fmtlog.write_text("")
+    r = run(sd_format, ["--dev", "mmcblk1", "--dry-run", "--yes"],
+            {"MOCK_FSTYPE": "vfat", "ONECLOUD_SD_TEST_DEV": "mmcblk1"})
+    check("MKFS" not in fmtlog.read_text(), "sd-format: dry-run 不执行格式化")
+
+    # E) sd-migrate: 无 SD -> 拒绝
+    r = run(sd_migrate, ["--yes"], {"MOCK_SCENARIO": "nosd"})
+    out = r.stdout + r.stderr
+    check(r.returncode != 0 and ("未检测" in out or "未就绪" in out),
+          "sd-migrate: 无 SD 卡时拒绝执行")
+
+    # F) sd-migrate: SD=vfat 自动格式化 + dry-run 迁移
+    fmtlog.write_text("")
+    r = run(sd_migrate, ["--dry-run", "--yes", "--source", _pp(src)],
+            {"MOCK_SCENARIO": "full", "MOCK_FSTYPE": "vfat",
+             "ONECLOUD_SD_TEST_DEV": "mmcblk1"})
+    out = r.stdout + r.stderr
+    t = fmtlog.read_text()
+    check(("MKFS" in t or "DRYRUN" in t), "sd-migrate: 检测到非 ext4 自动触发格式化")
+    check(r.returncode == 0 and "[dry-run]" in out, "sd-migrate: 格式化后进入 dry-run 迁移")
+    check((src / "app.conf").exists(), "sd-migrate: dry-run 不破坏来源目录")
+
+    # G) sd-migrate: SD=ext4 dry-run 正常
+    r = run(sd_migrate, ["--dry-run", "--yes", "--source", _pp(src)],
+            {"MOCK_SCENARIO": "full", "MOCK_FSTYPE": "ext4",
+             "ONECLOUD_SD_TEST_DEV": "mmcblk1"})
+    check(r.returncode == 0 and "[dry-run]" in (r.stdout + r.stderr),
+          "sd-migrate: ext4 直接 dry-run 迁移")
+
+    # H) sd-replace: 无 USB -> 拒绝
+    r = run(sd_replace, ["--yes"],
+            {"MOCK_SCENARIO": "nousb", "MOCK_FSTYPE": "ext4",
+             "ONECLOUD_SD_TEST_DEV": "mmcblk1"})
+    out = r.stdout + r.stderr
+    check(r.returncode != 0 and "USB" in out, "sd-replace: 未插入 USB 时拒绝执行")
+
+    # I) sd-replace: USB 空间不足 -> 拒绝
+    r = run(sd_replace, ["--yes"],
+            {"MOCK_SCENARIO": "full", "MOCK_FSTYPE": "ext4",
+             "ONECLOUD_SD_TEST_DEV": "mmcblk1", "ONECLOUD_USB_TEST_FREE_MB": "10"})
+    out = r.stdout + r.stderr
+    check(r.returncode != 0 and ("USB" in out or "空间" in out),
+          "sd-replace: USB 空间不足时拒绝执行")
+
+    # J) sd-replace: 正常备份到 USB
+    r = run(sd_replace, ["--yes"],
+            {"MOCK_SCENARIO": "full", "MOCK_FSTYPE": "ext4",
+             "ONECLOUD_SD_TEST_DEV": "mmcblk1", "ONECLOUD_USB_TEST_FREE_MB": "100000"})
+    out = r.stdout + r.stderr
+    check(r.returncode == 0 and "已完成备份" in out and "SHA256" in out,
+          "sd-replace: 正常备份并输出校验和")
+    arcs = list(usbmount.glob("onecloud-sd-backup-*.tar.gz"))
+    check(len(arcs) >= 1 and arcs[0].stat().st_size > 0,
+          "sd-replace: USB 上生成非空备份包")
+
+    # K) sd-tools 调度
+    r = run(sd_tools, ["--help"])
+    out = r.stdout + r.stderr
+    check(r.returncode == 0 and "SD 卡工具箱" in out and "迁移" in out
+          and "更换" in out and "格式化" in out, "sd-tools: 帮助列出三个功能")
+    r = run(sd_tools, ["migrate", "--help"])
+    check(r.returncode == 0 and "SD 卡迁移脚本" in (r.stdout + r.stderr),
+          "sd-tools: migrate 透传到 sd-migrate --help")
+    r = run(sd_tools, ["format", "--help"])
+    check(r.returncode == 0 and "SD 卡格式化脚本" in (r.stdout + r.stderr),
+          "sd-tools: format 透传到 sd-format --help")
+
+    _shutil.rmtree(str(tmp), ignore_errors=True)
+
+
 def main():
     print("=" * 60)
     print("OneCloud Cluster 功能验证")
@@ -5227,6 +5436,7 @@ def main():
         ("脚本 usage 与实现一致性 (CLI 契约)", test_cli_usage_contract),
         ("初始化装包精简 (无头服务器)", test_bootstrap_pkg_slim),
         ("安装路径自适应 (SD卡->/opt 回退)", test_install_path_adaptive),
+        ("SD 卡工具箱 (格式化/迁移/更换)", test_sd_tools),
     ]
     
     for test_name, test_func in tests:

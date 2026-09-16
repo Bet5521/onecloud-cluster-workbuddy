@@ -15,6 +15,7 @@ OneCloud 集群的完整技术文档。
 | [cloudflare-setup.md](cloudflare-setup.md) | Cloudflare Zero Trust Tunnel 配置指南 |
 | [package-trim.md](package-trim.md) | 初始化装包精简说明（核心/可选/桌面图形三档与移除理由） |
 | [install-path.md](install-path.md) | 安装路径自适应（SD 卡可用用 SD，否则回退 /opt，决策流程与函数清单） |
+| [sd-tools.md](sd-tools.md) | SD 卡工具箱（格式化/迁移/更换备份：功能、前置条件、用法与注意事项） |
 | [to-fix.md](to-fix.md) | 全项目验证问题清单与修复记录 |
 | [firewall/](firewall/) | 各节点防火墙建议清单（`firewall-recommend.sh` 生成） |
 
