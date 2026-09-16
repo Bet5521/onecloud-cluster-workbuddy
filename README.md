@@ -2,7 +2,7 @@
 
 > 基于玩客云 WS1608 (Amlogic S805, ARMv7, 1GB RAM) 多节点组建的家庭服务集群
 
-**当前版本: v1.5.1**
+**当前版本: v1.5.2**
 
 ---
 
@@ -159,6 +159,36 @@ onecloud-cluster/
 > 挂载点不是 `/mnt/sd` 时，`deploy.sh` / `backup.sh` / `setup.sh` 等仍按 `/mnt/sd`
 > 读写，需自行同步修改，否则数据会落到不同位置。
 
+#### 初始化装包范围（无头服务器）
+
+目标机是玩客云：**无图形界面、1GB 内存、eMMC/SD 卡**。装包按三档处理，
+只装"部署链路真的会调用"的包：
+
+| 档位 | 包 | 默认 |
+|---|---|---|
+| **核心** | `curl` `git` `ca-certificates` `jq` `rsync` `parted` `wireguard-tools` | ✅ 装 |
+| **可选** | `wget` `vim` `htop` `iotop` `net-tools` `dnsutils` `unzip` `dosfstools` `fdisk` `lsb-release` `gnupg` | ❌ 不装，`--extra-pkgs` 开启 |
+| **桌面/图形** | 桌面套件 / Xorg / 显示管理器 / 字体 / 浏览器 / 远程桌面等 | ⛔ 永不装 |
+
+- 核心包逐项对应一条真实依赖：下载（`curl`+`ca-certificates`）、克隆仓库（`git`）、
+  解析 JSON（`jq`）、迁移 Docker 数据（`rsync`）、SD 卡分区（`parted`）、组网（`wireguard-tools`）。
+- `iproute2` / `e2fsprogs` / `util-linux` 属系统基础包，系统一定自带，不重复声明。
+- 可选包**没有被删除，只是移出默认流程**：`--extra-pkgs` 装预设、`--extra-pkgs "vim htop"` 装指定的。
+- 桌面/图形包即使被显式列出也会被剔除并告警（黑名单见 `bootstrap.sh` 的 `APT_GUI_DENY`）。
+
+```bash
+# 只装核心包 (默认)
+./scripts/bootstrap.sh --node wk-edge-01 --yes
+# 另外装可选工具 (预设清单)
+./scripts/bootstrap.sh --node wk-edge-01 --yes --extra-pkgs
+# 只装指定的可选工具
+./scripts/bootstrap.sh --node wk-edge-01 --yes --extra-pkgs "vim htop"
+ONECLOUD_EXTRA_PKGS="vim htop" ./scripts/bootstrap.sh --node wk-edge-01 --yes   # 等价写法
+```
+
+`setup.sh` 同样只补业务必需的命令（`jq` / `curl` / `parted`），不再为了端口检测去装 `net-tools`、
+不再默认装 `dosfstools`（格式化一律走 ext4）。
+
 #### 执行前的网络安全检查
 
 配静态 IP 是容易把机器"配失联"的操作，脚本在写入前会做三项检查并汇总告警：
@@ -195,6 +225,8 @@ ONECLOUD_BOOTSTRAP_TTY=0 ./scripts/bootstrap.sh --node wk-edge-01 --ip 192.168.6
 ./scripts/bootstrap.sh --node wk-edge-01 --ip 192.168.6.101 --mirror --apt-upgrade --yes
 # 完全不动 apt (纯离线初始化: 只配主机名/IP/存储/目录/SSH 密钥)
 ./scripts/bootstrap.sh --node wk-edge-01 --ip 192.168.6.101 --no-apt --yes
+# 可选工具 (vim/htop/iotop/...) 默认不装, 需要时显式开启
+./scripts/bootstrap.sh --node wk-edge-01 --ip 192.168.6.101 --extra-pkgs --yes
 ```
 
 ### 2. 生成 WireGuard 配置
@@ -396,6 +428,9 @@ python3 test_validate.py
 | [docs/topology.md](docs/topology.md) | 可视化拓扑图 (Mermaid + ASCII) |
 | [docs/operations.md](docs/operations.md) | 运维手册（备份/恢复/更新/故障排查） |
 | [docs/cloudflare-setup.md](docs/cloudflare-setup.md) | Cloudflare Tunnel 配置 |
+| [docs/package-trim.md](docs/package-trim.md) | 初始化装包精简说明（核心/可选/桌面图形三档与移除理由） |
+| [docs/to-fix.md](docs/to-fix.md) | 全项目验证问题清单与修复记录 |
+| [docs/firewall/](docs/firewall/) | 各节点防火墙建议清单 |
 
 ---
 
@@ -427,6 +462,43 @@ python3 test_validate.py
   校验功能脚本无硬编码 IP、每个节点 hostname 字段齐全、环境变量覆盖真实生效
 - 验证项从 176 扩至 **184**（全部通过、0 警告）
 - 新增 `inventory/nodes.local.yaml.example` 覆盖模板（真实覆盖文件已 gitignore）
+
+---
+
+## 🚀 v1.5.2 变更说明
+
+**主题：初始化装包精简 —— 面向无头服务器，只装部署链路真正需要的包。**
+
+### 装包分档（核心 / 可选 / 永不装）
+
+`bootstrap.sh` 原来一次性装 18 个包，其中近一半与"无图形界面 + 部署流水线"的实际需要无关。
+现在改为三档：
+
+| 档位 | 内容 | 行为 |
+|---|---|---|
+| 核心（`BASE_PKGS`） | `curl` `git` `ca-certificates` `jq` `rsync` `parted` `wireguard-tools` | 默认装 |
+| 可选（`OPT_PKGS_PRESET`） | `wget` `vim` `htop` `iotop` `net-tools` `dnsutils` `unzip` `dosfstools` `fdisk` `lsb-release` `gnupg` | 默认**不装**，`--extra-pkgs` 显式开启 |
+| 桌面/图形（`APT_GUI_DENY`） | 桌面套件 / Xorg / 显示管理器 / 字体 / 浏览器 / 远程桌面 / 音频蓝牙等 45 项 | **永不装**，显式列出也会被剔除并告警 |
+
+- 新增 `--extra-pkgs` / `--no-extra-pkgs` 与 `ONECLOUD_EXTRA_PKGS`：
+  不带值装预设清单，带值只装指定的（`--extra-pkgs "vim htop"`）
+- 新增 `pkg_gui_name()` / `pkg_gui_filter()` / `extra_pkgs_apply()`，
+  黑名单按全名 + 命名前缀（`xserver-*` / `x11-*` / `fonts-*` / `*-desktop` …）双路匹配
+- 本次**没有**发现脚本里原本存在桌面/图形包；加黑名单是为了防止后续被误加回来
+
+### 一并收敛的 `setup.sh`
+
+- `ensure_tools()` 只补 `jq` / `curl` / `parted`，不再默认装 `wget` 与 `dosfstools`
+  （格式化一律走 `mkfs.ext4`，挂载 vfat/exfat 由内核 + `mount` 负责）
+- `check_port()` 不再为了端口检测去装 `net-tools`（`ss` 来自 iproute2，必定存在），
+  两者都缺失时只告警
+- 删除已无引用的 `ensure_pkg()`
+
+### 验证
+
+- 新增第 29 组测试「**初始化装包精简**」19 项：核心清单精确匹配、11 个可选包未泄漏进默认流程、
+  黑名单不误伤、`--extra-pkgs` 两种用法、显式列出图形包被剔除且有告警
+- 全量 **460 项 / 29 组**，全部通过
 
 ---
 

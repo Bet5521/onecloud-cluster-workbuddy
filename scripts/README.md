@@ -184,7 +184,22 @@ panel_host_cidr 192.168.1.101        # 192.168.1.0/24（网络地址 + 前缀）
 # 不插 SD 卡 / 换挂载点且不自动挂载
 ./scripts/bootstrap.sh --node wk-edge-01 --ip 10.0.0.5 --no-sd --yes
 ./scripts/bootstrap.sh --node wk-edge-01 --ip 10.0.0.5 --sd-mount /mnt/data --no-sd-automount --yes
+
+# 装包: 默认只装核心包; 可选工具按需显式开启
+./scripts/bootstrap.sh --node wk-edge-01 --ip 10.0.0.5 --extra-pkgs --yes
+./scripts/bootstrap.sh --node wk-edge-01 --ip 10.0.0.5 --extra-pkgs "vim htop" --yes
 ```
+
+**装包范围（无头服务器）**
+
+| 档位 | 包 | 默认 |
+|---|---|---|
+| 核心 | `curl` `git` `ca-certificates` `jq` `rsync` `parted` `wireguard-tools` | 装 |
+| 可选 | `wget` `vim` `htop` `iotop` `net-tools` `dnsutils` `unzip` `dosfstools` `fdisk` `lsb-release` `gnupg` | 不装，`--extra-pkgs` 开启 |
+| 桌面/图形 | `APT_GUI_DENY` 黑名单 45 项（桌面套件 / Xorg / 显示管理器 / 字体 / 浏览器 / 远程桌面…） | 永不装 |
+
+桌面/图形包即便被显式列出也会被 `pkg_gui_filter()` 剔除并告警。
+详见 `docs/package-trim.md`。
 
 **参数与询问的关系**
 

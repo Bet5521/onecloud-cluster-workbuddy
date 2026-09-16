@@ -89,16 +89,10 @@ check_root() {
 # 检测命令是否存在
 has_cmd() { command -v "$1" &>/dev/null; }
 
-# 确保安装了某个包
-ensure_pkg() {
-    local pkg=$1
-    if ! dpkg -l "$pkg" &>/dev/null 2>&1; then
-        apt-get install -y "$pkg" 2>/dev/null || true
-    fi
-}
-
 # 检测端口是否被占用
 # 参数: $1=端口号 $2=协议(tcp/udp)
+# 无头服务器上 ss (iproute2) 必定存在; 两者都没有时不为了检测去装 net-tools,
+# 只告警并按"未占用"处理 (返回 1), 免得初始化阶段顺手拉入已过时的工具包。
 check_port() {
     local port=$1 proto=${2:-tcp}
     if has_cmd ss; then
@@ -106,8 +100,8 @@ check_port() {
     elif has_cmd netstat; then
         netstat -tuln 2>/dev/null | grep -qE "[:.]${port}\b"
     else
-        ensure_pkg net-tools
-        netstat -tuln 2>/dev/null | grep -qE "[:.]${port}\b"
+        log_warn "ss / netstat 均不可用, 跳过端口 ${port}/${proto} 占用检测"
+        return 1
     fi
 }
 
@@ -138,15 +132,16 @@ ensure_docker() {
     log_success "Docker 可用"
 }
 
-# 确保有 jq(用于 JSON 处理)
+# 确保有部署所需的命令 (无头服务器: 只补业务真会调用的, 排障/图形类一律不装)
 ensure_tools() {
     local need=()
-    has_cmd jq     || need+=("jq")
-    has_cmd curl    || need+=("curl")
-    has_cmd wget    || need+=("wget")
-    has_cmd parted  || need+=("parted")
-    has_cmd dosfstools 2>/dev/null || need+=("dosfstools")
+    has_cmd jq     || need+=("jq")        # JSON 解析: GitHub release / 面板接口
+    has_cmd curl   || need+=("curl")      # 下载: docker 安装脚本 / release / get-pip.py
+    has_cmd parted || need+=("parted")    # 分区: U盘 / SD 卡
+    # 不再默认安装 dosfstools: 本脚本格式化一律用 ext4 (mkfs.ext4),
+    # 挂载 vfat/exfat 由内核 + mount 负责, 不需要 dosfstools。
     if [ ${#need[@]} -gt 0 ]; then
+        log_info "补齐缺失命令: ${need[*]}"
         apt-get update -qq
         apt-get install -y "${need[@]}" 2>/dev/null || true
     fi

@@ -4727,6 +4727,236 @@ def test_cli_usage_contract():
     return True
 
 
+def test_bootstrap_pkg_slim():
+    """测试 29: 初始化装包精简 —— 无头服务器不装桌面/图形与排障类工具
+
+    背景: 目标机是玩客云 (无图形界面 / 1GB 内存 / eMMC)。此前 bootstrap 一次性装
+    18 个包, 其中 vim/htop/iotop/net-tools/dnsutils/wget/unzip/fdisk/lsb-release/
+    software-properties-common 与「无头服务器 + 部署流水线」的实际需要无关;
+    software-properties-common 更是为 Ubuntu PPA 准备的, 在 Debian 上只带来额外依赖。
+    现在分三档: 核心包默认装 / 可选包显式 --extra-pkgs 才装 / 桌面图形包永不装。
+    """
+    print("\n" + "=" * 60)
+    print("测试 29: 初始化装包精简 (无头服务器)")
+    print("=" * 60)
+
+    boot = SCRIPTS_DIR / "bootstrap.sh"
+    if not boot.exists():
+        log_fail("scripts/bootstrap.sh 缺失")
+        return
+    src = boot.read_text(encoding="utf-8")
+
+    def _posix(p):
+        s = Path(p).as_posix()
+        m = re.match(r"^([A-Za-z]):/(.*)$", s)
+        return f"/{m.group(1).lower()}/{m.group(2)}" if m else s
+
+    # ---- 1) 静态: 三档清单齐备 ----
+    base_m = re.search(r'^BASE_PKGS="([^"]*)"', src, re.M)
+    opt_m = re.search(r'^OPT_PKGS_PRESET="([^"]*)"', src, re.M)
+    deny_m = re.search(r'APT_GUI_DENY="([^"]*)"', src, re.S)
+    if not (base_m and opt_m and deny_m):
+        log_fail("缺少装包分档常量 (BASE_PKGS / OPT_PKGS_PRESET / APT_GUI_DENY)")
+        return
+    log_pass("具备装包分档常量 (核心 / 可选 / 桌面图形黑名单)")
+
+    base = base_m.group(1).split()
+    opt = opt_m.group(1).split()
+    deny = set(deny_m.group(1).split())
+
+    CORE = {"curl", "git", "ca-certificates", "jq", "rsync", "parted", "wireguard-tools"}
+    if set(base) == CORE:
+        log_pass(f"默认只装核心包 ({len(base)} 个): {' '.join(base)}")
+    else:
+        log_fail("默认装包清单与「核心集合」不一致",
+                 f"多={sorted(set(base) - CORE)} 少={sorted(CORE - set(base))}")
+
+    MOVED = {"wget", "vim", "htop", "iotop", "net-tools", "dnsutils", "unzip",
+             "dosfstools", "fdisk", "lsb-release", "gnupg"}
+    if MOVED <= set(opt):
+        log_pass(f"调试/辅助类工具移出默认流程, 改为可选 ({len(MOVED)} 个)")
+    else:
+        log_fail("有工具被直接删除而不是改为可选", f"缺失: {sorted(MOVED - set(opt))}")
+
+    both = set(base) & set(opt)
+    if not both:
+        log_pass("核心包与可选包无交集 (不会重复安装)")
+    else:
+        log_fail("核心包与可选包重复", sorted(both))
+
+    if "software-properties-common" not in src:
+        log_pass("不再安装 software-properties-common (Debian 无 PPA, 且会拉入额外依赖)")
+    else:
+        log_fail("仍在安装 software-properties-common")
+
+    def _gui_hit(pkgs):
+        hit = [p for p in pkgs if p in deny]
+        hit += [p for p in pkgs
+                if re.match(r"^(xserver-|x11-|xorg-|task-.*-desktop|.*-desktop|fonts-)", p)]
+        return sorted(set(hit))
+
+    g1, g2 = _gui_hit(base), _gui_hit(opt)
+    if not g1 and not g2:
+        log_pass(f"核心与可选清单均不含桌面/图形组件 (黑名单 {len(deny)} 项)")
+    else:
+        log_fail("清单里仍含桌面/图形组件", f"核心={g1} 可选={g2}")
+
+    for fn in ("pkg_gui_name()", "pkg_gui_filter()", "extra_pkgs_apply()",
+               "pkg_install_list()"):
+        if fn in src:
+            log_pass(f"提供 {fn}")
+        else:
+            log_fail(f"缺少 {fn}")
+
+    # setup.sh 同样只补业务必需的命令
+    ssrc = (SCRIPTS_DIR / "setup.sh").read_text(encoding="utf-8")
+    if 'need+=("dosfstools")' not in ssrc and 'need+=("wget")' not in ssrc \
+            and "ensure_pkg net-tools" not in ssrc:
+        log_pass("setup.sh 不再默认补装 dosfstools / wget / net-tools 等非必需包")
+    else:
+        log_fail("setup.sh 仍在默认补装非必需包")
+
+    # ---- 2) 行为验证: mock apt, 四种开关组合 ----
+    lines = src.splitlines()
+    i_log = next((i for i, l in enumerate(lines) if l.startswith("log_info()  {")), -1)
+    i_net = next((i for i, l in enumerate(lines) if l.startswith("# 网段计算")), -1)
+    i_s3 = next((i for i, l in enumerate(lines) if l.startswith("# ---- 3. 换国内源")), -1)
+    i_s6 = next((i for i, l in enumerate(lines) if l.startswith("# ---- 6. 配置时区")), -1)
+    if min(i_log, i_net, i_s3, i_s6) < 0:
+        log_fail("无法定位 helper / 步骤锚点", "代码结构变了, 需同步更新本测试")
+        return
+    helpers = "\n".join(lines[i_log:i_net - 1])
+    flow = "\n".join(lines[i_s3:i_s6])
+
+    tmpdir = Path(tempfile.mkdtemp(prefix="oc_t29_"))
+    mockbin = tmpdir / "mockbin"
+    mockbin.mkdir()
+    mocks = {
+        "apt": '#!/bin/bash\necho "apt $*" >> "$APT_LOG"\nexit 0\n',
+        "apt-cache": '#!/bin/bash\necho "apt-cache $*" >> "$APT_LOG"\nexit 0\n',
+        "uname": ('#!/bin/bash\n[ "$1" = "-r" ] && { echo "5.10.63-rockchip"; exit 0; }\n'
+                  'echo Linux\nexit 0\n'),
+    }
+    for name, body in mocks.items():
+        p = mockbin / name
+        p.write_text(body, encoding="utf-8", newline="\n")
+        os.chmod(p, 0o755)
+
+    driver = r"""
+# ---------------- driver ----------------
+set +e
+WORK="@WORK@"
+M="@MOCK@"
+PATH="$M:/usr/bin:/bin"
+export PATH
+
+run_case() {
+    local tag="$1" flag="$2" req="$3"
+    local root="$WORK/root_$tag"
+    mkdir -p "$root/apt/sources.list.d"
+    printf 'ID=debian\nVERSION_CODENAME=bookworm\n' > "$root/os-release"
+    export ONECLOUD_ETC_ROOT="$root"
+    export APT_LOG="$WORK/apt_$tag.log"
+    : > "$APT_LOG"
+    unset ONECLOUD_EXTRA_PKGS
+    apt_switch_defaults
+    DO_MIRROR=false
+    DO_APT_UPDATE=false
+    DO_APT_UPGRADE=false
+    DO_APT_PKGS=true
+    DO_EXTRA_PKGS="$flag"
+    EXTRA_PKGS_REQUEST="$req"
+    ( set -e; step_apt_flow ) > "$WORK/out_$tag.txt" 2>&1
+    echo "###RC:$tag:$?"
+    echo "###APTLOG_BEGIN:$tag"; cat "$APT_LOG"; echo "###APTLOG_END:$tag"
+    echo "###OUT_BEGIN:$tag"; cat "$WORK/out_$tag.txt"; echo "###OUT_END:$tag"
+}
+
+run_case c1_core   false ""
+run_case c2_extra  true  ""
+run_case c3_gui    true  "vim xorg firefox-esr"
+run_case c4_pick   true  "vim htop"
+echo "###DONE"
+"""
+    probe = tmpdir / "probe.sh"
+    probe.write_text(
+        helpers + "\n\nstep_apt_flow() {\n" + flow + "\n}\n" + driver
+        .replace("@WORK@", _posix(tmpdir))
+        .replace("@MOCK@", _posix(mockbin)),
+        encoding="utf-8", newline="\n")
+
+    try:
+        r = subprocess.run(["bash", _posix(probe)], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace",
+                           stdin=subprocess.DEVNULL, timeout=420)
+        out = r.stdout
+
+        def sect(name, tag):
+            m = re.search(rf"###{name}_BEGIN:{tag}\n(.*?)\n###{name}_END:{tag}", out, re.S)
+            return (m.group(1) + "\n") if m else ""
+
+        def rc(tag):
+            m = re.search(rf"###RC:{tag}:(\d+)", out)
+            return int(m.group(1)) if m else None
+
+        if "###DONE" not in out:
+            log_fail("mock 驱动未跑完", f"stderr={r.stderr[-400:]}")
+            return
+
+        if rc("c1_core") == 0:
+            log_pass("默认 (只装核心包) 场景正常退出")
+        else:
+            log_fail(f"默认场景退出码 {rc('c1_core')}")
+
+        c1 = sect("APTLOG", "c1_core")
+        if all(f" {p}" in c1 or f"{p}\n" in c1 for p in sorted(CORE)):
+            log_pass("默认安装的正是核心包 (curl/git/jq/rsync/parted/wireguard-tools/证书)")
+        else:
+            miss = [p for p in sorted(CORE) if f" {p}" not in c1]
+            log_fail("默认未装全核心包", f"缺失: {miss} | log={c1[:200]}")
+
+        leaked = [p for p in sorted(MOVED) if re.search(rf"\b{re.escape(p)}\b", c1)]
+        if not leaked:
+            log_pass("默认不再安装任何可选/排障工具 (11 个)")
+        else:
+            log_fail("默认仍装了可选/排障工具", f"泄漏: {leaked}")
+
+        if "已剔除" not in sect("OUT", "c1_core"):
+            log_pass("默认场景无剔除告警 (清单本来就是干净的)")
+        else:
+            log_fail("默认清单里混进了被黑名单命中的包")
+
+        c2 = sect("APTLOG", "c2_extra")
+        preset_hit = [p for p in ("vim", "htop", "net-tools") if re.search(rf"\b{p}\b", c2)]
+        if len(preset_hit) == 3:
+            log_pass("--extra-pkgs (不带值) 装预设可选清单")
+        else:
+            log_fail("--extra-pkgs 未装上可选清单", f"命中={preset_hit} log={c2[:200]}")
+
+        c3 = sect("APTLOG", "c3_gui")
+        o3 = sect("OUT", "c3_gui")
+        if "vim" in c3 and not re.search(r"\b(xorg|firefox-esr)\b", c3):
+            log_pass("显式列出的桌面/图形包被剔除 (只装了 vim)")
+        else:
+            log_fail("桌面/图形包未被剔除", c3[:200])
+        if "已剔除桌面/图形组件" in o3:
+            log_pass("剔除动作有明确告警 (不是静默丢弃)")
+        else:
+            log_fail("剔除桌面/图形包时未告警", o3[-300:])
+
+        c4 = sect("APTLOG", "c4_pick")
+        if re.search(r"\bvim\b", c4) and re.search(r"\bhtop\b", c4) \
+                and not re.search(r"\biotop\b", c4):
+            log_pass("--extra-pkgs \"vim htop\" 只装指定的, 不牵连整个预设")
+        else:
+            log_fail("--extra-pkgs 指定清单未生效", c4[:200])
+    except Exception as e:
+        log_fail(f"装包精简验证异常: {str(e)}")
+        return
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 # ============ 主程序 ============
 def main():
     print("=" * 60)
@@ -4764,6 +4994,7 @@ def main():
         ("面板安装参数", test_panel_install_params),
         ("部署零防火墙改动与建议清单", test_deploy_no_firewall),
         ("脚本 usage 与实现一致性 (CLI 契约)", test_cli_usage_contract),
+        ("初始化装包精简 (无头服务器)", test_bootstrap_pkg_slim),
     ]
     
     for test_name, test_func in tests:

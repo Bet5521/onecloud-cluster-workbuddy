@@ -39,6 +39,106 @@ log_warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
 
 # ------------------------------------------------------------
+# 初始化装包清单 —— 面向无头服务器 (玩客云: 无图形界面 / 1GB 内存 / eMMC)
+#
+#   分档原则:
+#     核心包   部署链路真的会调用, 缺了走不下去 -> 默认装
+#     可选包   排障 / 编辑 / 老习惯兼容, 缺了只是不方便 -> 默认不装, 需显式开启
+#              (--extra-pkgs 或 ONECLOUD_EXTRA_PKGS)
+#     桌面/图形 一律不装: 目标机没有显示输出, 装了只吃空间与内存。
+#              即便被显式列出, 也会被 pkg_gui_filter 剔除 (见 APT_GUI_DENY)
+#
+#   核心包逐项理由 (其余一律不进默认流程):
+#     curl              下载 (docker 安装脚本 / GitHub release / get-pip.py)
+#     git               克隆 onecloud-cluster 仓库 (初始化后第一步)
+#     ca-certificates   HTTPS 校验证书; 缺了 curl 直接失败
+#     jq                setup.sh 解析 JSON (GitHub release / 面板接口)
+#     rsync             迁移 /var/lib/docker 到 SD 卡
+#     parted            SD 卡分区 (mklabel / mkpart)
+#     wireguard-tools   集群组网 (wg / wg-quick), 三节点互通的地基
+#   iproute2 / e2fsprogs / util-linux 属系统基础包 (Priority: required/important),
+#   系统一定自带, 不重复声明。
+# ------------------------------------------------------------
+BASE_PKGS="curl git ca-certificates jq rsync parted wireguard-tools"
+
+# 可选包预设: 仅当显式开启 (--extra-pkgs) 时才安装
+OPT_PKGS_PRESET="wget vim htop iotop net-tools dnsutils unzip dosfstools fdisk lsb-release gnupg"
+
+# 桌面环境 / 图形组件黑名单 (无头服务器一律拒绝)
+APT_GUI_DENY="task-desktop task-gnome-desktop task-kde-desktop task-lxde-desktop
+task-xfce-desktop task-mate-desktop task-cinnamon-desktop xorg xorg-common
+xserver-xorg xserver-xorg-core xserver-common xinit x11-common x11-apps x11-utils
+x11-xserver-utils xauth xdg-utils dbus-x11 lightdm gdm3 sddm xdm slim xterm xvfb
+x11vnc tigervnc-standalone-server xrdp chromium chromium-browser firefox-esr
+fonts-noto-core xfonts-base gvfs thunar pcmanfm nautilus gedit libreoffice
+alsa-utils pulseaudio bluez blueman"
+
+# 判定包名是否属于桌面/图形组件 (0=是, 1=否)
+pkg_gui_name() {
+    local p="${1:-}" g
+    [ -n "$p" ] || return 1
+    for g in $APT_GUI_DENY; do
+        if [ "$p" = "$g" ]; then return 0; fi
+    done
+    case "$p" in
+        xserver-*|x11-*|task-*-desktop|xorg-*|*-desktop|fonts-*) return 0 ;;
+    esac
+    return 1
+}
+
+# 剔除参数中的桌面/图形组件: 剩余包打印到 stdout, 被剔除的写入全局变量 PKG_DROPPED
+pkg_gui_filter() {
+    local p out="" dropped=""
+    PKG_DROPPED=""
+    for p in "$@"; do
+        [ -n "$p" ] || continue
+        if pkg_gui_name "$p"; then
+            dropped="${dropped}${dropped:+ }${p}"
+        else
+            out="${out}${out:+ }${p}"
+        fi
+    done
+    # 告警必须走 stderr: 本函数的 stdout 会被命令替换当成装包清单收走
+    if [ -n "$dropped" ]; then
+        log_warn "已剔除桌面/图形组件 (目标机为无头服务器, 不安装): ${dropped}" >&2
+    fi
+    PKG_DROPPED="$dropped"
+    printf '%s' "$out"
+    return 0
+}
+
+# 可选包取值: 空 或 真值 (1/true/yes/on) -> 用预设清单; 否则按用户给的包名列表
+extra_pkgs_apply() {
+    case "$(printf '%s' "${1:-}" | tr 'A-Z' 'a-z')" in
+        ''|1|true|yes|on) printf '%s' "$OPT_PKGS_PRESET" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+# 计算最终装包清单 (核心 + 可选, 且已剔除桌面/图形组件), 结果写入 INSTALL_PKGS
+# 按入参缓存: 配置摘要与真正安装两步都会用到它, 不缓存的话剔除告警会打印两次
+pkg_install_list() {
+    local key="${DO_APT_PKGS}|${DO_EXTRA_PKGS:-false}|${EXTRA_PKGS_REQUEST:-}"
+    [ "${INSTALL_PKGS_KEY:-}" = "$key" ] && return 0
+    INSTALL_PKGS_KEY="$key"
+    INSTALL_EXTRA_PKGS=""
+    if [ "$DO_APT_PKGS" != true ]; then
+        INSTALL_PKGS=""
+        return 0
+    fi
+    INSTALL_PKGS="$(pkg_gui_filter $BASE_PKGS)"
+    if [ "${DO_EXTRA_PKGS:-false}" = true ]; then
+        local _extra
+        _extra="$(pkg_gui_filter $(extra_pkgs_apply "${EXTRA_PKGS_REQUEST:-}"))"
+        if [ -n "$_extra" ]; then
+            INSTALL_EXTRA_PKGS="$_extra"
+            INSTALL_PKGS="${INSTALL_PKGS} ${_extra}"
+        fi
+    fi
+    return 0
+}
+
+# ------------------------------------------------------------
 # 发行版 / apt 辅助
 # ------------------------------------------------------------
 # 探测系统 ID 与代号, 输出 "<id> <codename>" (取不到则 unknown / 空)
@@ -248,8 +348,9 @@ dns_apply_mode() {
 #     刷新索引   DO_APT_UPDATE   --apt-update   / ONECLOUD_APT_ENABLE_UPDATE=1
 #     升级系统包 DO_APT_UPGRADE  --apt-upgrade  / ONECLOUD_APT_ENABLE_UPGRADE=1
 #     装基础工具 DO_APT_PKGS     (默认开)       / --no-apt-pkgs 关闭
+#     装可选工具 DO_EXTRA_PKGS   --extra-pkgs   / ONECLOUD_EXTRA_PKGS (默认关)
 #
-#   --no-apt 一键关掉全部四项 (纯离线初始化: 只配主机名/IP/存储/目录/SSH 密钥)
+#   --no-apt 一键关掉全部 (纯离线初始化: 只配主机名/IP/存储/目录/SSH 密钥)
 #   旧开关 ONECLOUD_APT_SKIP_MIRROR=1 继续有效 (= 不换源, 向后兼容)
 # ------------------------------------------------------------
 apt_switch_defaults() {
@@ -260,6 +361,14 @@ apt_switch_defaults() {
     APT_UPDATE_AUTO=false        # 换源后自动补的刷索引 (不是用户本意, 日志里要说明)
     APT_UPDATE_EXPLICIT=false    # 用户是否显式表过态 (显式优先于自动补)
     APT_OPTS_EXPLICIT=false      # 命令行是否给过任一 apt 开关 (给了就不再交互询问)
+    # 可选工具: 默认不装。ONECLOUD_EXTRA_PKGS 给真值 (1/true/yes/on) 用预设清单,
+    # 给包名列表则按列表装; 见 extra_pkgs_apply()
+    DO_EXTRA_PKGS=false
+    EXTRA_PKGS_REQUEST=""
+    if [ -n "${ONECLOUD_EXTRA_PKGS:-}" ]; then
+        DO_EXTRA_PKGS=true
+        EXTRA_PKGS_REQUEST="$ONECLOUD_EXTRA_PKGS"
+    fi
     case "$(printf '%s' "${ONECLOUD_APT_ENABLE_MIRROR:-}" | tr 'A-Z' 'a-z')" in
         1|true|yes|on) DO_MIRROR=true ;;
     esac
@@ -278,7 +387,8 @@ apt_switch_defaults() {
     esac
     case "$(printf '%s' "${ONECLOUD_APT_SKIP_ALL:-}" | tr 'A-Z' 'a-z')" in
         1|true|yes|on)
-            DO_MIRROR=false; DO_APT_UPDATE=false; DO_APT_UPGRADE=false; DO_APT_PKGS=false ;;
+            DO_MIRROR=false; DO_APT_UPDATE=false; DO_APT_UPGRADE=false; DO_APT_PKGS=false
+            DO_EXTRA_PKGS=false; EXTRA_PKGS_REQUEST="" ;;
     esac
     return 0
 }
@@ -317,9 +427,13 @@ apt_switch_desc() {
         printf '    升级系统  : 跳过 (默认; 需要时加 --apt-upgrade)\n'
     fi
     if [ "$DO_APT_PKGS" = true ]; then
-        printf '    基础工具  : 安装 (跳过用 --no-apt-pkgs)\n'
+        pkg_install_list
+        printf '    装包清单  : %s\n' "${INSTALL_PKGS}"
+        if [ "${DO_EXTRA_PKGS:-false}" != true ]; then
+            printf '    可选工具  : 跳过 (默认; 需要时加 --extra-pkgs)\n'
+        fi
     else
-        printf '    基础工具  : 跳过 (--no-apt-pkgs)\n'
+        printf '    装包清单  : 跳过 (--no-apt-pkgs)\n'
     fi
     return 0
 }
@@ -503,8 +617,19 @@ usage() {
       --apt-upgrade     升级系统包 (apt upgrade -y; 默认: 跳过)
       --no-apt-upgrade  不升级系统包 (默认行为)
       --no-apt-pkgs     跳过基础工具安装 (curl/git/parted/wireguard-tools ...)
+      --extra-pkgs[=..] 安装可选工具 (默认不装)。不带值=预设清单, 带值=指定包名
+      --no-extra-pkgs   不装可选工具 (默认行为)
       --no-apt          跳过以上全部 (纯离线初始化: 只配主机名/IP/存储/目录/密钥)
   -h, --help            显示帮助
+
+初始化装包范围 (无头服务器, 不装任何桌面/图形组件):
+  核心 (默认装)  curl git ca-certificates jq rsync parted wireguard-tools
+  可选 (默认不装) wget vim htop iotop net-tools dnsutils unzip dosfstools
+                 fdisk lsb-release gnupg        -- 需要时加 --extra-pkgs
+  桌面/图形 (永不装) 桌面套件 / Xorg / 显示管理器 / 字体 / 浏览器 / 远程桌面等,
+                 即便显式列出也会被剔除并告警 (见 APT_GUI_DENY)
+  --extra-pkgs 用法: --extra-pkgs            (装上面那份可选预设)
+                     --extra-pkgs "vim htop" (只装指定的)
 
 参数与询问的关系:
   传入的参数一律直接生效, 不会被询问覆盖;
@@ -552,6 +677,8 @@ DNS 的两种模式:
   ONECLOUD_APT_ENABLE_UPDATE=1                        # 等价于 --apt-update
   ONECLOUD_APT_ENABLE_UPGRADE=1                       # 等价于 --apt-upgrade
   ONECLOUD_APT_SKIP_PKGS=1                            # 跳过基础工具安装
+  ONECLOUD_EXTRA_PKGS="vim htop"                      # 装可选工具 (= --extra-pkgs;
+                                                      #   取 1/true/yes/on 则用预设清单)
   ONECLOUD_APT_SKIP_ALL=1                             # 跳过全部 apt 动作
   ONECLOUD_APT_SKIP_MIRROR=1                          # 旧开关, 仍然有效 (= 不换源)
   ONECLOUD_APT_MIRROR / ONECLOUD_APT_SECURITY_MIRROR  # 覆盖默认 apt 镜像
@@ -571,6 +698,8 @@ apt 源说明:
   $0 --node wk-new --ip 10.0.0.9 --hostname new --gateway 10.0.0.1 --yes
   $0 --node wk-edge-01 --yes --mirror                         # 顺便换源 (自动刷索引)
   $0 --node wk-edge-01 --yes --no-apt                         # 一个字节都不动 apt
+  $0 --node wk-edge-01 --yes --extra-pkgs                     # 另外装可选工具 (vim/htop/...)
+  $0 --node wk-edge-01 --yes --extra-pkgs "vim iotop"         # 只装指定的可选工具
   $0                                                          # 无参数: 全交互询问
 EOF
 }
@@ -660,8 +789,18 @@ while [[ $# -gt 0 ]]; do
         --apt-upgrade)  DO_APT_UPGRADE=true;  APT_OPTS_EXPLICIT=true; shift ;;
         --no-apt-upgrade) DO_APT_UPGRADE=false; APT_OPTS_EXPLICIT=true; shift ;;
         --no-apt-pkgs)  DO_APT_PKGS=false;  APT_OPTS_EXPLICIT=true; shift ;;
+        --extra-pkgs)   DO_EXTRA_PKGS=true; APT_OPTS_EXPLICIT=true
+                        # 可带值 (包名列表); 不带值或下一个参数是选项 -> 用预设清单
+                        if [ $# -ge 2 ] && [ -n "${2:-}" ] && [ "${2#-}" = "$2" ]; then
+                            EXTRA_PKGS_REQUEST="$2"; shift 2
+                        else
+                            EXTRA_PKGS_REQUEST=""; shift
+                        fi ;;
+        --no-extra-pkgs) DO_EXTRA_PKGS=false; EXTRA_PKGS_REQUEST=""
+                        APT_OPTS_EXPLICIT=true; shift ;;
         --no-apt)       DO_MIRROR=false; DO_APT_UPDATE=false
                         DO_APT_UPGRADE=false; DO_APT_PKGS=false
+                        DO_EXTRA_PKGS=false; EXTRA_PKGS_REQUEST=""
                         APT_OPTS_EXPLICIT=true; shift ;;
         -y|--yes)       ASSUME_YES=true;   shift ;;
         --dry-run)      DRY_RUN=true;      shift ;;
@@ -1116,9 +1255,15 @@ if [ "$DRY_RUN" = true ]; then
         echo "  将跳过: SD 卡挂载与 Docker 数据迁移"
     fi
     if [ "$DO_APT_PKGS" = true ]; then
-        echo "  将执行: 安装基础工具 (curl wget git parted wireguard-tools 等)"
+        pkg_install_list
+        echo "  将执行: 安装基础工具 (${INSTALL_PKGS})"
+        if [ "${DO_EXTRA_PKGS:-false}" = true ]; then
+            echo "  将执行: 安装可选工具 (${INSTALL_EXTRA_PKGS:-无 —— 全部被黑名单剔除})"
+        else
+            echo "  将跳过: 可选工具 (默认不装, 需要时加 --extra-pkgs)"
+        fi
     else
-        echo "  将跳过: 基础工具安装"
+        echo "  将跳过: 基础工具与可选工具安装"
     fi
     if apt_switch_all_off; then
         echo "  将跳过: 全部 apt 动作 (换源/刷新索引/升级/装包) —— 一个字节都不动 apt"
@@ -1195,19 +1340,23 @@ else
     fi
 fi
 
-# ---- 5. 安装基础工具 (默认执行; --no-apt-pkgs / --no-apt 可跳过) ----
+# ---- 5. 安装基础工具 (默认只装核心包; 可选包需 --extra-pkgs 显式开启) ----
 # 注意: 这里刻意不含 wireguard-dkms —— Debian 12 (bookworm) 起该包已从仓库移除
 #       (bullseye 尚在; 内核 5.6+ 已内置 wireguard 模块, 本就无需 dkms)。
 #       老内核且源里确实提供该包时才按需安装, 见下方。
+# 目标机是无头服务器: 任何桌面套件 / Xorg / 显示管理器 / GUI 应用都不在清单里,
+# 即便用户经 --extra-pkgs 显式列出, 也会被 pkg_gui_filter 剔除。
 if [ "$DO_APT_PKGS" != true ]; then
-    log_info "跳过基础工具安装 (--no-apt-pkgs): 请自行确认 curl/git/parted/wireguard-tools 已就绪"
+    log_info "跳过基础工具安装 (--no-apt-pkgs): 请自行确认 ${BASE_PKGS} 已就绪"
 else
-    log_info "安装基础工具..."
-    if ! apt_run "安装基础工具" apt install -y \
-        curl wget git vim htop iotop net-tools dnsutils \
-        parted fdisk dosfstools rsync unzip jq ca-certificates \
-        gnupg lsb-release software-properties-common \
-        wireguard-tools; then
+    pkg_install_list
+    if [ "${DO_EXTRA_PKGS:-false}" != true ]; then
+        log_info "可选工具默认不装 (wget/vim/htop/iotop/net-tools/...); 需要请加 --extra-pkgs"
+    fi
+    log_info "安装基础工具: ${INSTALL_PKGS}"
+    if [ -z "$INSTALL_PKGS" ]; then
+        log_warn "装包清单为空, 跳过 apt install"
+    elif ! apt_run "安装基础工具" apt install -y $INSTALL_PKGS; then
         log_warn "基础工具安装失败, 已继续后续步骤 (不中断初始化)"
         if [ "$DO_APT_UPDATE" != true ]; then
             log_warn "  当前未刷新 apt 索引, 多半是索引过期; 可加 --apt-update 重跑, 或手工 apt update"
