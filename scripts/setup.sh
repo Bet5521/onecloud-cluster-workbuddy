@@ -23,9 +23,16 @@ log_error()   { echo -e "${RED}[ERROR]${NC} $*"; }
 log_step()    { echo -e "\n${BLUE}${BOLD}==> $*${NC}"; }
 log_success() { echo -e "${GREEN}${BOLD}✓ $*${NC}"; }
 
-# ---- 全局配置 ----
-DATA_DIR="/mnt/sd/srv"          # 数据根目录(优先 SD 卡)
-[ -d /mnt/sd ] || DATA_DIR="/opt/onecloud/srv"
+# ---- 全局配置 (安装路径自适应) ----
+# 探测 SD 卡实际状态: 已挂载/可读写/空间充足 -> 用其挂载点; 否则回退 /opt/onecloud
+SCRIPT_DIR_SETUP="$(cd "$(dirname "$0")" && pwd)"
+if [ -f "${SCRIPT_DIR_SETUP}/lib-install-path.sh" ]; then
+    # shellcheck disable=SC1090
+    source "${SCRIPT_DIR_SETUP}/lib-install-path.sh"
+    resolve_data_root
+fi
+DATA_DIR="$(install_path_for srv 2>/dev/null)"
+[ -z "$DATA_DIR" ] && DATA_DIR="/opt/onecloud/srv"
 COMPOSE_DIR="${DATA_DIR}"       # docker-compose 目录
 TZ="Asia/Shanghai"
 PUID=1000

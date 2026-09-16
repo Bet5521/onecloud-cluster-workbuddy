@@ -29,6 +29,13 @@ if [ -f "${SCRIPT_DIR}/lib-network-audit.sh" ]; then
     fi
 fi
 
+# 安装路径自适应库 (SD 卡状态探测 -> 动态选择 /opt 回退)
+# 库缺失时降级为固定 /opt/onecloud, 不影响初始化主流程
+if [ -f "${SCRIPT_DIR}/lib-install-path.sh" ]; then
+    # shellcheck source=lib-install-path.sh
+    source "${SCRIPT_DIR}/lib-install-path.sh"
+fi
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -1632,16 +1639,25 @@ grep -q '^net.ipv4.conf.all.src_valid_mark=1' /etc/sysctl.conf 2>/dev/null || \
     echo 'net.ipv4.conf.all.src_valid_mark=1' >> /etc/sysctl.conf
 sysctl -p 2>/dev/null || true
 
-# ---- 14. 创建目录结构 ----
-DATA_ROOT="${SD_MOUNT}"
-if [ "$SD_MOUNTED" != true ]; then
-    DATA_ROOT="/mnt/sd"
+# ---- 14. 创建目录结构 (安装路径自适应: SD 可用用 SD, 否则回退 /opt) ----
+# --no-sd 时用户显式跳过 SD 卡, 直接走 /opt 回退; 否则运行时重新评估 SD 真实状态
+if [ "$SD_ENABLE" != true ]; then
+    DATA_ROOT="${INSTALL_FALLBACK_ROOT:-/opt/onecloud}"
+    INSTALL_VIA_SD=0
+    INSTALL_SOURCE="本地回退 (/opt) - 用户指定 --no-sd"
+    log_warn "已指定 --no-sd: 安装目录固定为 ${DATA_ROOT}"
+else
+    resolve_data_root
 fi
-log_info "创建目录结构: ${DATA_ROOT}/srv/${NODE_NAME}"
-mkdir -p "${DATA_ROOT}/srv/${NODE_NAME}"/{cloudflared,adguard/{work,conf},wireguard/config,
-    clash,memos/data,homeassistant,piwigo/{config,gallery},xiaomusic,
-    migpt,syncthing/{config,data},verysync/{temp},aria2/{config,downloads},
-    cupsd/{config,printers,spool},cups-web/config,panel}
+
+# 服务数据目录清单 (相对 srv/<节点>); SD 写入失败会自动降级到 /opt 同路径
+SVC_TREE="cloudflared adguard/{work,conf} wireguard/config \
+    clash memos/data homeassistant piwigo/{config,gallery} xiaomusic \
+    migpt syncthing/{config,data} verysync/{temp} aria2/{config,downloads} \
+    cupsd/{config,printers,spool} cups-web/config panel"
+
+log_info "创建目录结构: ${DATA_ROOT}/srv/${NODE_NAME} (来源: ${INSTALL_SOURCE})"
+safe_install_tree "srv/${NODE_NAME}" "${SVC_TREE}" "服务数据目录"
 
 # ---- 15. 生成 SSH 密钥 (如不存在) ----
 if [ ! -f /root/.ssh/id_ed25519 ]; then
@@ -1659,16 +1675,16 @@ echo ""
 echo "节点信息:"
 echo "  主机名: $HOSTNAME"
 echo "  IP:     $NODE_IP"
-if [ "$SD_MOUNTED" = true ]; then
-    echo "  存储:   ${SD_MOUNT} (SD卡, 自动挂载: $([ "$SD_AUTOMOUNT" = true ] && echo 是 || echo 否))"
+if [ "$INSTALL_VIA_SD" = 1 ]; then
+    echo "  存储:   ${DATA_ROOT} (SD卡, 自动挂载: $([ "$SD_AUTOMOUNT" = true ] && echo 是 || echo 否))"
 else
-    echo "  存储:   未挂载 SD 卡 (数据位于 eMMC ${DATA_ROOT})"
+    echo "  存储:   回退安装目录 (${INSTALL_SOURCE})"
 fi
 echo "  Swap:   2GB"
 echo ""
 echo "下一步:"
 echo "  1. 将此节点的 SSH 公钥添加到其他节点的 authorized_keys"
-echo "  2. 克隆 onecloud-cluster 仓库到 ${SD_MOUNT}/"
+echo "  2. 克隆 onecloud-cluster 仓库到 ${DATA_ROOT}/"
 echo "  3. 复制对应 node-xxx 目录的 docker-compose.yml 到 ${DATA_ROOT}/srv/${NODE_NAME}/"
 echo "  4. 运行 ./scripts/deploy.sh 分发配置"
 echo "  5. 启动服务: cd ${DATA_ROOT}/srv/${NODE_NAME} && docker-compose up -d"

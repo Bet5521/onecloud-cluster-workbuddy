@@ -201,6 +201,14 @@ panel_host_cidr 192.168.1.101        # 192.168.1.0/24（网络地址 + 前缀）
 桌面/图形包即便被显式列出也会被 `pkg_gui_filter()` 剔除并告警。
 详见 `docs/package-trim.md`。
 
+#### 安装路径自适应（SD 卡 → /opt 回退）
+
+初始化（`bootstrap.sh` 第 14 步）与安装（`setup.sh` 全局配置）统一调用
+`lib-install-path.sh` 的 `resolve_data_root()`：SD 卡设备存在且已挂载、可读写、空间充足
+（默认 ≥ `SD_MIN_SPACE_MB=512`）时安装到其运行时查询得到的挂载点；否则自动回退 `/opt/onecloud`，
+**不阻断流程**。写 SD 失败时 `safe_install_dir` / `safe_install_file` 自动降级到 /opt 并重试。
+详见 `docs/install-path.md`。
+
 **参数与询问的关系**
 
 传入的参数一律直接生效；只有"未提供且无法从清单/探测推断"的项才在终端可用时询问

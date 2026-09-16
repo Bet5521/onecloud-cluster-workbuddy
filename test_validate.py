@@ -4957,6 +4957,237 @@ echo "###DONE"
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+# ============ 安装路径自适应 (无卡/未挂载/只读/空间不足 -> /opt 回退) ============
+def test_install_path_adaptive():
+    """验证 lib-install-path.sh 的决策流:
+       SD 卡设备 -> 已挂载 -> 可读写 -> 空间足够 才装到 SD; 否则回退 /opt,
+       且写入 SD 失败时自动降级到 /opt 并记录日志。
+    """
+    lib = SCRIPTS_DIR / "lib-install-path.sh"
+    boot = SCRIPTS_DIR / "bootstrap.sh"
+    setup = SCRIPTS_DIR / "setup.sh"
+
+    # ---- 静态检查: 库与调用点存在 ----
+    if not lib.exists():
+        log_fail("缺少 scripts/lib-install-path.sh")
+        return
+    lsrc = lib.read_text(encoding="utf-8")
+    needed = ["sd_probe()", "sd_mount_state()", "sd_rw_ok()", "sd_space_ok()",
+              "sd_evaluate()", "resolve_data_root()", "install_path_for()",
+              "safe_install_dir()", "safe_install_file()", "safe_install_tree()"]
+    miss = [n for n in needed if n not in lsrc]
+    if not miss:
+        log_pass("lib-install-path.sh 提供完整决策函数集")
+    else:
+        log_fail("lib-install-path.sh 缺函数", str(miss))
+        return
+
+    bsrc = boot.read_text(encoding="utf-8")
+    if 'source "${SCRIPT_DIR}/lib-install-path.sh"' in bsrc \
+            and "resolve_data_root" in bsrc and "safe_install_tree" in bsrc:
+        log_pass("bootstrap.sh 引入并使用了安装路径自适应库")
+    else:
+        log_fail("bootstrap.sh 未接入安装路径自适应库")
+
+    ssrc = setup.read_text(encoding="utf-8")
+    if 'source "${SCRIPT_DIR_SETUP}/lib-install-path.sh"' in ssrc \
+            and "resolve_data_root" in ssrc and 'install_path_for srv' in ssrc:
+        log_pass("setup.sh 引入并使用了安装路径自适应库")
+    else:
+        log_fail("setup.sh 未接入安装路径自适应库")
+
+    # 旧写死逻辑必须已移除
+    if 'DATA_ROOT="/mnt/sd"' in bsrc:
+        log_fail("bootstrap.sh 仍写死 DATA_ROOT=\"/mnt/sd\" (无卡时会指向不存在的目录)")
+    else:
+        log_pass("bootstrap.sh 已移除写死的 /mnt/sd 回退路径")
+    if '[ -d /mnt/sd ] || DATA_DIR="/opt/onecloud/srv"' in ssrc:
+        log_fail("setup.sh 仍写死 [ -d /mnt/sd ] 判定")
+    else:
+        log_pass("setup.sh 已移除写死的 /mnt/sd 目录判定")
+
+    # ---- 行为验证 (mock 环境) ----
+    def _posix(p):
+        s = Path(p).as_posix()
+        m = re.match(r"^([A-Za-z]):/(.*)$", s)
+        return f"/{m.group(1).lower()}/{m.group(2)}" if m else s
+
+    tmpdir = Path(tempfile.mkdtemp(prefix="oc_t30_"))
+    try:
+        sd = tmpdir / "sdmount"
+        opt = tmpdir / "optfallback"
+        sd.mkdir(); opt.mkdir()
+        mockbin = tmpdir / "mockbin"
+        mockbin.mkdir()
+
+        # 默认 mock: SD 可用 (mmcblk1 可移动, 挂载在 sd, 空间充足)
+        (mockbin / "lsblk").write_text(
+            "#!/bin/bash\n"
+            'echo "mmcblk0  0 disk"\n'
+            '[ "${MOCK_NO_SD:-0}" = "1" ] || echo "mmcblk1  1 disk"\n'
+            "exit 0\n", encoding="utf-8", newline="\n")
+        (mockbin / "findmnt").write_text(
+            "#!/bin/bash\n"
+            'if [ "$1" = "-n" ] && [ "$2" = "-o" ] && [ "$3" = "TARGET" ] && [ "$4" = "--source" ]; then\n'
+            f'  [ "$5" = "/dev/mmcblk1p1" ] && echo "{_posix(sd)}"\n'
+            "fi\n"
+            "exit 0\n", encoding="utf-8", newline="\n")
+        (mockbin / "mountpoint").write_text(
+            "#!/bin/bash\n"
+            f'[ "$2" = "{_posix(sd)}" ] && exit 0\n'
+            "exit 1\n", encoding="utf-8", newline="\n")
+        (mockbin / "df").write_text(
+            "#!/bin/bash\n"
+            'H="Filesystem\\t1024-blocks\\tUsed\\tAvailable\\tUse%\\tMounted"\n'
+            'if [ "$1" = "-Pm" ]; then\n'
+            f'  if [ "$2" = "{_posix(sd)}" ]; then echo -e "$H"; echo -e "dev\\t100000\\t10000\\t90000\\t10%\\t$2"; exit 0; fi\n'
+            '  echo -e "$H"; echo -e "dev\\t100000\\t100\\t99900\\t1%\\t$2"; exit 0\n'
+            "fi\n"
+            'if [ "$1" = "-Ph" ]; then echo -e "Filesystem\\tSize\\tUsed\\tAvail\\tUse%\\tMounted";'
+            f' echo -e "dev\\t98G\\t10G\\t88G\\t10%\\t$2"; exit 0; fi\n'
+            "exit 0\n", encoding="utf-8", newline="\n")
+        # 保存默认 df, 供空间不足场景之后恢复
+        (mockbin / "df").replace(mockbin / "df.bak")
+        for f in mockbin.iterdir():
+            try:
+                os.chmod(f, 0o755)
+            except OSError:
+                pass
+
+        driver = tmpdir / "drive.sh"
+        driver.write_text(
+            "#!/bin/bash\n"
+            "set -u\n"
+            f'source "{_posix(lib)}"\n'
+            f'export INSTALL_FALLBACK_ROOT="{_posix(opt)}"\n'
+            "export SD_MIN_SPACE_MB=512\n"
+            "export OC_TEST_NO_SYSBLOCK=1\n"
+            f'export PATH="{_posix(mockbin)}:$PATH"\n'
+            "\n"
+            "# A) SD 可用\n"
+            "ONECLOUD_SD_TEST_DEV=mmcblk1 resolve_data_root\n"
+            'echo "SD_USABLE|${DATA_ROOT}|${INSTALL_VIA_SD}"\n'
+            'echo "PATHFOR|$(install_path_for srv)|$(install_path_for docker)|$(install_path_for backups)"\n'
+            "\n"
+            "# B) 无 SD 卡\n"
+            "MOCK_NO_SD=1 resolve_data_root\n"
+            'echo "NO_SD|${DATA_ROOT}|${SD_REJECT_REASON}"\n'
+            "\n"
+            "# C) 设备存在但未挂载 (findmnt 返回空)\n"
+            f'cp "{_posix(mockbin)}/findmnt" "{_posix(mockbin)}/findmnt.bak"\n'
+            f'printf \'#!/bin/bash\\nexit 0\\n\' > "{_posix(mockbin)}/findmnt"\n'
+            "ONECLOUD_SD_TEST_DEV=mmcblk1 resolve_data_root\n"
+            'echo "NOT_MOUNTED|${DATA_ROOT}|${SD_REJECT_REASON}"\n'
+            f'cp "{_posix(mockbin)}/findmnt.bak" "{_posix(mockbin)}/findmnt"\n'
+            "\n"
+            "# D) 写入 SD 失败 -> 自动降级 /opt\n"
+            "ONECLOUD_SD_TEST_DEV=mmcblk1 resolve_data_root\n"
+            'BEFORE="${DATA_ROOT}"\n'
+            "ONECLOUD_SD_TEST_FORCE_DEGRADE=1 safe_install_dir \"srv/test\" \"test\"\n"
+            'AFTER="${DATA_ROOT}"\n'
+            f'MARKER=no; [ -d "{_posix(opt)}/srv/test" ] && MARKER=yes\n'
+            'echo "DEGRADE_DIR|before=${BEFORE}|after=${AFTER}|marker=${MARKER}"\n'
+            "\n"
+            "# E) 空间不足\n"
+            f'cp "{_posix(mockbin)}/df.bak" "{_posix(mockbin)}/df"\n'
+            f'cat > "{_posix(mockbin)}/df" <<\'DF\'\n'
+            "#!/bin/bash\n"
+            'H="Filesystem\\t1024-blocks\\tUsed\\tAvailable\\tUse%\\tMounted"\n'
+            'if [ "$1" = "-Pm" ]; then\n'
+            f'  if [ "$2" = "{_posix(sd)}" ]; then echo -e "$H"; echo -e "dev\\t100000\\t99999\\t1\\t99%\\t$2"; exit 0; fi\n'
+            '  echo -e "$H"; echo -e "dev\\t100000\\t100\\t99900\\t1%\\t$2"; exit 0\n'
+            "fi\n"
+            'if [ "$1" = "-Ph" ]; then echo -e "Filesystem\\tSize\\tUsed\\tAvail\\tUse%\\tMounted";'
+            f' echo -e "dev\\t98G\\t97G\\t1G\\t99%\\t$2"; exit 0; fi\n'
+            "exit 0\n"
+            "DF\n"
+            "chmod +x " + f'"{_posix(mockbin)}/df"\n'
+            "ONECLOUD_SD_TEST_DEV=mmcblk1 resolve_data_root\n"
+            'echo "SPACE_LOW|${DATA_ROOT}|${SD_REJECT_REASON}"\n'
+            "\n"
+            "# F) SD 可用时正常写入文件\n"
+            f'cp "{_posix(mockbin)}/df.bak" "{_posix(mockbin)}/df"\n'
+            "chmod +x " + f'"{_posix(mockbin)}/df"\n'
+            "ONECLOUD_SD_TEST_DEV=mmcblk1 resolve_data_root\n"
+            'safe_install_file "srv/app/conf.yml" "hello: world" "app配置"\n'
+            f'WRITTEN=no; [ -f "{_posix(sd)}/srv/app/conf.yml" ] && WRITTEN=yes\n'
+            'echo "FILE_SD|written=${WRITTEN}"\n',
+            encoding="utf-8", newline="\n")
+
+        env = dict(os.environ)
+        env["PATH"] = _posix(mockbin) + ":/usr/bin:/bin"
+        env["BASH_ENV"] = ""
+        r = subprocess.run(["bash", _posix(driver)], env=env, cwd=str(tmpdir),
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", stdin=subprocess.DEVNULL, timeout=120)
+        out = r.stdout + r.stderr
+
+        def line(tag):
+            m = re.search(rf"^{tag}\|(.+)$", out, re.M)
+            return m.group(1) if m else ""
+
+        # A
+        a = line("SD_USABLE")
+        if a and a.split("|")[0] == _posix(sd) and a.split("|")[1] == "1":
+            log_pass("SD 卡可用时安装路径指向 SD 挂载点 (INSTALL_VIA_SD=1)")
+        else:
+            log_fail("SD 可用时未选择 SD 挂载点", a)
+        pf = line("PATHFOR")
+        if pf:
+            s_, d_, b_ = pf.split("|")
+            if s_ == f"{_posix(sd)}/srv" and d_ == f"{_posix(sd)}/docker" \
+                    and b_ == f"{_posix(sd)}/backups":
+                log_pass("install_path_for 按组件返回 SD 下正确子目录")
+            else:
+                log_fail("install_path_for 子目录映射错误", pf)
+        else:
+            log_fail("未输出 PATHFOR")
+
+        # B
+        b = line("NO_SD")
+        if b and b.split("|")[0] == _posix(opt) and "未检测到 SD 卡设备" in b:
+            log_pass("无 SD 卡设备时回退 /opt 且原因明确")
+        else:
+            log_fail("无 SD 卡未正确回退 /opt", b)
+
+        # C
+        c = line("NOT_MOUNTED")
+        if c and c.split("|")[0] == _posix(opt) and "SD 卡未挂载" in c:
+            log_pass("设备存在但未挂载时回退 /opt (不阻断流程)")
+        else:
+            log_fail("未挂载未正确回退 /opt", c)
+
+        # D
+        d = line("DEGRADE_DIR")
+        if d:
+            parts = dict(x.split("=") for x in d.split("|")[1:])
+            if parts.get("after") == _posix(opt) and parts.get("marker") == "yes":
+                log_pass("写入 SD 失败时自动降级到 /opt 且目录在 /opt 落地")
+            else:
+                log_fail("SD 写入失败未正确降级", d)
+        else:
+            log_fail("未输出 DEGRADE_DIR")
+
+        # E
+        e = line("SPACE_LOW")
+        if e and e.split("|")[0] == _posix(opt) and "可用空间不足" in e:
+            log_pass("SD 卡空间不足时回退 /opt 且原因含阈值")
+        else:
+            log_fail("空间不足未正确回退 /opt", e)
+
+        # F
+        f = line("FILE_SD")
+        if f and f.split("=")[1] == "yes":
+            log_pass("SD 可用时文件成功写入 SD 挂载点")
+        else:
+            log_fail("SD 可用时文件未写入 SD", f)
+    except Exception as ex:
+        log_fail(f"安装路径自适应验证异常: {str(ex)}")
+        return
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 # ============ 主程序 ============
 def main():
     print("=" * 60)
@@ -4995,6 +5226,7 @@ def main():
         ("部署零防火墙改动与建议清单", test_deploy_no_firewall),
         ("脚本 usage 与实现一致性 (CLI 契约)", test_cli_usage_contract),
         ("初始化装包精简 (无头服务器)", test_bootstrap_pkg_slim),
+        ("安装路径自适应 (SD卡->/opt 回退)", test_install_path_adaptive),
     ]
     
     for test_name, test_func in tests:

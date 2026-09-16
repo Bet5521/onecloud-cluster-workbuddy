@@ -2,7 +2,7 @@
 
 > 基于玩客云 WS1608 (Amlogic S805, ARMv7, 1GB RAM) 多节点组建的家庭服务集群
 
-**当前版本: v1.5.2**
+**当前版本: v1.5.3**
 
 ---
 
@@ -462,6 +462,40 @@ python3 test_validate.py
   校验功能脚本无硬编码 IP、每个节点 hostname 字段齐全、环境变量覆盖真实生效
 - 验证项从 176 扩至 **184**（全部通过、0 警告）
 - 新增 `inventory/nodes.local.yaml.example` 覆盖模板（真实覆盖文件已 gitignore）
+
+---
+
+## 🚀 v1.5.3 变更说明
+
+**主题：安装路径自适应 —— SD 卡可用时用 SD，否则（无卡/未挂载/只读/空间不足）自动回退 /opt，且不阻断初始化。**
+
+### 决策流程
+
+初始化阶段（`bootstrap.sh` 第 14 步）与安装阶段（`setup.sh` 全局配置）统一调用 `lib-install-path.sh` 的
+`resolve_data_root()`，按 **设备存在 → 分区可见 → 已挂载（运行时查询）→ 挂载点可读写 → 剩余空间充足**
+逐级判定：
+
+- 全部满足 → 安装到 SD 卡**实际挂载点**（通过 `findmnt --source <设备>` 查询得到，不写死 `/mnt/sd`）
+- 任意一级不满足 → 回退安装根目录到 `/opt/onecloud`，流程不中断
+
+### 关键性质
+
+- **SD 卡不是硬性前置**：无卡 / 未挂载 / 挂载只读 / 空间不足都是正常状态，只降级不报错
+- **挂载路径运行时查询**：移除原 `bootstrap.sh` 写死的 `DATA_ROOT="/mnt/sd"` 与 `setup.sh` 的
+  `[ -d /mnt/sd ]` 判定
+- **写入过程异常回退**：`safe_install_dir` / `safe_install_file` 往 SD 写目录或文件失败时，自动把
+  `DATA_ROOT` 切回 `/opt/onecloud` 重试，并输出 `[ERROR]`/`[WARN]` 明确状态
+- 回退根目录、最小可用空间（`SD_MIN_SPACE_MB`，默认 512）均为可覆盖环境变量
+
+### 实现与验证
+
+- 新增 `scripts/lib-install-path.sh`：`sd_probe` / `sd_mount_state` / `sd_rw_ok` / `sd_space_ok` /
+  `sd_evaluate` / `resolve_data_root` / `install_path_for` / `safe_install_dir` / `safe_install_tree` /
+  `safe_install_file`
+- 详细设计见 [docs/install-path.md](docs/install-path.md)
+- 新增第 30 组测试「**安装路径自适应**」12 项：SD 可用 / 无设备 / 未挂载 / 写入失败降级 /
+  空间不足 / 组件路径映射 / 静态接入点检查
+- 全量 **472 项 / 30 组**，全部通过
 
 ---
 
