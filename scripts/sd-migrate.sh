@@ -16,7 +16,12 @@
 #   * 迁移失败不破坏来源(默认保留, --clean 才删除)
 #   * 支持 --dry-run 预演
 # ============================================================
-set -o pipefail
+set -euo pipefail
+
+# ---------------- 日志 ----------------
+log_info()  { echo "[INFO]  $*"; }
+log_warn()  { echo "[WARN]  $*" >&2; }
+log_error() { echo "[ERROR] $*" >&2; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 if [ -f "${SCRIPT_DIR}/lib-install-path.sh" ]; then

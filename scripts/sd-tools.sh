@@ -12,7 +12,12 @@
 #   ./scripts/sd-tools.sh replace [参数]   -> 透传 sd-replace.sh
 #   ./scripts/sd-tools.sh format   [参数]   -> 透传 sd-format.sh
 # ============================================================
-set -o pipefail
+set -euo pipefail
+
+# ---------------- 日志 ----------------
+log_info()  { echo "[INFO]  $*"; }
+log_warn()  { echo "[WARN]  $*" >&2; }
+log_error() { echo "[ERROR] $*" >&2; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 

@@ -15,7 +15,12 @@
 #   * 设备/分区一律运行时探测, 不写死 /dev/mmcblk1
 #   * 挂载点运行时查询, 不写死 /mnt/sd
 # ============================================================
-set -o pipefail
+set -euo pipefail
+
+# ---------------- 日志 ----------------
+log_info()  { echo "[INFO]  $*"; }
+log_warn()  { echo "[WARN]  $*" >&2; }
+log_error() { echo "[ERROR] $*" >&2; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 if [ -f "${SCRIPT_DIR}/lib-install-path.sh" ]; then
@@ -89,16 +94,16 @@ format_sd() {
   if [ "$DRY_RUN" = 1 ]; then
     log_info "[dry-run] parted -s $dev mklabel gpt mkpart primary ext4 0% 100%"
     log_info "[dry-run] mkfs.ext4 -F -L onecloud-sd $part"
-    [ -n "$FMT_LOG" ] && echo "DRYRUN $dev" >> "$FMT_LOG"
+    if [ -n "$FMT_LOG" ]; then echo "DRYRUN $dev" >> "$FMT_LOG"; fi
     return 0
   fi
   log_info "正在将 $dev 分区并格式化为 ext4 ..."
   if command -v parted >/dev/null 2>&1; then
-    parted -s "$dev" mklabel gpt 2>/dev/null
-    parted -s "$dev" mkpart primary ext4 0% 100% 2>/dev/null
+    parted -s "$dev" mklabel gpt 2>/dev/null || true
+    parted -s "$dev" mkpart primary ext4 0% 100% 2>/dev/null || true
   elif command -v sfdisk >/dev/null 2>&1; then
-    sfdisk "$dev" >/dev/null 2>&1 <<< 'label: gpt'
-    sfdisk "$dev" >/dev/null 2>&1 <<< 'type=L'
+    sfdisk "$dev" >/dev/null 2>&1 <<< 'label: gpt' || true
+    sfdisk "$dev" >/dev/null 2>&1 <<< 'type=L' || true
   else
     log_error "未找到 parted/sfdisk, 无法分区"; return 1
   fi
@@ -107,7 +112,7 @@ format_sd() {
   if ! mkfs.ext4 -F -L onecloud-sd "$part" 2>/dev/null; then
     log_error "mkfs.ext4 失败: $part"; return 1
   fi
-  [ -n "$FMT_LOG" ] && echo "MKFS $part" >> "$FMT_LOG"
+  if [ -n "$FMT_LOG" ]; then echo "MKFS $part" >> "$FMT_LOG"; fi
   log_info "已完成格式化: $part (ext4)"
   return 0
 }
