@@ -8,7 +8,9 @@
 #   - 修改 nodes.yaml 中的 ip / wg_ip / hostname 后,
 #     重新运行本脚本即可刷新面板, 无需手改 config.json。
 #   - 支持 nodes.local.yaml / 环境变量覆盖 (见 nodes.yaml 头部说明)。
-# 用法: bash scripts/gen-panel-config.sh
+# 用法: bash scripts/gen-panel-config.sh [--out FILE_OR_DIR]
+#   --out  指定输出 (默认仓库内 panel/config.json; 传目录则写 <目录>/config.json)
+#          面板已安装到稳定目录时, 用 --out /opt/onecloud/panel 同步到实际运行目录
 # ============================================================
 set -euo pipefail
 
@@ -16,8 +18,26 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 source "$SCRIPT_DIR/lib-nodes.sh"
 
-PANEL_CONFIG="${ROOT_DIR}/panel/config.json"
-VERSION="${ONECLOUD_PANEL_VERSION:-1.5.4}"
+VERSION="${ONECLOUD_PANEL_VERSION:-1.5.5}"
+
+# 输出路径: 命令行 > 环境变量 > 仓库内 panel/config.json
+#   --out FILE  写指定文件; 若传入的是已存在的目录, 则写 <目录>/config.json
+PANEL_CONFIG="${ONECLOUD_PANEL_CONFIG:-${ROOT_DIR}/panel/config.json}"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -o|--out) PANEL_CONFIG="${2:-}"; shift 2 ;;
+        -h|--help)
+            sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
+            echo "用法: bash scripts/gen-panel-config.sh [--out FILE_OR_DIR]"
+            exit 0 ;;
+        *) echo "[ERROR] 未知选项: $1" >&2; exit 2 ;;
+    esac
+done
+[ -n "$PANEL_CONFIG" ] || { echo "[ERROR] 输出路径为空" >&2; exit 2; }
+# 传入目录时补全文件名
+if [ -d "$PANEL_CONFIG" ]; then
+    PANEL_CONFIG="${PANEL_CONFIG%/}/config.json"
+fi
 
 # 通用日志
 log_info()  { echo -e "\033[0;32m[INFO]\033[0m $*"; }
@@ -73,6 +93,9 @@ build_services() {
     done
     echo "$out"
 }
+
+# 输出目录不存在时先建 (--out 指定了稳定目录的场景)
+mkdir -p "$(dirname "$PANEL_CONFIG")" 2>/dev/null || true
 
 # 逐行拼装, 避免多行变量拼接导致的逗号丢失
 {

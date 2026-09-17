@@ -248,6 +248,39 @@ node_by_ip() {
     return 1
 }
 
+# ------------------------------------------------------------
+# 远程数据根目录: 节点上「服务数据实际所在」的根
+#
+# 背景: bootstrap.sh 会自适应选择数据根 —— SD 卡可用则挂载点, 否则回退
+#       /opt/onecloud; 但控制端的 deploy/backup/restore/update 若一律按
+#       /mnt/sd 读写, 在「无卡节点」上就会操作到不存在的目录。
+#       节点在初始化时把结果写进 /etc/onecloud/install.conf (DATA_ROOT=...),
+#       这里通过 SSH 读取它, 与节点事实保持一致。
+#
+# 用法: node_data_root <IP 或节点名>
+# 取不到时回退 ONECLOUD_REMOTE_DATA_ROOT (默认 /mnt/sd, 兼容旧环境)。
+# ------------------------------------------------------------
+node_data_root() {
+    local q="$1"
+    local ip="$q" dr="" n
+    # 允许直接传节点名
+    if [ -n "${NODE_NAMES[*]:-}" ]; then
+        for n in "${NODE_NAMES[@]}"; do
+            [ "$n" = "$q" ] && { ip="$(node_ip "$n")"; break; }
+        done
+    fi
+    if [ -n "$ip" ] && command -v ssh >/dev/null 2>&1; then
+        dr="$(ssh -o ConnectTimeout=4 -o BatchMode=yes "root@${ip}" \
+              "sed -n 's/^DATA_ROOT=//p' /etc/onecloud/install.conf 2>/dev/null | head -1" \
+              2>/dev/null || true)"
+        case "$dr" in
+            /*) printf '%s' "$dr"; return 0 ;;
+        esac
+    fi
+    printf '%s' "${ONECLOUD_REMOTE_DATA_ROOT:-/mnt/sd}"
+}
+
+
 # 按角色取节点名 (找不到时回退到按关键字匹配节点名)
 #   node_name_by_role edge-gateway  ->  wk-edge-01
 node_name_by_role() {

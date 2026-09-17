@@ -78,6 +78,16 @@ backup_remote() {
     # 可选的额外 rsync 参数 (data 模式用它排除配置文件)
     local EXTRA_OPTS=${5:-}
 
+    # 路径归一化: 调用方按约定的 /mnt/sd/srv/... 书写, 这里映射到节点的**实际**
+    # 数据根 (SD 挂载点或 /opt/onecloud 回退, 读自 /etc/onecloud/install.conf)。
+    # 否则「无 SD 卡节点」上 /mnt/sd 不存在, 备份会静默跳过。
+    local _root
+    _root="$(node_data_root "$NODE_IP")"
+    case "$REMOTE_PATH" in
+        /mnt/sd/srv*) REMOTE_PATH="${_root}${REMOTE_PATH#/mnt/sd}" ;;
+        /mnt/sd/*)    REMOTE_PATH="${_root}/${REMOTE_PATH#/mnt/sd/}" ;;
+    esac
+
     if ssh -o ConnectTimeout=5 "root@${NODE_IP}" "test -e $REMOTE_PATH" 2>/dev/null; then
         log_info "备份 $DESC from $NODE_IP..."
         # shellcheck disable=SC2086

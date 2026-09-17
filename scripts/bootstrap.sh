@@ -452,6 +452,66 @@ apt_switch_all_off() {
 }
 
 # ------------------------------------------------------------
+# 将本次部署选定的节点身份 upsert 到 inventory/nodes.local.yaml
+# (该文件不入库; 面板/部署/备份脚本都会读取它作为覆盖层)
+# 用法: update_local_inventory <节点名> <IP> <主机名> [WG_IP]
+# 返回 0=已写入; 1=失败。幂等: 已存在则就地更新字段, 不存在则追加到 nodes: 列表。
+# ------------------------------------------------------------
+update_local_inventory() {
+    local node="$1" ip="$2" host="$3" wg="${4:-}"
+    [ -n "$node" ] || return 1
+    local proj="${SCRIPT_DIR%/scripts}"
+    local dir="${proj}/inventory"
+    local f="${dir}/nodes.local.yaml"
+    mkdir -p "$dir" 2>/dev/null || return 1
+
+    if [ ! -f "$f" ]; then
+        {
+            echo "# 由 scripts/bootstrap.sh 自动维护 (不入库)"
+            echo "# 记录本机部署时选定的节点身份; 控制端面板/部署脚本读取此覆盖层。"
+            echo "nodes:"
+        } > "$f" 2>/dev/null || return 1
+    fi
+
+    local tmp="${f}.tmp.$$"
+    awk -v node="$node" -v ip="$ip" -v host="$host" -v wg="$wg" '
+    function emit() {
+        print "  - name: " node
+        if (host != "") print "    hostname: " host
+        if (ip   != "") print "    ip: " ip
+        if (wg   != "") print "    wg_ip: " wg
+    }
+    BEGIN { inblk = 0; found = 0; inserted = 0; in_nodes = 0 }
+    {
+        line = $0
+        if (inblk == 1) {
+            # 块结束: 遇新的列表项或顶层键
+            if (line ~ /^[[:space:]]*-[[:space:]]*name:/ || line ~ /^[A-Za-z_]/) {
+                inblk = 0
+            } else {
+                next    # 吞掉旧块内的字段
+            }
+        }
+        if (line ~ ("^[[:space:]]*-[[:space:]]*name:[[:space:]]*" node "[[:space:]]*$")) {
+            emit(); found = 1; inserted = 1; inblk = 1; next
+        }
+        if (line ~ /^[A-Za-z_]/) {
+            # 顶层键: 离开 nodes 段前, 若新节点尚未写入则补在 nodes 段末尾
+            if (in_nodes == 1 && inserted == 0 && found == 0 && ip != "") { emit(); inserted = 1 }
+            if (line ~ /^nodes:[[:space:]]*$/) in_nodes = 1
+            else in_nodes = 0
+            print; next
+        }
+        print
+    }
+    END { if (inserted == 0 && found == 0 && ip != "") emit() }' \
+        "$f" > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+
+    mv "$tmp" "$f" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    return 0
+}
+
+# ------------------------------------------------------------
 # 网段计算: 由 IP + 前缀得到 "网络地址 网关"
 # 网关取网络地址 + 1 (家用网段惯例), 输出 "<网络地址> <网关>"
 # 纯算术实现, 不依赖 awk 的位运算函数 (mawk 没有 and()/lshift())
@@ -1664,6 +1724,42 @@ if [ ! -f /root/.ssh/id_ed25519 ]; then
     log_info "生成 SSH 密钥..."
     ssh-keygen -t ed25519 -N "" -f /root/.ssh/id_ed25519 -C "root@${HOSTNAME}"
     chmod 600 /root/.ssh/id_ed25519
+fi
+
+# ---- 15b. 记录安装信息 + 回写节点清单 (供面板/部署/备份同步) ----
+# ① 节点侧权威记录: 数据根目录与节点身份。
+#    控制端 deploy/backup/restore 与面板配置同步据此定位远程路径,
+#    避免「无 SD 卡回退 /opt」的节点仍被按 /mnt/sd 读写。
+WG_IP_EFF="$(node_wg_ip "$NODE_NAME" 2>/dev/null || true)"
+INSTALL_CONF_DIR="${ONECLOUD_ETC_ROOT:-/etc}/onecloud"
+if mkdir -p "$INSTALL_CONF_DIR" 2>/dev/null; then
+    {
+        echo "# 由 scripts/bootstrap.sh 生成: 节点安装事实 (勿手改)"
+        echo "NODE_NAME=${NODE_NAME}"
+        echo "HOSTNAME=${HOSTNAME}"
+        echo "NODE_IP=${NODE_IP}"
+        echo "WG_IP=${WG_IP_EFF}"
+        echo "DATA_ROOT=${DATA_ROOT}"
+        echo "INSTALL_VIA_SD=${INSTALL_VIA_SD}"
+    } > "${INSTALL_CONF_DIR}/install.conf" 2>/dev/null \
+        && log_info "已记录安装信息: ${INSTALL_CONF_DIR}/install.conf" \
+        || log_warn "写入 ${INSTALL_CONF_DIR}/install.conf 失败"
+fi
+
+# ② 把本次选定的 IP/主机名 回写到 inventory/nodes.local.yaml。
+#    否则「部署时改的 IP」只落在本机网络配置里, 面板/部署脚本读到的仍是旧值,
+#    面板就会因 IP 不符而无法监控/操作该节点。
+if [ -d "${SCRIPT_DIR%/scripts}/inventory" ]; then
+    if update_local_inventory "$NODE_NAME" "$NODE_IP" "$HOSTNAME" "$WG_IP_EFF"; then
+        log_info "已回写节点清单: inventory/nodes.local.yaml (面板配置将据此刷新)"
+    else
+        log_warn "回写 inventory/nodes.local.yaml 失败 (可手工登记该节点)"
+    fi
+else
+    log_info "未找到 inventory/ 目录, 跳过清单回写; 请在控制端手工登记:"
+    echo "          - name: ${NODE_NAME}"
+    echo "            hostname: ${HOSTNAME}"
+    echo "            ip: ${NODE_IP}"
 fi
 
 # ---- 16. 显示完成信息 ----

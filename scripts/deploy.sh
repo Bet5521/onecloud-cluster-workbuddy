@@ -74,7 +74,11 @@ deploy_node() {
     local NODE_IP=$2
     local NODE_HOSTNAME=$3
     local NODE_SRC="${PROJECT_DIR}/node-${NODE_NAME}"
-    local REMOTE_BASE="/mnt/sd/srv/${NODE_NAME}"
+    # 远程数据根: 读取节点 /etc/onecloud/install.conf 的实际值 (SD 挂载点或 /opt 回退),
+    # 取不到才回退 /mnt/sd。避免「无 SD 卡节点」被按 /mnt/sd 分发到不存在的路径。
+    local REMOTE_ROOT REMOTE_BASE
+    REMOTE_ROOT="$(node_data_root "$NODE_IP")"
+    REMOTE_BASE="${REMOTE_ROOT}/srv/${NODE_NAME}"
 
     echo "--- $NODE_NAME ($NODE_IP, $NODE_HOSTNAME) ---"
 
@@ -105,10 +109,10 @@ deploy_node() {
 
     # 分发脚本和文档到公共位置
     if [ "$DRY_RUN" != "--dry-run" ]; then
-        ssh "root@${NODE_IP}" "mkdir -p /mnt/sd/scripts /mnt/sd/docs /mnt/sd/inventory"
-        rsync -avz $DRY_RUN "${SCRIPT_DIR}/" "root@${NODE_IP}:/mnt/sd/scripts/"
-        rsync -avz $DRY_RUN "${PROJECT_DIR}/docs/" "root@${NODE_IP}:/mnt/sd/docs/"
-        rsync -avz $DRY_RUN "${PROJECT_DIR}/inventory/" "root@${NODE_IP}:/mnt/sd/inventory/"
+        ssh "root@${NODE_IP}" "mkdir -p ${REMOTE_ROOT}/scripts ${REMOTE_ROOT}/docs ${REMOTE_ROOT}/inventory"
+        rsync -avz $DRY_RUN "${SCRIPT_DIR}/" "root@${NODE_IP}:${REMOTE_ROOT}/scripts/"
+        rsync -avz $DRY_RUN "${PROJECT_DIR}/docs/" "root@${NODE_IP}:${REMOTE_ROOT}/docs/"
+        rsync -avz $DRY_RUN "${PROJECT_DIR}/inventory/" "root@${NODE_IP}:${REMOTE_ROOT}/inventory/"
     fi
 
     # 远程执行命令 (--exec), 在节点服务目录下运行

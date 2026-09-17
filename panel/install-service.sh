@@ -21,17 +21,30 @@
 #       init/init.sh 用 `sudo env PANEL_HOST=... PANEL_PORT=... bash install-service.sh --yes`
 #       调用, 因此不会被重复询问。
 #
+#   --install-dir DIR 把面板运行文件安装到稳定目录 (默认沿用脚本所在目录)
+#
+# 关于 --install-dir (重要)
+#   直接以 git 克隆目录作为面板运行目录, 会带来两个问题:
+#     1. 该目录可能位于用户家目录 / 临时路径, 被移动或清理后面板即失效;
+#     2. `git pull` / 重新克隆会覆盖或删除运行目录。
+#   因此支持把 app.py / templates / static / requirements.txt / config.json
+#   复制到稳定目录 (推荐 /opt/onecloud/panel) 后再由 systemd 指向它。
+#   默认值 = 脚本所在目录 (与旧行为一致, 向后兼容)。
+#
 # 落盘位置:
 #   /etc/systemd/system/onecloud-panel.service   服务定义 (监听参数内联)
 #   /etc/onecloud/panel.env                      监听/访问参数 (600, 合并写入)
+#   <install-dir>/                               面板运行文件 (仅 --install-dir 时复制)
 # 账号密码由 init/init.sh 决定, 本脚本只更新自己负责的四个键, 其余行原样保留。
 # ============================================================
 
 PANEL_DIR="$(cd "$(dirname "$0")" && pwd)"
+SRC_DIR="${PANEL_DIR}"                       # 源目录: 脚本所在处 (git 克隆路径)
 NODE_NAME="${NODE_NAME:-wk-edge-01}"
-PANEL_SERVICE="${PANEL_DIR}/config.json"
 PANEL_ENV_FILE="${ONECLOUD_PANEL_ENV_FILE:-/etc/onecloud/panel.env}"
 PANEL_UNIT="${ONECLOUD_PANEL_UNIT:-/etc/systemd/system/onecloud-panel.service}"
+INSTALL_DIR_MODE=0                           # 1 = 显式指定了 --install-dir
+PANEL_INSTALL_DIR=""                         # 解析后得到
 
 usage() {
     cat << EOF
@@ -42,11 +55,14 @@ usage() {
   --port PORT       面板监听端口 (默认 9000)
   --url-host HOST   面板访问地址: 面板 IP 或域名 (默认自动探测本机地址)
   --url-port PORT   面板访问端口 (默认与监听端口一致; 前面有反代/NAT 时填它)
+  --install-dir DIR 面板运行文件安装目录 (默认=脚本所在目录; 推荐 /opt/onecloud 下的 panel 子目录)
+                   指定时会把 app.py/templates/static/config.json 复制过去并指向它
   -y, --yes         不询问, 全部取环境变量/默认值
   -h, --help        显示帮助
 
 环境变量 (与选项等价, 选项优先):
   PANEL_HOST / PANEL_PORT / PANEL_URL_HOST / PANEL_URL_PORT
+  ONECLOUD_PANEL_INSTALL_DIR  等价于 --install-dir
 
 示例:
   sudo bash $0                                     # 交互式确认三个参数
@@ -58,29 +74,42 @@ EOF
 }
 
 # ---- 参数解析 (参数 > 环境变量 > 默认) ----
-ARG_HOST=""; ARG_PORT=""; ARG_URL_HOST=""; ARG_URL_PORT=""
+ARG_HOST=""; ARG_PORT=""; ARG_URL_HOST=""; ARG_URL_PORT=""; ARG_INSTALL_DIR=""
 ENV_HOST="${PANEL_HOST:-}"; ENV_PORT="${PANEL_PORT:-}"
 ENV_URL_HOST="${PANEL_URL_HOST:-}"; ENV_URL_PORT="${PANEL_URL_PORT:-}"
+ENV_INSTALL_DIR="${ONECLOUD_PANEL_INSTALL_DIR:-}"
 ASSUME_YES=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --host)      ARG_HOST="${2:-}";     shift 2 ;;
-        --port)      ARG_PORT="${2:-}";     shift 2 ;;
-        --url-host)  ARG_URL_HOST="${2:-}"; shift 2 ;;
-        --url-port)  ARG_URL_PORT="${2:-}"; shift 2 ;;
-        -y|--yes)    ASSUME_YES=true;       shift ;;
-        -h|--help)   usage; exit 0 ;;
+        --host)        ARG_HOST="${2:-}";        shift 2 ;;
+        --port)        ARG_PORT="${2:-}";        shift 2 ;;
+        --url-host)    ARG_URL_HOST="${2:-}";    shift 2 ;;
+        --url-port)    ARG_URL_PORT="${2:-}";    shift 2 ;;
+        --install-dir) ARG_INSTALL_DIR="${2:-}"; shift 2 ;;
+        -y|--yes)      ASSUME_YES=true;          shift ;;
+        -h|--help)     usage; exit 0 ;;
         *) echo "[ERROR] 未知选项: $1" >&2; usage >&2; exit 2 ;;
     esac
 done
+
+# ---- 运行目录: 参数 > 环境变量 > 脚本所在目录 (向后兼容) ----
+PANEL_INSTALL_DIR="${ARG_INSTALL_DIR:-${ENV_INSTALL_DIR:-$PANEL_DIR}}"
+if [ -n "$PANEL_INSTALL_DIR" ] && [ "$PANEL_INSTALL_DIR" != "$PANEL_DIR" ]; then
+    INSTALL_DIR_MODE=1
+fi
+# 去掉末尾斜杠, 便于路径比较
+PANEL_INSTALL_DIR="${PANEL_INSTALL_DIR%/}"
+PANEL_DIR="$PANEL_INSTALL_DIR"
+PANEL_SERVICE="${PANEL_DIR}/config.json"
 
 # ---- 默认值 (占位, 下面按 参数 > 环境变量 > 默认 的优先级覆盖) ----
 PANEL_HOST="${PANEL_HOST:-0.0.0.0}"
 PANEL_PORT="${PANEL_PORT:-9000}"
 
 # ---- 校验逻辑优先复用 scripts/lib-panel-host.sh, 库不在时用内联兜底 ----
-_LIB_PANEL_HOST="$(cd "${PANEL_DIR}/.." 2>/dev/null && pwd)/scripts/lib-panel-host.sh"
+# 注意: 库在**源码目录** (SRC_DIR) 的上一级 scripts/ 下, 与安装目录无关
+_LIB_PANEL_HOST="$(cd "${SRC_DIR}/.." 2>/dev/null && pwd)/scripts/lib-panel-host.sh"
 if [ -f "$_LIB_PANEL_HOST" ]; then
     # shellcheck source=lib-panel-host.sh
     . "$_LIB_PANEL_HOST"
@@ -227,6 +256,35 @@ if [ -n "$PANEL_URL_HOST" ] && ! check_url_host "$PANEL_URL_HOST"; then
 fi
 if ! check_port "$PANEL_URL_PORT"; then
     echo "[ERROR] 面板访问端口 ${PANEL_URL_PORT} 不是合法端口 (1-65535)" >&2
+    exit 1
+fi
+
+# ---- 安装到稳定目录 (--install-dir): 复制运行文件 ----
+# 只复制运行必需项; 目标已存在时整体替换 (app.py / templates / static 等源码),
+# 不触碰目标目录下其它无关文件。
+panel_install_copy() {
+    [ "$INSTALL_DIR_MODE" = 1 ] || return 0
+    local d="$PANEL_INSTALL_DIR"
+    if [ -z "$d" ] || [ "$d" = "/" ]; then
+        echo "[ERROR] 非法的安装目录: '${d}'" >&2
+        return 1
+    fi
+    if [ ! -d "${SRC_DIR}/templates" ] && [ ! -f "${SRC_DIR}/app.py" ]; then
+        echo "[ERROR] 源码目录缺少面板文件: ${SRC_DIR}" >&2
+        return 1
+    fi
+    mkdir -p "$d" || { echo "[ERROR] 无法创建安装目录: ${d}" >&2; return 1; }
+    local item
+    for item in app.py config.json requirements.txt templates static; do
+        [ -e "${SRC_DIR}/${item}" ] || continue
+        rm -rf "${d:?}/${item}" 2>/dev/null || true
+        cp -a "${SRC_DIR}/${item}" "${d}/" || { echo "[ERROR] 复制 ${item} 失败" >&2; return 1; }
+    done
+    echo "[✓] 面板运行文件已安装到 ${d}"
+    return 0
+}
+
+if ! panel_install_copy; then
     exit 1
 fi
 

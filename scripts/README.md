@@ -11,8 +11,10 @@
 | `lib-nodes.sh` | 节点清单库（被其他脚本 source） | — |
 | `lib-pydeps.sh` | Python 依赖安装库（pip 缺失多路降级，被 init/setup/install-services source） | 直接 source |
 | `lib-panel-host.sh` | 面板监听地址库（探测本机网卡、校验绑定地址，被 init/install-service source） | 直接 source |
-| `gen-panel-config.sh` | 从清单生成面板 config.json | 直接运行 |
+| `gen-panel-config.sh` | 从清单生成面板 config.json | 直接运行 / `--out <文件或目录>` |
 | `gen-node-env.sh` | 从清单渲染各节点 .env | `[节点名]` / `--dry-run` |
+| `sync-panel-config.sh` | 把清单节点信息刷新到面板实际读取的 config.json | `--restart` / `--dry-run` |
+| `fix-perms.sh` | 批量修复脚本执行权限（git 拉取后丢了 +x） | 直接运行 / `--list` / `--dry-run` |
 | `bootstrap.sh` | 新节点初始化 | `--node <名> --yes` |
 | `setup.sh` | 统一安装（交互式多选） | `sudo bash setup.sh` |
 | `wireguard-setup.sh` | WireGuard mesh 配置 | `gen` / `add peer` / `list` |
@@ -22,6 +24,10 @@
 | `backup.sh` | 备份配置与数据 | `all` / `config` / `node <名>` |
 | `restore.sh` | 从备份恢复 | `<ID> <目标>` / `latest all` |
 | `update-all.sh` | 批量更新镜像/系统包 | `-d` / `-s` / `-a` |
+| `sd-tools.sh` | SD 卡工具箱入口（迁移/更换/格式化） | `migrate` / `replace` / `format` |
+| `sd-format.sh` | SD 卡分区格式化为 ext4（根盘拦截） | `--dev <名>` / `--force-fmt` / `--dry-run` |
+| `sd-migrate.sh` | eMMC(/opt) → SD 完整迁移 | `--yes` / `--dry-run` / `--clean` |
+| `sd-replace.sh` | SD → USB 打包备份（换卡前） | `--yes` / `--dry-run` |
 
 ---
 
@@ -364,7 +370,34 @@ sudo bash setup.sh
 
 ```bash
 ./scripts/gen-panel-config.sh              # 生成 panel/config.json
+./scripts/gen-panel-config.sh --out /opt/onecloud/panel   # 直接写到面板安装目录
 ./scripts/gen-node-env.sh                  # 渲染各节点 .env
 ./scripts/gen-node-env.sh --dry-run        # 预览不写入
 ./scripts/gen-node-env.sh wk-edge-01       # 仅渲染指定节点
 ```
+
+### sync-panel-config.sh / fix-perms.sh — 初始化/部署修复（v1.5.5）
+
+```bash
+# 改完 inventory/nodes.yaml 或 nodes.local.yaml 后, 刷新面板**实际读取**的配置
+./scripts/sync-panel-config.sh             # 刷新仓库副本 + 面板安装目录
+./scripts/sync-panel-config.sh --restart   # 顺带重启 onecloud-panel
+./scripts/sync-panel-config.sh --dry-run   # 只显示将写入的位置
+
+# git 拉取后脚本丢了可执行位 -> 批量修复
+./scripts/fix-perms.sh                     # 修复全部 *.sh
+./scripts/fix-perms.sh --list              # 只列出不可执行的
+./scripts/fix-perms.sh --dry-run           # 只显示将改动的
+```
+
+### 远程数据根（`/mnt/sd` vs `/opt/onecloud`）
+
+`bootstrap.sh` 会把节点**实际**数据根写入 `/etc/onecloud/install.conf`；
+`deploy.sh` / `backup.sh` / `restore.sh` / `update-all.sh` / `health-check.sh` 通过
+`lib-nodes.sh` 的 `node_data_root()` 读取它（取不到回退 `/mnt/sd`），
+因此「无 SD 卡、回退 `/opt/onecloud`」的节点也能正确分发 / 备份 / 恢复。
+可用 `ONECLOUD_REMOTE_DATA_ROOT` 强制统一远程根（例如全部节点都用 `/opt/onecloud`）。
+
+面板安装目录：`init/init.sh` 默认装到 `/opt/onecloud/panel`
+（`ONECLOUD_PANEL_INSTALL_DIR` 覆盖；置空则沿用旧的「就地运行」）。
+详见 [docs/init-deploy-fixes.md](../docs/init-deploy-fixes.md)。

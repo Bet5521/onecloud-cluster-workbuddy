@@ -40,6 +40,9 @@ PROJECT_ROOT="$(dirname "$INIT_DIR")"
 SCRIPTS_DIR="${PROJECT_ROOT}/scripts"
 PANEL_DIR="${PROJECT_ROOT}/panel"
 INVENTORY_DIR="${PROJECT_ROOT}/inventory"
+# 面板运行文件的稳定安装目录: 不放在 git 克隆路径下 (避免被 pull/移动/清理破坏)。
+# 可用 ONECLOUD_PANEL_INSTALL_DIR 覆盖; 设为空字符串则沿用旧的"就地运行"行为。
+PANEL_INSTALL_DIR="${ONECLOUD_PANEL_INSTALL_DIR-/opt/onecloud/panel}"
 
 # ------------------------------------------------------------
 # 2. 节点清单库 (提供 node_* 查询函数)
@@ -584,8 +587,20 @@ panel_install_systemd() {
     # ONECLOUD_PANEL_TTY=0: 监听地址/端口已在本菜单问过, 别让安装脚本再问一遍
     #        (访问地址由脚本按本机地址自动填充)
     #        刻意不用命令行开关表达 —— 那等于预置默认值, 与本脚本的约定冲突
+    # ONECLOUD_PANEL_INSTALL_DIR: 把面板运行文件装到稳定目录 (不随 git 克隆目录变动)
     $SUDO env PANEL_HOST="$PANEL_HOST" PANEL_PORT="$PANEL_PORT" \
+        ONECLOUD_PANEL_INSTALL_DIR="$PANEL_INSTALL_DIR" \
         ONECLOUD_PANEL_TTY=0 bash "${PANEL_DIR}/install-service.sh" || return 1
+
+    # 把清单里的最新节点 IP/主机名写进**面板实际读取的** config.json。
+    # app.py 每次请求都重新 load_config(), 因此无需重启即可生效。
+    if [ -n "$PANEL_INSTALL_DIR" ] && [ -f "${SCRIPTS_DIR}/gen-panel-config.sh" ]; then
+        if ( cd "$PROJECT_ROOT" && bash scripts/gen-panel-config.sh --out "$PANEL_INSTALL_DIR" >/dev/null 2>&1 ); then
+            log_ok "面板配置已同步: ${PANEL_INSTALL_DIR}/config.json"
+        else
+            log_warn "面板配置同步失败, 面板可能显示旧节点信息"
+        fi
+    fi
 
     $SUDO systemctl daemon-reload
     $SUDO systemctl restart onecloud-panel
@@ -596,6 +611,32 @@ panel_install_systemd() {
     fi
     log_err "onecloud-panel.service 未处于运行状态, 请查看: systemctl status onecloud-panel"
     return 1
+}
+
+# 手动刷新面板配置: 把清单里的节点信息写入面板实际读取的 config.json
+panel_sync_config() {
+    header "同步面板配置 (把节点 IP/主机名刷新到面板)"
+    if [ ! -f "${SCRIPTS_DIR}/sync-panel-config.sh" ]; then
+        log_err "未找到 scripts/sync-panel-config.sh"
+        pause
+        return 1
+    fi
+    echo -e "  ${DIM}面板运行目录: ${PANEL_INSTALL_DIR:-（就地运行, 未迁移）}${NC}"
+    echo -e "  ${DIM}数据来源    : inventory/nodes.yaml + inventory/nodes.local.yaml${NC}"
+    echo -e "  ${DIM}作用        : 修正「面板监控不到节点 / 无法操作节点」的 IP 不一致${NC}"
+    echo ""
+    if ! ask_yes_no "确认刷新面板配置?"; then
+        log_warn "已取消"
+        pause
+        return 1
+    fi
+    if ( cd "$PROJECT_ROOT" && ONECLOUD_PANEL_INSTALL_DIR="${PANEL_INSTALL_DIR}" \
+            bash scripts/sync-panel-config.sh ); then
+        log_ok "面板配置已刷新 (app.py 每次请求重新读取, 无需重启)"
+    else
+        log_err "刷新失败, 请检查上面的输出"
+    fi
+    pause
 }
 
 panel_deploy() {
@@ -615,8 +656,12 @@ panel_deploy() {
         return 1
     fi
 
-    # 可选: 由清单重新生成面板配置
-    if [ -f "${SCRIPTS_DIR}/gen-panel-config.sh" ]; then
+    # 可选: 由清单刷新面板配置 (仓库副本 + 面板实际安装目录, 保证面板读到最新节点 IP)
+    if [ -f "${SCRIPTS_DIR}/sync-panel-config.sh" ]; then
+        if ask_yes_no "是否先由 inventory/nodes.yaml 刷新面板配置 (含节点 IP)?"; then
+            ( cd "$PROJECT_ROOT" && bash scripts/sync-panel-config.sh ) || log_warn "刷新失败, 继续使用现有配置"
+        fi
+    elif [ -f "${SCRIPTS_DIR}/gen-panel-config.sh" ]; then
         if ask_yes_no "是否先由 inventory/nodes.yaml 重新生成 panel/config.json?"; then
             ( cd "$PROJECT_ROOT" && bash scripts/gen-panel-config.sh ) || log_warn "生成失败, 继续使用现有配置"
         fi
@@ -672,6 +717,7 @@ menu_panel() {
             "部署为 systemd 常驻服务 (开机自启)" \
             "仅前台试运行 (Ctrl+C 结束, 不写 systemd)" \
             "仅安装 Python 依赖" \
+            "同步面板配置 (刷新节点 IP 到面板)" \
             "返回主菜单"
         case "$MENU_CHOICE" in
             1) panel_deploy systemd ;;
@@ -680,7 +726,8 @@ menu_panel() {
                 panel_install_deps
                 pause
                 ;;
-            4) return ;;
+            4) panel_sync_config ;;
+            5) return ;;
         esac
     done
 }
@@ -711,6 +758,18 @@ node_bootstrap_local() {
     echo ""
     if [ "$rc" -eq 0 ]; then
         log_ok "bootstrap 执行结束"
+        # bootstrap 已把本机节点身份回写到 inventory/nodes.local.yaml;
+        # 若本机同时承担面板, 顺手把新信息刷进面板配置, 否则面板会监控不到该节点。
+        if [ -f "${PANEL_DIR}/app.py" ] && [ -f "${SCRIPTS_DIR}/sync-panel-config.sh" ]; then
+            if ask_yes_no "是否把本机节点信息同步到面板配置?"; then
+                if ( cd "$PROJECT_ROOT" && ONECLOUD_PANEL_INSTALL_DIR="${PANEL_INSTALL_DIR}" \
+                        bash scripts/sync-panel-config.sh ); then
+                    log_ok "面板配置已同步"
+                else
+                    log_warn "同步失败 (可稍后在「部署 Panel」菜单手动同步)"
+                fi
+            fi
+        fi
     else
         log_err "bootstrap 退出码: $rc"
     fi
@@ -1294,6 +1353,21 @@ preflight_check() {
     fi
     if [ "$HAVE_INVENTORY" != "1" ]; then
         log_warn "节点清单库未加载, 依赖清单的功能将不可用"
+    fi
+
+    # git 对可执行位的记录, 在 Windows 克隆 (core.fileMode=false) 或非 git 方式
+    # 拷贝后会丢失 → `./scripts/xxx.sh` 直接运行报 Permission denied。
+    # 幂等自愈: 只在确实发现「不可执行」的脚本时才动作, 正常情况下零输出。
+    if [ -f "${SCRIPTS_DIR}/fix-perms.sh" ]; then
+        local _noexec=""
+        _noexec="$(find "$SCRIPTS_DIR" "$INIT_DIR" -name '*.sh' -type f ! -perm -u+x 2>/dev/null | head -n 1)"
+        if [ -n "$_noexec" ]; then
+            log_warn "检测到脚本缺少可执行位 (例: ${_noexec#"$PROJECT_ROOT"/})"
+            log_info "正在批量赋予执行权限 (scripts/fix-perms.sh)..."
+            bash "${SCRIPTS_DIR}/fix-perms.sh" >/dev/null 2>&1 \
+                && log_ok "已修复脚本执行权限" \
+                || log_warn "批量赋权失败, 可手动执行: bash scripts/fix-perms.sh"
+        fi
     fi
 }
 

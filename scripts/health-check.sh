@@ -75,10 +75,12 @@ check_system() {
     check_ssh "$ip" "$name" || return 1
 
     # 系统负载
-    local load mem disk
+    local load mem disk droot
+    # 数据根以节点 /etc/onecloud/install.conf 为准; 取不到回退 /mnt/sd (兼容旧环境)
+    droot="$(node_data_root "$ip")"
     load=$(ssh "root@${ip}" "cat /proc/loadavg | cut -d' ' -f1")
     mem=$(ssh "root@${ip}" "free -m | awk 'NR==2{printf \"%s/%sMB (%.0f%%)\", \$3,\$2,\$3/\$2*100}'")
-    disk=$(ssh "root@${ip}" "df -h /mnt/sd | awk 'NR==2{print \$4 \" 可用 / \" \$2 \" 总计 (\" \$5 \" 已用)\"}'")
+    disk=$(ssh "root@${ip}" "df -h '${droot}' | awk 'NR==2{print \$4 \" 可用 / \" \$2 \" 总计 (\" \$5 \" 已用)\"}'")
     local swap
     swap=$(ssh "root@${ip}" "free -m | awk 'NR==3{printf \"%s/%sMB\", \$3,\$2}'")
 

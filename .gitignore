@@ -64,6 +64,7 @@ docker-compose.override.yml
 # 验证脚本输出
 test_report.txt
 test_run.txt
+*.log
 # 开发用的小工具 (只跑单个测试组, 本地保留不入库)
 _run_one.py
 

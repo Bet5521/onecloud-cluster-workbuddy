@@ -144,6 +144,15 @@ restore_to_node() {
     local REMOTE_DST=$3
     local DESC=$4
 
+    # 路径归一化: 调用方按约定的 /mnt/sd/srv/... 书写, 这里映射到节点的**实际**
+    # 数据根 (SD 挂载点或 /opt/onecloud 回退), 与备份侧保持同一口径。
+    local _root
+    _root="$(node_data_root "$NODE_IP")"
+    case "$REMOTE_DST" in
+        /mnt/sd/srv*) REMOTE_DST="${_root}${REMOTE_DST#/mnt/sd}" ;;
+        /mnt/sd/*)    REMOTE_DST="${_root}/${REMOTE_DST#/mnt/sd/}" ;;
+    esac
+
     if [ ! -d "$LOCAL_SRC" ]; then
         log_warn "跳过 (无备份): $DESC"
         return
@@ -217,4 +226,4 @@ esac
 echo ""
 log_info "恢复完成"
 log_warn "请重启相关服务或节点以应用更改"
-log_info "  cd /mnt/sd/srv/<node> && docker-compose up -d"
+log_info "  cd <数据根>/srv/<node> && docker-compose up -d   # 数据根见节点 /etc/onecloud/install.conf (SD 挂载点或 /opt/onecloud)"

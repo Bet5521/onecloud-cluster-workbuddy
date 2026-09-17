@@ -82,12 +82,15 @@ for NODE in "${ALL_NODES[@]}"; do
         continue
     fi
 
+    # 远程数据根: 以节点 /etc/onecloud/install.conf 为准 (SD 挂载点或 /opt 回退)
+    REMOTE_ROOT="$(node_data_root "$IP")"
+
     # Docker 更新
     if [ "$MODE" = "docker" ] || [ "$MODE" = "all" ]; then
         log_info "更新 Docker 镜像..."
-        ssh "root@${IP}" "bash -s" << 'ENDSSH'
+        ssh "root@${IP}" "REMOTE_ROOT='${REMOTE_ROOT}' bash -s" << 'ENDSSH'
 set -e
-for dir in /mnt/sd/srv/*/; do
+for dir in "${REMOTE_ROOT}/srv"/*/; do
     if [ -f "${dir}docker-compose.yml" ]; then
         echo "  更新 $(basename $dir)..."
         cd "$dir"

@@ -1046,7 +1046,10 @@ def test_panel_install_service():
         else:
             log_warn("可能使用硬编码路径")
         
-        # 检查是否有硬编码路径
+        # 检查是否有硬编码路径 (只看代码, 注释中的示例路径/文档不算)
+        code = "\n".join(
+            ln for ln in content.splitlines() if not ln.lstrip().startswith("#")
+        )
         hardcoded_patterns = [
             r'/mnt/sd/edge-01/panel',
             r'/mnt/sd/wk-edge/panel',
@@ -1054,7 +1057,7 @@ def test_panel_install_service():
         ]
         has_hardcoded = False
         for pattern in hardcoded_patterns:
-            if re.search(pattern, content):
+            if re.search(pattern, code):
                 has_hardcoded = True
                 log_fail(f"存在硬编码路径匹配: {pattern}")
         
@@ -5398,6 +5401,261 @@ echo "{c} $*" >> "$FMT_LOG"; exit 0
     _shutil.rmtree(str(tmp), ignore_errors=True)
 
 
+def test_init_deploy_sync():
+    """测试 32: 初始化/部署修复 (脚本权限 / 面板迁移 / 节点IP同步 / 远程数据根一致)"""
+    print("\n" + "=" * 60)
+    print("测试 32: 初始化/部署修复 (权限 / 面板迁移 / IP 同步 / 数据根)")
+    print("=" * 60)
+
+    import subprocess as _sp, os as _os, tempfile as _tf, json as _json
+    import shutil as _shutil, re as _re
+    from pathlib import Path as _P
+
+    _GIT = "C:/Users/betyk/.workbuddy/binaries/PortableGit/versions/1.2.0"
+    BASH_BIN = f"{_GIT}/bin/bash.exe"
+
+    def check(c, m):
+        log_pass(m) if c else log_fail(m)
+
+    def read(p):
+        return _P(p).read_text(encoding="utf-8")
+
+    def _pp(x):
+        # Windows 路径 -> msys 路径: 必须先把反斜杠换成 /,
+        # 否则传给 bash 的参数 (如 SCRIPT_DIR="C:\...") 会被反斜杠转义吃掉。
+        s = str(x).replace("\\", "/")
+        m = _re.match(r"^([A-Za-z]):/(.*)$", s)
+        return f"/{m.group(1).lower()}/{m.group(2)}" if m else s
+
+    def extract_fn(path, name):
+        out = []
+        on = False
+        for ln in read(path).splitlines():
+            if ln.startswith(name + "()"):
+                on = True
+            if on:
+                out.append(ln)
+                if ln == "}":
+                    break
+        return "\n".join(out)
+
+    def run_bash(args, extra=None, cwd=None, timeout=120):
+        e = dict(_os.environ)
+        # 去掉宿主 Bash 工具注入的 BASH_ENV shim: 它会在每次非交互 bash 启动时
+        # 重置 PATH, 使子进程里的 awk/mv/sed 等 coreutils 不可用 (环境假失败)。
+        e.pop("BASH_ENV", None)
+        e["PATH"] = f"{_GIT}/usr/bin;{_GIT}/bin;" + e.get("PATH", "")
+        if extra:
+            e.update(extra)
+        return _sp.run([BASH_BIN, *args], capture_output=True, text=True,
+                       encoding="utf-8", errors="replace",
+                       cwd=str(cwd or PROJECT_ROOT), env=e, timeout=timeout)
+
+    # ---------- 1) 脚本执行权限批量修复 ----------
+    fixp = SCRIPTS_DIR / "fix-perms.sh"
+    if not fixp.exists():
+        check(False, "fix-perms.sh 存在")
+    else:
+        check(True, "fix-perms.sh 存在")
+        r = run_bash(["-n", _pp(fixp)], timeout=60)
+        check(r.returncode == 0, "fix-perms.sh 语法正确")
+        fsrc = read(fixp)
+        check("chmod +x" in fsrc and "--dry-run" in fsrc and "--list" in fsrc,
+              "fix-perms.sh 具备 chmod +x 与 --list/--dry-run")
+        check("update-index --chmod=+x" in fsrc,
+              "fix-perms.sh 给出 git 索引层次根治提示")
+        check("set -euo pipefail" in fsrc and "log_info" in fsrc and "log_error" in fsrc,
+              "fix-perms.sh 符合脚本约定 (set -euo pipefail + 日志函数)")
+
+        t = _P(_tf.mkdtemp(prefix="ocfp_"))
+        (t / "sub").mkdir()
+        (t / "sub" / "x.sh").write_text("#!/bin/bash\necho x\n", encoding="utf-8", newline="\n")
+        r = run_bash([_pp(fixp), "--root", _pp(t)], timeout=60)
+        _o = r.stdout + r.stderr
+        check(r.returncode == 0 and ("已修复" in _o or "无需修改" in _o) and "1 个脚本" in _o,
+              "fix-perms.sh: 正确统计目标脚本并处理 (修复 / 确认无需修改)")
+        r = run_bash([_pp(fixp), "--list", "--root", _pp(t)], timeout=60)
+        check(r.returncode == 0 and "共 1 个脚本" in (r.stdout + r.stderr),
+              "fix-perms.sh --list: 输出统计正常")
+        r = run_bash([_pp(fixp), "--dry-run", "--root", _pp(t)], timeout=60)
+        check(r.returncode == 0 and "dry-run" in (r.stdout + r.stderr),
+              "fix-perms.sh --dry-run: 只提示不写入")
+        _shutil.rmtree(str(t), ignore_errors=True)
+
+    # ---------- 2) 面板运行文件迁移到稳定目录 ----------
+    inst = PANEL_DIR / "install-service.sh"
+    isrc = read(inst)
+    check("--install-dir" in isrc and "ONECLOUD_PANEL_INSTALL_DIR" in isrc,
+          "install-service.sh 支持 --install-dir / ONECLOUD_PANEL_INSTALL_DIR")
+    check("panel_install_copy" in isrc and "SRC_DIR=" in isrc,
+          "install-service.sh 具备运行文件复制逻辑 (SRC_DIR 保留源码目录)")
+    check('_LIB_PANEL_HOST="$(cd "${SRC_DIR}/.."' in isrc,
+          "install-service.sh 校验库仍从源码目录定位 (与安装目录解耦)")
+
+    body = extract_fn(inst, "panel_install_copy")
+    if not body:
+        check(False, "panel_install_copy 可抽取执行")
+    else:
+        drv = _P(_tf.mkdtemp(prefix="ocpc_"))
+        tgt = drv / "inst"
+        drv_sh = drv / "drv.sh"
+        drv_sh.write_text(
+            "set -u\n"
+            + 'SRC_DIR="' + _pp(PANEL_DIR) + '"\n'
+            + 'PANEL_INSTALL_DIR="' + _pp(tgt) + '"\n'
+            + "INSTALL_DIR_MODE=1\n"
+            + body + "\n"
+            + "panel_install_copy\n",
+            encoding="utf-8", newline="\n")
+        r = run_bash([_pp(drv_sh)], timeout=60)
+        ok = (tgt / "app.py").exists() and (tgt / "templates").is_dir() \
+            and (tgt / "config.json").exists() and (tgt / "requirements.txt").exists()
+        check(r.returncode == 0 and ok,
+              "面板迁移: app.py/templates/static/config.json/requirements.txt 均已就位")
+        _shutil.rmtree(str(drv), ignore_errors=True)
+
+    init_src = read(PROJECT_ROOT / "init" / "init.sh")
+    check("PANEL_INSTALL_DIR=" in init_src and "/opt/onecloud/panel" in init_src,
+          "init.sh 定义面板稳定安装目录 (默认 /opt/onecloud/panel)")
+    check('ONECLOUD_PANEL_INSTALL_DIR="$PANEL_INSTALL_DIR"' in init_src,
+          "init.sh 安装面板时注入安装目录")
+    check("panel_sync_config" in init_src and "sync-panel-config.sh" in init_src,
+          "init.sh 提供面板配置同步入口")
+
+    # ---------- 3) 节点 IP -> 面板配置同步 ----------
+    gpc = SCRIPTS_DIR / "gen-panel-config.sh"
+    gsrc = read(gpc)
+    check("--out" in gsrc and "ONECLOUD_PANEL_CONFIG" in gsrc,
+          "gen-panel-config.sh 支持 --out / ONECLOUD_PANEL_CONFIG")
+
+    tmpd = _P(_tf.mkdtemp(prefix="ocgpc_"))
+    outp = tmpd / "pc.json"
+    r = run_bash([_pp(gpc), "--out", _pp(outp)])
+    nn = 0
+    try:
+        d = _json.loads(outp.read_text(encoding="utf-8"))
+        nn = len(d.get("nodes", []))
+        ok = nn >= 1 and bool(d["nodes"][0].get("ip"))
+    except Exception:
+        ok = False
+    check(ok, f"gen-panel-config --out 生成合法 JSON (节点数 {nn})")
+
+    r = run_bash([_pp(gpc), "--out", _pp(outp)], {"ONECLOUD_WK_EDGE_01_IP": "10.77.77.77"})
+    try:
+        got = _json.loads(outp.read_text(encoding="utf-8"))["nodes"][0]["ip"]
+    except Exception:
+        got = "?"
+    check(got == "10.77.77.77", "gen-panel-config: 清单/环境变量里的节点 IP 被透传")
+
+    syncp = SCRIPTS_DIR / "sync-panel-config.sh"
+    if not syncp.exists():
+        check(False, "sync-panel-config.sh 存在")
+    else:
+        check(True, "sync-panel-config.sh 存在")
+        r = run_bash(["-n", _pp(syncp)], timeout=60)
+        check(r.returncode == 0, "sync-panel-config.sh 语法正确")
+        ssrc = read(syncp)
+        check("gen-panel-config.sh" in ssrc and "PANEL_CONFIG=" in ssrc,
+              "sync-panel-config.sh 复用 gen-panel-config 生成器")
+        check("PANEL_REPO_CONFIG" in ssrc, "sync-panel-config.sh 支持重定向仓库副本路径 (可测)")
+
+        fake = _P(_tf.mkdtemp(prefix="ocsync_"))
+        instdir = fake / "instpanel"
+        instdir.mkdir()
+        (instdir / "config.json").write_text('{"old":true}', encoding="utf-8")
+        unit = fake / "panel.service"
+        unit.write_text("[Service]\nEnvironment=PANEL_CONFIG=" + _pp(instdir)
+                        + "/config.json\n", encoding="utf-8", newline="\n")
+        repocfg = fake / "repo_config.json"
+        env2 = {"ONECLOUD_PANEL_UNIT": _pp(unit),
+                "ONECLOUD_PANEL_REPO_CONFIG": _pp(repocfg)}
+        r = run_bash([_pp(syncp)], env2)
+        txt = (instdir / "config.json").read_text(encoding="utf-8")
+        check('"nodes"' in txt and '"old"' not in txt,
+              "sync-panel-config: 刷新面板实际读取的 config.json (unit 指定目录)")
+        check(repocfg.exists() and '"nodes"' in repocfg.read_text(encoding="utf-8"),
+              "sync-panel-config: 仓库副本同步刷新")
+        r2 = run_bash([_pp(syncp), "--dry-run"], env2, timeout=60)
+        check(r2.returncode == 0 and "dry-run" in (r2.stdout + r2.stderr),
+              "sync-panel-config --dry-run: 只提示不写入")
+        _shutil.rmtree(str(fake), ignore_errors=True)
+
+    _shutil.rmtree(str(tmpd), ignore_errors=True)
+
+    # bootstrap 回写节点身份
+    bsrc = read(SCRIPTS_DIR / "bootstrap.sh")
+    check("update_local_inventory()" in bsrc, "bootstrap.sh 定义 update_local_inventory()")
+    check("install.conf" in bsrc and "DATA_ROOT=${DATA_ROOT}" in bsrc,
+          "bootstrap.sh 记录 /etc/onecloud/install.conf (含 DATA_ROOT)")
+    check("已回写节点清单" in bsrc, "bootstrap.sh 结尾回写节点清单 (部署改的 IP 不再丢失)")
+
+    body2 = extract_fn(SCRIPTS_DIR / "bootstrap.sh", "update_local_inventory")
+    if not body2:
+        check(False, "update_local_inventory 可抽取执行")
+    else:
+        drv = _P(_tf.mkdtemp(prefix="ocinv_"))
+        (drv / "scripts").mkdir()
+        (drv / "inventory").mkdir()
+        (drv / "inventory" / "nodes.local.yaml").write_text(
+            "nodes:\n  - name: wk-edge-01\n    ip: 1.1.1.1\n    hostname: edge-01\n"
+            "    wg_ip: 10.8.0.101\n\nnetwork:\n  gateway: 192.168.1.1\n",
+            encoding="utf-8", newline="\n")
+        drv_sh = drv / "drv.sh"
+        drv_sh.write_text(
+            "set -u\n"
+            + 'SCRIPT_DIR="' + _pp(drv / "scripts") + '"\n'
+            + body2 + "\n"
+            + "update_local_inventory wk-edge-01 9.9.9.9 edge-01 10.8.0.101\n"
+            + "update_local_inventory wk-node-77 9.9.9.77 node-77 10.8.0.77\n",
+            encoding="utf-8", newline="\n")
+        r = run_bash([_pp(drv_sh)], timeout=60)
+        y = (drv / "inventory" / "nodes.local.yaml").read_text(encoding="utf-8")
+        check("ip: 9.9.9.9" in y, "update_local_inventory: 就地更新已有节点 IP")
+        check("name: wk-node-77" in y and "ip: 9.9.9.77" in y,
+              "update_local_inventory: 追加新节点")
+        check(y.index("name: wk-node-77") < y.index("network:"),
+              "update_local_inventory: 新节点落在 nodes 段内 (network 之前)")
+        check(r.returncode == 0, "update_local_inventory 执行返回 0")
+        _shutil.rmtree(str(drv), ignore_errors=True)
+
+    # ---------- 4) 同类问题: 远程数据根一致性 ----------
+    lnsrc = read(SCRIPTS_DIR / "lib-nodes.sh")
+    check("node_data_root()" in lnsrc, "lib-nodes.sh 提供 node_data_root()")
+
+    _lib_path = _pp(SCRIPTS_DIR / "lib-nodes.sh")
+
+    def run_lib(snippet, extra=None):
+        drv = _P(_tf.mkdtemp(prefix="oclib_"))
+        sh = drv / "d.sh"
+        sh.write_text('source "' + _lib_path + '"\n' + snippet,
+                      encoding="utf-8", newline="\n")
+        out = run_bash([_pp(sh)], extra, timeout=60).stdout.strip()
+        _shutil.rmtree(str(drv), ignore_errors=True)
+        return out
+
+    a = run_lib("node_data_root 10.123.0.1")
+    check(a == "/mnt/sd", "node_data_root: SSH 不可用时回退 /mnt/sd (兼容旧环境)")
+    b = run_lib("node_data_root 10.123.0.1", {"ONECLOUD_REMOTE_DATA_ROOT": "/opt/onecloud"})
+    check(b == "/opt/onecloud", "node_data_root: ONECLOUD_REMOTE_DATA_ROOT 覆盖生效")
+
+    dep = read(SCRIPTS_DIR / "deploy.sh")
+    dep_code = "\n".join(l for l in dep.splitlines() if not l.lstrip().startswith("#"))
+    check("node_data_root" in dep and "/mnt/sd" not in dep_code,
+          "deploy.sh 代码不再硬编码 /mnt/sd, 改用 node_data_root (含 scripts/docs/inventory)")
+    bks = read(SCRIPTS_DIR / "backup.sh")
+    check("node_data_root" in bks and "/mnt/sd/srv*" in bks,
+          "backup.sh 经 node_data_root 将 /mnt/sd 前缀映射到实际数据根")
+    rs = read(SCRIPTS_DIR / "restore.sh")
+    check("node_data_root" in rs and "/mnt/sd/srv*" in rs,
+          "restore.sh 经 node_data_root 将 /mnt/sd 前缀映射到实际数据根")
+    ua = read(SCRIPTS_DIR / "update-all.sh")
+    check("node_data_root" in ua and "${REMOTE_ROOT}/srv" in ua,
+          "update-all.sh 远程目录改用 REMOTE_ROOT")
+    hc = read(SCRIPTS_DIR / "health-check.sh")
+    check("node_data_root" in hc and "droot" in hc,
+          "health-check.sh 磁盘检查改用节点实际数据根")
+
+
 def main():
     print("=" * 60)
     print("OneCloud Cluster 功能验证")
@@ -5437,6 +5695,7 @@ def main():
         ("初始化装包精简 (无头服务器)", test_bootstrap_pkg_slim),
         ("安装路径自适应 (SD卡->/opt 回退)", test_install_path_adaptive),
         ("SD 卡工具箱 (格式化/迁移/更换)", test_sd_tools),
+        ("初始化部署修复 (权限/迁移/IP同步/数据根)", test_init_deploy_sync),
     ]
     
     for test_name, test_func in tests:

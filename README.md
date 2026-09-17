@@ -2,7 +2,7 @@
 
 > 基于玩客云 WS1608 (Amlogic S805, ARMv7, 1GB RAM) 多节点组建的家庭服务集群
 
-**当前版本: v1.5.4**
+**当前版本: v1.5.5**
 
 ---
 
@@ -462,6 +462,62 @@ python3 test_validate.py
   校验功能脚本无硬编码 IP、每个节点 hostname 字段齐全、环境变量覆盖真实生效
 - 验证项从 176 扩至 **184**（全部通过、0 警告）
 - 新增 `inventory/nodes.local.yaml.example` 覆盖模板（真实覆盖文件已 gitignore）
+
+---
+
+## 🚀 v1.5.5 变更说明
+
+**主题：初始化 / 部署链路四处「写入的值没有同步到实际使用处」的一致性缺陷修复。**
+
+### 1. git 拉取后脚本丢失执行权限
+
+- **根因**：脚本在 git 索引里是 `100644`（无执行位），克隆 / 拉取到 Linux 后 `./scripts/xxx.sh` 报 `Permission denied`。
+- **根治**：把可执行位写回索引（`git update-index --chmod=+x`），此后克隆 / 拉取自带 `+x`。
+- **兜底**：新增 **`scripts/fix-perms.sh`** —— 批量把仓库内所有 `*.sh` 恢复为可执行，
+  支持 `--list`（只列出不可执行的）/ `--dry-run`（只显示将改动的）/ `--with-py` / `--root DIR`，幂等。
+- **自愈**：`init/init.sh` 启动预检发现缺执行位时自动修复。
+
+### 2. panel 文件留在 git 克隆目录 → 迁移到稳定目录
+
+- **根因**：systemd 单元的 `WorkingDirectory` / `ExecStart` 指向 git 克隆路径，该路径被移动、清理或
+  `git pull` 覆盖后面板即失效。
+- **修复**：`panel/install-service.sh` 新增 **`--install-dir DIR`**（等价 `ONECLOUD_PANEL_INSTALL_DIR`）——
+  把 `app.py` / `templates` / `static` / `requirements.txt` / `config.json` 复制到稳定目录后再由 systemd 指向它；
+  校验库仍从源码目录（`SRC_DIR`）定位。`init/init.sh` 默认安装到 **`/opt/onecloud/panel`**
+  （`ONECLOUD_PANEL_INSTALL_DIR=` 空值可退回旧的「就地运行」）。
+
+### 3. 部署节点 / 面板时修改的节点 IP 未同步到面板配置
+
+- **根因**：① `bootstrap.sh` 交互选定的 IP 只写进本机网络配置，**没有回写清单**；
+  ② 面板实际运行在 `/opt/onecloud/panel`，仓库里那份 `panel/config.json` 不是它读的那份。
+  结果：面板按旧 IP 连节点 → 监控不到、也无法操作。
+- **修复**：
+  - `bootstrap.sh` 结尾把**节点名 / IP / 主机名 / WG IP** 回写 `inventory/nodes.local.yaml`
+    （幂等 upsert：已存在就地更新，不存在则追加到 `nodes:` 段）。
+  - `scripts/gen-panel-config.sh` 新增 **`--out FILE_OR_DIR`**（等价 `ONECLOUD_PANEL_CONFIG`）。
+  - 新增 **`scripts/sync-panel-config.sh`**：把清单最新节点信息一次刷新到**面板真正读取的每一处** ——
+    仓库副本、systemd 单元 `PANEL_CONFIG` 指向的安装目录、`ONECLOUD_PANEL_INSTALL_DIR` / `/opt/onecloud/panel`；
+    `--restart` 顺带重启。`app.py` 每次请求重新读取配置，通常无需重启。
+  - 接入点：面板部署后自动同步；「部署 Panel」菜单新增「同步面板配置」；本机 bootstrap 结束后询问同步。
+- **注意**：节点清单的最终真相在控制端 `inventory/`；bootstrap 的回写只作用于该节点本地副本，
+  多机场景仍需把该条目汇到控制端再刷新。
+
+### 4. 同类问题：远程数据根 `/mnt/sd` 硬编码
+
+- **根因**：`bootstrap.sh` 已按 SD 卡状态自适应数据根（SD 挂载点或回退 `/opt/onecloud`），
+  但 `deploy.sh` / `backup.sh` / `restore.sh` / `update-all.sh` / `health-check.sh` 仍一律按 `/mnt/sd` 读写 ——
+  在**无 SD 卡节点**上会操作到不存在的目录，分发 / 备份 / 恢复 / 更新静默失效。
+- **修复**：`bootstrap.sh` 把结果写入节点 **`/etc/onecloud/install.conf`**（`DATA_ROOT=...`）；
+  `lib-nodes.sh` 新增 **`node_data_root <IP|节点名>`**（SSH 读取该文件，取不到回退
+  `ONECLOUD_REMOTE_DATA_ROOT` 或 `/mnt/sd`）；上述五个脚本一律改用它
+  （`backup.sh` / `restore.sh` 在入口函数内统一映射 `/mnt/sd` 前缀，调用处无需逐个改）。
+
+### 验证
+
+- 新增第 **32** 组测试「**初始化部署修复**」**40 项**：覆盖四个脚本 / 库的静态契约与真实行为
+  （权限统计、面板目录复制、`--out` 生成合法 JSON 且 IP 透传、单元指定目录被刷新、
+  清单 upsert 三场景、`node_data_root` 回退与覆盖、五个脚本不再硬编码 `/mnt/sd`）。
+- 详细根因 / 修复 / 验证见 [docs/init-deploy-fixes.md](docs/init-deploy-fixes.md)。
 
 ---
 
