@@ -92,8 +92,27 @@ onecloud-cluster/
 ├── node-wk-storage-03/       # NODE-03 Storage & Sync 配置
 ├── panel/                    # Flask 集群控制面板
 ├── init/                     # 交互式初始化入口 (部署面板 / 部署节点 / 节点维护)
-├── scripts/                  # 运维脚本
-└── test_validate.py          # 集群配置/脚本验证套件
+├── scripts/                  # 运维脚本（4 个库 + 20 个可执行脚本）
+│   ├── lib-nodes.sh          #   节点/服务清单加载器（单一数据源）
+│   ├── lib-install-path.sh   #   安装路径决策（SD 卡 -> /opt/onecloud 回退）
+│   ├── lib-pydeps.sh         #   Python 依赖四级降级链
+│   ├── lib-panel-host.sh     #   面板监听地址校验（三层共用）
+│   ├── lib-network-audit.sh  #   通路/防火墙/SSH 自检（只读）
+│   ├── init/                 #   交互式入口 init.sh（见 init/）
+│   ├── bootstrap.sh          #   节点初始化
+│   ├── setup.sh              #   节点侧交互式服务安装
+│   ├── deploy.sh             #   配置分发
+│   ├── wireguard-setup.sh    #   WireGuard 配置生成
+│   ├── install-services.sh   #   原生服务与容器安装
+│   ├── gen-node-env.sh       #   渲染各节点 .env
+│   ├── gen-panel-config.sh   #   生成 panel/config.json
+│   ├── sync-panel-config.sh  #   刷新面板真正读取的每一处配置
+│   ├── firewall-recommend.sh #   生成防火墙建议清单（零写入）
+│   ├── health-check.sh       #   集群健康巡检
+│   ├── backup.sh / restore.sh / update-all.sh
+│   ├── sd-format.sh / sd-migrate.sh / sd-replace.sh / sd-tools.sh
+│   └── fix-perms.sh          #   修复 .sh 执行权限（幂等）
+├── test_validate.py          # 集群配置/脚本验证套件（32 组 / 555 项）
 ```
 
 ---
@@ -367,7 +386,11 @@ vim inventory/nodes.local.yaml   # 填入你的 IP/主机名, 该文件已被 gi
 | 脚本 | 作用 | 常用用法 |
 |------|------|---------|
 | `lib-nodes.sh` | 节点清单库（单一数据源，供所有脚本 source） | 被其他脚本引用 |
+| `lib-install-path.sh` | 安装路径决策引擎（SD 卡 → `/opt/onecloud` 回退） | 被 `bootstrap.sh` / `setup.sh` 引用 |
+| `lib-pydeps.sh` | Python 依赖四级降级链 | 被 `setup.sh` / `install-services.sh` 引用 |
+| `lib-panel-host.sh` | 面板监听地址校验（单一实现） | 被 `init.sh` / `panel/install-service.sh` / `app.py` 引用 |
 | `lib-network-audit.sh` | 通路/防火墙/SSH 通道自检库（只读探测） | 被 `bootstrap.sh` 引用 |
+| `sd-tools.sh` | SD 卡工具箱入口（格式化 / 迁移 / 更换） | 直接运行（菜单） |
 | `gen-panel-config.sh` | 从清单生成 `panel/config.json` | 直接运行 |
 | `gen-node-env.sh` | 从清单渲染各节点 `.env`（保留已填密钥） | `[节点名]` / `--dry-run` |
 | `bootstrap.sh` | 新节点初始化（主机名/swap/SD卡/Docker/静态IP；apt 换源与更新默认跳过） | `--node <名> [--ip <IP>] [--gateway <IP>] [--sd <DEV>] [--no-sd] [--mirror] [--apt-update] [--no-apt] [--dry-run] --yes` |
@@ -387,15 +410,19 @@ vim inventory/nodes.local.yaml   # 填入你的 IP/主机名, 该文件已被 gi
 
 ## ✅ 功能验证
 
-项目自带验证套件，共 28 组，覆盖配置完整性、脚本语法、节点映射、**服务清单五方一致性**、
+项目自带验证套件，共 32 组，覆盖配置完整性、脚本语法、节点映射、**服务清单五方一致性**、
 **文档化 CLI 接口契约**、**IP/主机名可自定义性**、**安全健壮性回归**、
 **面板前后端契约**、**bootstrap 网络取值与 SD/风险预检**、**init 交互式入口契约**、
 **Python 依赖降级链**、**bootstrap apt 源与依赖安装回归**、
 **bootstrap DNS 模式（DHCP 自动获取）**、**面板监听地址校验（误填拦截 / 同网段引导）**、
 **通路 / 防火墙 / SSH 通道自检**、**面板安装参数（监听地址与访问地址分离）**、
 **部署侧零防火墙改动 + 防火墙建议清单生成**、
-**脚本 usage 与实现一致性（声明的子命令必须有 case 分支）**
-（当前 441 项）：
+**脚本 usage 与实现一致性（声明的子命令必须有 case 分支）**、
+**初始化装包精简（核心 7 / 可选 11 / GUI 黑名单 45）**、
+**安装路径自适应（SD 卡 → `/opt/onecloud` 回退）**、
+**SD 卡工具箱（格式化 / 迁移 / 更换）**、
+**初始化部署修复（权限自愈 / 面板迁移 / IP 同步 / 数据根一致性）**
+（当前 555 项）：
 
 ```bash
 python3 test_validate.py
@@ -404,8 +431,8 @@ python3 test_validate.py
 输出示例：
 
 ```
-  总计: 441 项
-  通过: 441
+  总计: 555 项
+  通过: 555
   失败: 0
   警告: 0
 ```

@@ -9,8 +9,10 @@
 | 脚本 | 用途 | 常用命令 |
 |------|------|---------|
 | `lib-nodes.sh` | 节点清单库（被其他脚本 source） | — |
+| `lib-install-path.sh` | 安装路径决策库（SD 卡判定与 `/opt/onecloud` 回退，被 bootstrap/setup source） | 直接 source |
 | `lib-pydeps.sh` | Python 依赖安装库（pip 缺失多路降级，被 init/setup/install-services source） | 直接 source |
 | `lib-panel-host.sh` | 面板监听地址库（探测本机网卡、校验绑定地址，被 init/install-service source） | 直接 source |
+| `lib-network-audit.sh` | 通路/防火墙/SSH 自检库（只读探测，被 bootstrap source） | 直接 source |
 | `gen-panel-config.sh` | 从清单生成面板 config.json | 直接运行 / `--out <文件或目录>` |
 | `gen-node-env.sh` | 从清单渲染各节点 .env | `[节点名]` / `--dry-run` |
 | `sync-panel-config.sh` | 把清单节点信息刷新到面板实际读取的 config.json | `--restart` / `--dry-run` |
@@ -48,9 +50,22 @@ lib-panel-host.sh     ← 面板监听地址的单一实现（自动 source）
     ├── init/init.sh                 监听地址选择与校验
     └── panel/install-service.sh     注入 PANEL_HOST 时再校验一次
 
+lib-install-path.sh   ← 安装路径决策的单一实现（自动 source）
+    ├── scripts/bootstrap.sh         步骤 14 决定 DATA_ROOT（SD 挂载点 或 /opt/onecloud）
+    └── scripts/setup.sh             install_path_for srv -> DATA_DIR / COMPOSE_DIR
+
+lib-network-audit.sh  ← 通路/防火墙/SSH 自检库（只读，不 source 别的库）
+    └── scripts/bootstrap.sh         环境自检段
+
 gen-panel-config.sh   → panel/config.json
 gen-node-env.sh       → node-*/.env
+sync-panel-config.sh  → 刷新 panel/ 仓库副本 + systemd 指向目录 + /opt/onecloud/panel
 ```
+
+> **数据根取值唯一入口**：远程路径一律经 `lib-nodes.sh: node_data_root <IP|节点名>`
+> （SSH 读 `/etc/onecloud/install.conf` 的 `DATA_ROOT`，取不到回退 `ONECLOUD_REMOTE_DATA_ROOT`
+> 或 `/mnt/sd`）。`deploy` / `backup` / `restore` / `update-all` / `health-check` 必须用它。
+> `<DATA_ROOT>/srv/<完整节点名>` 是服务数据目录的约定布局。
 
 ---
 
