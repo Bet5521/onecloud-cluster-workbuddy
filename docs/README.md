@@ -20,6 +20,7 @@ OneCloud 集群的完整技术文档。
 | [init-deploy-fixes.md](init-deploy-fixes.md) | 初始化/部署链路缺陷修复（脚本权限 / 面板迁移 / 节点IP同步 / 远程数据根） |
 | [functional-inventory.md](functional-inventory.md) | 功能清单与说明（节点 / 服务 / 脚本 / 面板 / 验证 / 文档索引） |
 | [audit-2026-09.md](audit-2026-09.md) | 代码库质量与功能验证报告（问题分级 + 改进建议） |
+| [design-optional-components.md](design-optional-components.md) | 组件选择性安装与三种组网模式设计方案（v1.6.0） |
 | [firewall/](firewall/) | 各节点防火墙建议清单（`firewall-recommend.sh` 生成） |
 
 ---
