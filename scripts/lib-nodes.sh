@@ -179,6 +179,12 @@ load_nodes() {
     # 未配置时默认即为 dhcp, 不再强制兜底成 1.1.1.1
     NET_DNS="${ONECLOUD_DNS:-${_NODE_FIELD[__net__.dns]:-dhcp}}"
 
+    # 组网模式 (auto|wireguard|lan|mixed)
+    #   auto      按清单里 wireguard 服务是否存在且 default_enabled 推导
+    #   wireguard 仅 WireGuard 组网   lan 仅局域网直连   mixed 混合
+    # 取值与判定由 lib-services.sh 统一负责, 这里只做加载。
+    NET_MODE="${ONECLOUD_NET_MODE:-${_NODE_FIELD[__net__.mode]:-auto}}"
+
     # LAN 掩码位数: 由 lan_subnet 推导, 例 192.168.1.0/24 -> 24
     NET_LAN_PREFIX="${NET_LAN_SUBNET##*/}"
     case "$NET_LAN_PREFIX" in
@@ -208,17 +214,20 @@ node_color()    { node_field "$1" color; }
 
 # 输出某节点的服务列表, 每行一个 (解析 "services" 字段里的 [a, b, c])
 node_services() {
-    local raw val
+    local raw val s
     raw="$(node_field "$1" services)"
     [ -z "$raw" ] && return 0
-    # 去掉方括号, 按逗号切分
+    # 去掉方括号后按逗号切分, 每个元素再去掉首尾空白。
+    # 去空白不能用 `set -- $s`: 此时 IFS 已是逗号, 词分割按逗号走, 空格留着。
+    # 也不能再 fork sed (面板状态表会遍历全部节点×服务, fork 数被放大几十倍),
+    # 所以用 bash 内建的前后缀裁剪 —— 不产生子进程。
     val="${raw#[}"
     val="${val%]}"
     local IFS=','
-    local s
     for s in $val; do
-        s="$(echo "$s" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-        [ -n "$s" ] && echo "$s"
+        s="${s#"${s%%[![:space:]]*}"}"   # 去头部空白
+        s="${s%"${s##*[![:space:]]}"}"   # 去尾部空白
+        [ -n "$s" ] && printf '%s\n' "$s"
     done
 }
 
@@ -351,6 +360,127 @@ service_names() {
 }
 
 # 要求节点清单非空, 否则报错退出 (各脚本入口调用)
+# ------------------------------------------------------------
+# 服务字段查询 (解析 inventory/services.yaml 的任意顶层字段)
+#   service_field <服务名> <字段名>   ->  回显字段值; 无该字段返回 1
+# 例: service_field wireguard optional  ->  true
+# ------------------------------------------------------------
+_parse_services_fields() {
+    # 解析结果按「整个文件」缓存: 本函数会被 service_field 反复调用 (面板状态表
+    # 一次要查 ~40 组服务×字段), 每次都 fork 一个 awk 全量扫 YAML, 在 Git Bash
+    # on Windows 上一轮实测 3 分钟。文件在单次进程生命周期内不会变, 可安全缓存。
+    if [ -n "${_SVC_FIELDS_CACHE:-}" ]; then
+        printf '%s\n' "$_SVC_FIELDS_CACHE"
+        return 0
+    fi
+    local file="${LIB_NODES_PROJECT_DIR}/inventory/services.yaml"
+    [ -f "$file" ] || return 0
+    _SVC_FIELDS_CACHE="$(awk '
+    BEGIN { cur = "" }
+    {
+        line = $0
+        sub(/\r$/, "", line)
+        if (line ~ /^[[:space:]]*#/ || line ~ /^[[:space:]]*$/) next
+        if (line ~ /^[A-Za-z_]/) { cur = ""; next }
+        # 服务名: 2 空格缩进的 "xxx:"
+        if (line ~ /^  [A-Za-z_][A-Za-z0-9_-]*:/) {
+            sub(/^  /, "", line); sub(/:.*$/, "", line)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
+            cur = line
+            next
+        }
+        # 服务的属性字段: 4 空格缩进 "key: value" (排除列表项与子块)
+        if (cur != "" && line ~ /^    [A-Za-z_][A-Za-z0-9_-]*:/) {
+            sub(/^    /, "", line)
+            p = index(line, ":")
+            k = substr(line, 1, p - 1)
+            v = substr(line, p + 1)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", k)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+            gsub(/^"|"$/, "", v)
+            # 只输出标量值, 跳过空值(子块起始) 与列表起始
+            if (v != "") print cur "|" k "|" v
+            next
+        }
+    }' "$file")"
+    printf '%s\n' "$_SVC_FIELDS_CACHE"
+}
+
+# ------------------------------------------------------------
+# services.yaml 字段索引 —— 预载进关联数组, 让查字段变成纯内存哈希访问
+#
+# 为什么需要它: 每个 (节点,服务) 的渲染要查 optional / install / port 三次字段,
+# 18 组就是 54 次 service_field。而 service_field 即使命中缓存, 调用本身仍是
+# `local x="$(service_field ...)"` 形式的子 shell —— 在 Git Bash on Windows 上
+# 一次子 shell 约 1 秒, 54 次就是近一分钟。预载后查表退化为 ${_SVC_FIELD_INDEX[k]:-}。
+#
+# 键格式: <服务名>|<字段名>; 只填充**存在**的字段, 用 ${var+x} 区分"不存在"。
+# ------------------------------------------------------------
+declare -A _SVC_FIELD_INDEX=()
+_SVC_FIELD_INDEX_LOADED=""
+
+_services_field_index_load() {
+    [ -n "$_SVC_FIELD_INDEX_LOADED" ] && return 0
+    _SVC_FIELD_INDEX_LOADED=1
+    local line name key value
+    while IFS='|' read -r name key value; do
+        [ -n "$name" ] && [ -n "$key" ] && _SVC_FIELD_INDEX["${name}|${key}"]="$value"
+    done < <(_parse_services_fields)
+}
+
+service_field() {   # service_field <服务名> <字段名>
+    local svc="$1" want="$2" v
+    # 纯内存查表 (见上): 先把整份字段索引载入关联数组, 再直接取值。
+    _services_field_index_load
+    v="${_SVC_FIELD_INDEX["${svc}|${want}"]+_set}"
+    if [ -z "$v" ]; then
+        return 1
+    fi
+    printf '%s' "${_SVC_FIELD_INDEX["${svc}|${want}"]}"
+}
+
+# ------------------------------------------------------------
+# 网络参数 mode 的裸值 (供 lib-services.sh 判定, 不在这里解释 auto)
+# ------------------------------------------------------------
+network_mode_raw() { printf '%s' "${NET_MODE:-auto}"; }
+
+# ------------------------------------------------------------
+# 本机数据根 (与远端 node_data_root 相对)
+#   优先已 resolve 的 DATA_ROOT; 未 resolve 时返回空
+#   远端读取请用 node_data_root <IP>
+# ------------------------------------------------------------
+local_data_root() {
+    printf '%s' "${DATA_ROOT:-}"
+}
+
+# ------------------------------------------------------------
+# 静态数据根 (不做任何 SSH) —— 生成类脚本专用
+#
+# 背景: node_data_root 会 SSH 到节点读 /etc/onecloud/install.conf, 单次
+#       ConnectTimeout=4s, 节点离线时等于「每个节点白等 4~5 秒」。
+#       gen-panel-config.sh 要在控制端为每个节点各取一次数据根,
+#       3 节点就多花 ~15s, 且离线场景更久 —— 这是纯粹的构建期浪费。
+#
+# 生成器只需要一个「可写入配置文件的默认值」, 真实数据根由面板在运行时
+# 自己探测 (panel/app.py), 因此这里不阻塞:
+#   ONECLOUD_REMOTE_DATA_ROOT > 已 resolve 的 DATA_ROOT > /mnt/sd
+#
+# 需要节点真实数据根时, 仍用 node_data_root (会 SSH)。
+# ------------------------------------------------------------
+static_data_root() {
+    if [ -n "${ONECLOUD_REMOTE_DATA_ROOT:-}" ]; then
+        printf '%s' "$ONECLOUD_REMOTE_DATA_ROOT"
+        return 0
+    fi
+    local r
+    r="$(local_data_root)"
+    if [ -n "$r" ]; then
+        printf '%s' "$r"
+        return 0
+    fi
+    printf '/mnt/sd'
+}
+
 require_nodes() {
     if [ "${#NODE_NAMES[@]}" -eq 0 ]; then
         echo "[ERROR] 未找到任何节点定义, 请检查: $NODES_YAML" >&2

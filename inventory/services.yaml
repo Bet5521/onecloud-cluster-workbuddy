@@ -37,6 +37,14 @@ services:
   wireguard:
     node: wk-edge-01
     container: true
+    # 可选组件: 可以不安装 (纯局域网组网时)
+    #   optional        = true  -> 允许"未安装", 不算异常
+    #   default_enabled = false -> 首次部署默认不装; network.mode=auto 时据此
+    #                              推导为 lan (未启用 WG)
+    #   provides        = 该组件提供的组网能力, 供组网模式推导使用
+    optional: true
+    default_enabled: false
+    provides: wg-mesh
     image: linuxserver/wireguard:latest
     ports:
       - "51820:51820/udp"
@@ -168,6 +176,11 @@ services:
   verysync:
     node: wk-storage-03
     container: false
+    # install: manual = 无自动化安装实现, 需人工下载。
+    # 面板据此显示「待手动安装」而不是「离线」, 健康检查也不计为失败。
+    optional: true
+    default_enabled: false
+    install: manual
     binary: verysync-linux-armv7
     port: 19900
     memory_limit: 50MB

@@ -1,6 +1,11 @@
 {
   "cluster_name": "OneCloud Cluster",
-  "version": "1.5.5",
+  "version": "1.6.0",
+  "network_mode": "mixed",
+  "network_mode_label": "混合组网 (LAN 直连 + WireGuard Mesh)",
+  "wg_enabled": true,
+  "wg_subnet": "10.8.0.0/24",
+  "lan_subnet": "192.168.1.0/24",
   "update_interval": 10,
   "ssh_timeout": 3,
   "generated_by": "scripts/gen-panel-config.sh",
@@ -13,7 +18,8 @@
     "wg_ip": "10.8.0.101",
     "hostname": "edge-01",
     "color": "#4CAF50",
-    "services": [{"name":"cloudflared","display":"Cloudflare Tunnel","container":true},{"name":"adguard","display":"AdGuard Home","container":true},{"name":"wireguard","display":"WireGuard","container":true},{"name":"clash","display":"Clash","container":false},{"name":"memos","display":"Memos","container":true},{"name":"panel","display":"OneCloud Panel","container":false}]
+    "data_root": "/mnt/sd",
+    "services": [{"name":"cloudflared","display":"Cloudflare Tunnel","container":true,"installed":true,"optional":false,"install":"","port":0},{"name":"adguard","display":"AdGuard Home","container":true,"installed":true,"optional":false,"install":"","port":0},{"name":"wireguard","display":"WireGuard","container":true,"installed":true,"optional":true,"install":"","port":51820},{"name":"clash","display":"Clash","container":false,"installed":true,"optional":false,"install":"","port":9090},{"name":"memos","display":"Memos","container":true,"installed":true,"optional":false,"install":"","port":0},{"name":"panel","display":"OneCloud Panel","container":false,"installed":true,"optional":false,"install":"","port":9000}]
   }
   ,
   {
@@ -24,7 +30,8 @@
     "wg_ip": "10.8.0.102",
     "hostname": "iot-02",
     "color": "#2196F3",
-    "services": [{"name":"homeassistant","display":"Home Assistant","container":true},{"name":"xiaomusic","display":"xiaomusic","container":false},{"name":"migpt","display":"migpt","container":false},{"name":"piwigo","display":"Piwigo","container":true},{"name":"typecho","display":"Typecho","container":true}]
+    "data_root": "/mnt/sd",
+    "services": [{"name":"homeassistant","display":"Home Assistant","container":true,"installed":true,"optional":false,"install":"","port":0},{"name":"xiaomusic","display":"xiaomusic","container":false,"installed":true,"optional":false,"install":"","port":8081},{"name":"migpt","display":"migpt","container":false,"installed":true,"optional":false,"install":"","port":8082},{"name":"piwigo","display":"Piwigo","container":true,"installed":true,"optional":false,"install":"","port":8080},{"name":"typecho","display":"Typecho","container":true,"installed":true,"optional":false,"install":"","port":8083}]
   }
   ,
   {
@@ -35,7 +42,8 @@
     "wg_ip": "10.8.0.103",
     "hostname": "storage-03",
     "color": "#FF9800",
-    "services": [{"name":"syncthing","display":"Syncthing","container":true},{"name":"verysync","display":"verysync","container":false},{"name":"aria2","display":"aria2","container":true},{"name":"cupsd","display":"CUPS","container":true},{"name":"cups-web","display":"CUPS Web","container":true},{"name":"ariang","display":"AriaNg","container":true},{"name":"gitea","display":"Gitea","container":true}]
+    "data_root": "/mnt/sd",
+    "services": [{"name":"syncthing","display":"Syncthing","container":true,"installed":true,"optional":false,"install":"","port":8384},{"name":"verysync","display":"verysync","container":false,"installed":false,"optional":true,"install":"manual","port":19900},{"name":"aria2","display":"aria2","container":true,"installed":true,"optional":false,"install":"","port":6800},{"name":"cupsd","display":"CUPS","container":true,"installed":true,"optional":false,"install":"","port":631},{"name":"cups-web","display":"CUPS Web","container":true,"installed":true,"optional":false,"install":"","port":632},{"name":"ariang","display":"AriaNg","container":true,"installed":true,"optional":false,"install":"","port":6880},{"name":"gitea","display":"Gitea","container":true,"installed":true,"optional":false,"install":"","port":3000}]
   }
   ]
 }

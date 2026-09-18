@@ -67,6 +67,12 @@ test_run.txt
 *.log
 # 开发用的小工具 (只跑单个测试组, 本地保留不入库)
 _run_one.py
+# 面板行为端到端校验脚本 (本地跑 mock 用, 不入库)
+_panel_e2e.py
+# 本地临时产物 (测试/排查输出, 一律不入库)
+_*.txt
+_*.tsv
+_g*.txt
 
 # Python 缓存
 __pycache__/

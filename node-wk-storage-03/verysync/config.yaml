@@ -1,5 +1,8 @@
-# verysync (微力同步) 配置
+# verysync (微力同步) 配置模板
 # 注意: verysync 是原生二进制, 非 Docker
+#
+# 路径字段用 __DATA_ROOT__ 占位, 由 scripts/install-services.sh 在安装时
+# 按本机实际数据根渲染 (SD 挂载点或无卡回退 /opt/onecloud), 不再写死 /mnt/sd。
 
 server:
   # WebUI 监听地址
@@ -13,19 +16,19 @@ sync:
   # 需要同步的目录列表
   folders:
     - name: "集群配置"
-      path: "/mnt/sd/storage-03/cluster-sync"
+      path: "__DATA_ROOT__/srv/wk-storage-03/cluster-sync"
       # 同步码 (其他设备需要输入此码加入)
       # 首次启动后在 WebUI 中生成
 
     - name: "下载文件"
-      path: "/mnt/sd/storage-03/aria2/downloads"
+      path: "__DATA_ROOT__/srv/wk-storage-03/aria2/downloads"
 
     - name: "相册备份"
-      path: "/mnt/sd/storage-03/photos-backup"
+      path: "__DATA_ROOT__/srv/wk-storage-03/photos-backup"
 
 advanced:
   # 临时文件目录
-  temp_dir: "/mnt/sd/storage-03/verysync/temp"
+  temp_dir: "__DATA_ROOT__/srv/wk-storage-03/verysync/temp"
 
   # 最大并发下载数
   max_concurrent: 16

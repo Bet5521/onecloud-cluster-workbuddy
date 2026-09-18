@@ -251,14 +251,14 @@ init.sh
 
 ## 8. 验证与自检
 
-| 入口 | 覆盖 | 结果（v1.5.5） |
+| 入口 | 覆盖 | 结果（v1.6.0） |
 | --- | --- | --- |
-| `python test_validate.py` | 32 组 / 555 项 | 通过 555 / 失败 0 / 警告 0（报告写入 `test_report.txt`，已 gitignore） |
+| `python test_validate.py` | 36 组 | 全通过（报告写入 `test_report.txt`，已 gitignore） |
 | `scripts/lib-network-audit.sh` | 网络通路 / 防火墙 / SSH 通道 | 只读；探测不到一律 `unknown` |
 | `scripts/health-check.sh` | 容器 / 端口 / WireGuard / 磁盘 | 运行态检查 |
 | `scripts/fix-perms.sh --list` | `.sh` 执行权限 | 幂等修复 |
 
-**32 组测试分布**（`test_validate.py` 中的 `def test_*`）：
+**36 组测试分布**（`test_validate.py` 中的 `def test_*`）：
 
 | # | 组名 | 关注点 |
 | --- | --- | --- |
@@ -294,9 +294,14 @@ init.sh
 | 30 | `test_install_path_adaptive` | SD 卡 → `/opt/onecloud` 回退 |
 | 31 | `test_sd_tools` | SD 卡工具箱（格式化 / 迁移 / 更换） |
 | 32 | `test_init_deploy_sync` | 权限 / 迁移 / IP 同步 / 数据根一致性 |
+| 33 | `test_lib_services` | `lib-services.sh` 安装态 / 模式 / 数据根单一真相 |
+| 34 | `test_optional_components_chain` | 可选组件全链路（7 条反向断言） |
+| 35 | `test_network_modes_and_panel` | 三种组网模式 / 面板三态 / 版本同步 |
+| 36 | `test_services_lib_perf_and_ports` | 性能回归（禁逐节点 SSH）+ 容器端口解析 |
 
 > 跑测注意：必须在 PATH 含 Git `bin` + `usr/bin` 的 shell 里执行，否则 harness 找不到 `bash` → 大量
-> `[WinError 2]` 假失败。Windows 一轮 15–20 分钟，可用 `ONECLOUD_TEST_HARNESS_TIMEOUT` 调整上限。
+> `[WinError 2]` 假失败。Windows 一轮 20–30 分钟，可用 `ONECLOUD_TEST_HARNESS_TIMEOUT` 调整上限。
+> 改完 `test_validate.py` **必须重开一轮** —— Python 启动时已把文件读进内存，后台跑测期间改文件对当轮无效。
 
 ---
 

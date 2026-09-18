@@ -11,6 +11,9 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 # 节点清单统一从 inventory 读取 (支持 nodes.local.yaml / 环境变量自定义)
 # shellcheck source=lib-nodes.sh
 source "${SCRIPT_DIR}/lib-nodes.sh"
+# 安装态 / 组网模式 单一真相库 (未安装的服务不建目录、不分发)
+# shellcheck source=lib-services.sh
+source "${SCRIPT_DIR}/lib-services.sh"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -94,7 +97,39 @@ deploy_node() {
     fi
 
     # 确保远程目录存在
-    ssh "root@${NODE_IP}" "mkdir -p ${REMOTE_BASE}/{cloudflared,adguard/{work,conf},wireguard/config,clash,memos/data,homeassistant,piwigo/{config,gallery},xiaomusic,migpt,typecho/usr,syncthing/{config,data},verysync,aria2/{config,downloads},cupsd/{config,printers,spool},cups-web/config,panel,gitea}"
+    #   目录清单由清单推导: 只给「应当安装」的服务建数据目录。
+    #   原先这里把 24 个目录写死, 未安装/可选组件也照样建 —— 用户不装
+    #   WireGuard 时节点上仍会出现 wireguard/config, 面板/健康检查之外的地方
+    #   看到这个空目录会误以为已安装。改为按 service_installed 过滤。
+    #
+    #   生成的是**花括号展开**形式 (a,{x,y},b): 一条 mkdir 命令搞定,
+    #   也便于测试用同一套括号解析逻辑核对「预建目录是否覆盖 compose 挂载」。
+    local dirs="" s
+    for s in $(node_services "$NODE_NAME"); do
+        [ "$(service_installed "$NODE_NAME" "$s")" = "1" ] || continue
+        # 容器型服务的子目录按需展开 (与各节点 compose 的挂载点对应)
+        local item
+        case "$s" in
+            adguard)        item="adguard/{work,conf}" ;;
+            piwigo)         item="piwigo/{config,gallery}" ;;
+            syncthing)      item="syncthing/{config,data}" ;;
+            aria2)          item="aria2/{config,downloads}" ;;
+            cupsd)          item="cupsd/{config,printers,spool}" ;;
+            cups-web)       item="cups-web/config" ;;
+            typecho)        item="typecho/usr" ;;
+            memos)          item="memos/data" ;;
+            wireguard)      item="wireguard/config" ;;
+            *)              item="$s" ;;
+        esac
+        dirs="${dirs:+${dirs},}${item}"
+    done
+    if [ -n "$dirs" ]; then
+        # shellcheck disable=SC2086
+        ssh "root@${NODE_IP}" "mkdir -p '${REMOTE_BASE}' && cd '${REMOTE_BASE}' && mkdir -p ${dirs}"
+    else
+        log_warn "$NODE_NAME 清单中没有可安装的服务, 仅创建节点根目录"
+        ssh "root@${NODE_IP}" "mkdir -p '${REMOTE_BASE}'"
+    fi
 
     # 分发配置文件
     if [ -d "$NODE_SRC" ]; then

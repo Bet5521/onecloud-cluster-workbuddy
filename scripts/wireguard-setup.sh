@@ -28,7 +28,36 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 # 节点清单统一从 inventory 读取 (支持 nodes.local.yaml / 环境变量自定义)
 # shellcheck source=lib-nodes.sh
 source "${SCRIPT_DIR}/lib-nodes.sh"
+# 安装态 / 组网模式 单一真相库 (判定当前是否应生成 WireGuard 配置)
+# shellcheck source=lib-services.sh
+source "${SCRIPT_DIR}/lib-services.sh"
 require_nodes
+
+# ----------------------------------------------------------------------------
+# 组网模式闸门: 当前模式未启用 WireGuard 时直接退出 0
+#
+# 为什么是 exit 0 而不是报错:
+#   "不装 WireGuard" 是用户明确选择的合法配置 (network.mode: lan), 不是失败。
+#   init.sh / deploy.sh 会在流水线里调本脚本, 若这里非 0 退出, 整条部署链
+#   会被一个预期内的跳过动作打断。所以: 打印说明, 返回成功。
+#   要真的生成配置, 把 network.mode 改成 mixed / wireguard (或仅删掉 mode: lan)。
+# ----------------------------------------------------------------------------
+if [ "$(wg_enabled)" != "1" ]; then
+    echo ""
+    echo "=========================================="
+    echo "  WireGuard Mesh 配置生成器"
+    echo "=========================================="
+    echo ""
+    # network_mode_label 自带括号说明, 这里不要再套一层 (会变成
+    # "lan (局域网直连 (192.168.1.0/24))")。
+    echo "[SKIP] 当前组网模式为 $(network_mode_label)"
+    echo "       未启用 WireGuard, 无需生成 wg0.conf —— 这是配置选择, 不是错误。"
+    echo ""
+    echo "       如需启用: 在 inventory/nodes.yaml 里设 network.mode 为 mixed 或 wireguard"
+    echo "       (当前值: $(network_mode_raw))"
+    echo ""
+    exit 0
+fi
 
 # 密钥与节点登记表的存放位置 (不入库)
 WG_DIR="${PROJECT_DIR}/wireguard"
@@ -36,8 +65,11 @@ mkdir -p "$WG_DIR"
 PEERS_FILE="${WG_DIR}/peers.list"
 DOMAIN_FILE="${WG_DIR}/domain"
 
-# Hub 节点: 承担外网端点与流量转发, 取 role=edge-gateway 的节点
-HUB_NODE="$(node_name_by_role edge-gateway 2>/dev/null || echo "${NODE_NAMES[0]}")"
+# Hub 节点: 承担外网端点与流量转发
+#   原先按 role=edge-gateway 反查, 但那只是"边缘网关节点恰好跑 WG"的巧合;
+#   真正的归属在 services.yaml 里 wireguard 的 node 字段。角色改名/迁移节点
+#   后原写法会静默取错节点, 所以改由清单声明反查。
+HUB_NODE="$(wg_hub_node 2>/dev/null || node_name_by_role edge-gateway 2>/dev/null || echo "${NODE_NAMES[0]}")"
 
 # WireGuard 监听端口与 DNS 均来自清单
 WG_PORT="$NET_WG_PORT"

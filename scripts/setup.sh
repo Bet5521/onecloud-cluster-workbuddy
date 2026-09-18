@@ -906,12 +906,15 @@ install_xiaomusic() {
     fi
 
     # 配置
+    # 修复: 原先这里写死 /mnt/sd/music, 与上面的 ${DATA_DIR} 决策相矛盾 ——
+    #       无 SD 卡的机器上 DATA_DIR 已是 /opt/onecloud/srv, 但配置仍指向
+    #       /mnt/sd, 导致音乐目录建在不存在的位置 (审计 C-3)。
     if [ ! -f "${DATA_DIR}/xiaomusic/config.json" ]; then
         cat > "${DATA_DIR}/xiaomusic/config.json" << EOF
 {
   "port": 8081,
-  "music_path": "/mnt/sd/music",
-  "download_path": "/mnt/sd/music/download",
+  "music_path": "${DATA_DIR}/xiaomusic/music",
+  "download_path": "${DATA_DIR}/xiaomusic/music/download",
   "hostname": "$(current_node_ip)",
   "account": "xiaomusic",
   "password": "xiaomusic"
@@ -919,7 +922,7 @@ install_xiaomusic() {
 EOF
     fi
 
-    mkdir -p /mnt/sd/music/download
+    mkdir -p "${DATA_DIR}/xiaomusic/music/download"
 
     # systemd
     cat > /etc/systemd/system/xiaomusic.service << EOF

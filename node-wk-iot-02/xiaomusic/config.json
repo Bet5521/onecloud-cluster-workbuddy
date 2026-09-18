@@ -1,4 +1,5 @@
 {
+  "_comment": "路径字段用 __DATA_ROOT__ 占位, 由 scripts/install-services.sh 在安装时按本机实际数据根渲染 (SD 挂载点或无卡回退 /opt/onecloud), 不再写死 /mnt/sd。",
   "server": {
     "host": "0.0.0.0",
     "port": 8081,
@@ -6,8 +7,8 @@
     "debug": false
   },
   "music": {
-    "download_path": "/mnt/sd/iot-02/xiaomusic/downloads",
-    "cache_path": "/mnt/sd/iot-02/xiaomusic/cache",
+    "download_path": "__DATA_ROOT__/srv/wk-iot-02/xiaomusic/downloads",
+    "cache_path": "__DATA_ROOT__/srv/wk-iot-02/xiaomusic/cache",
     "max_cache_size_mb": 512,
     "auto_update_lrc": true,
     "prefer_quality": "standard"
@@ -15,7 +16,7 @@
   "account": {
     "phone": "",
     "password": "",
-    "session_data_path": "/mnt/sd/iot-02/xiaomusic/session"
+    "session_data_path": "__DATA_ROOT__/srv/wk-iot-02/xiaomusic/session"
   },
   "output": {
     "format": "mp3",

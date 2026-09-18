@@ -91,6 +91,18 @@ if [ -f "${SCRIPTS_DIR}/lib-network-audit.sh" ]; then
     source "${SCRIPTS_DIR}/lib-network-audit.sh"
 fi
 
+# 安装态 / 组网模式 单一真相库 (菜单里展示模式, 并据此给出 WireGuard 提示)
+if [ -f "${SCRIPTS_DIR}/lib-services.sh" ]; then
+    # shellcheck source=../scripts/lib-services.sh
+    source "${SCRIPTS_DIR}/lib-services.sh"
+fi
+
+# 当前组网模式 (供菜单展示); 库不可用时返回空, 调用方按"未知"处理
+node_net_mode_display() {
+    command -v network_mode >/dev/null 2>&1 || return 1
+    network_mode 2>/dev/null
+}
+
 # ------------------------------------------------------------
 # 3. 颜色与日志 (在 source lib-nodes.sh 之后定义, 覆盖同名函数)
 # ------------------------------------------------------------
@@ -1112,6 +1124,19 @@ wg_add_peer() {
 menu_wireguard() {
     while :; do
         header "WireGuard 配置管理"
+        # 组网模式闸门提示: mode=lan 时 WireGuard 是被刻意关闭的, 先说明再给菜单,
+        # 否则用户点了"生成"只看到一行 SKIP 会以为是坏了。
+        local _mode=""
+        _mode="$(node_net_mode_display 2>/dev/null || true)"
+        if [ -n "$_mode" ] && [ "$_mode" != "lan" ]; then
+            echo -e "  ${DIM}当前组网模式: ${_mode}${NC}"
+            echo ""
+        elif [ "$_mode" = "lan" ]; then
+            echo -e "  ${YELLOW}当前组网模式为 lan (仅局域网直连), WireGuard 未启用。${NC}"
+            echo -e "  ${DIM}生成配置会直接跳过 —— 这是配置选择, 不是错误。${NC}"
+            echo -e "  ${DIM}如需启用: 编辑 inventory/nodes.yaml 的 network.mode 为 mixed。${NC}"
+            echo ""
+        fi
         menu "请选择操作" \
             "生成全部节点密钥与 wg0.conf" \
             "登记新节点 (add peer)" \
@@ -1132,6 +1157,13 @@ menu_wireguard() {
     done
 }
 
+# 服务的安装态与组网模式一览 (供菜单展示; 取不到时静默返回空)
+menu_services_status() {
+    header "服务安装态与组网模式"
+    run_script "服务安装态" bash "${SCRIPTS_DIR}/install-services.sh" list-installed
+    pause
+}
+
 menu_config() {
     while :; do
         header "配置与分发"
@@ -1143,6 +1175,7 @@ menu_config() {
             "生成面板配置 panel/config.json" \
             "渲染节点 .env 文件" \
             "WireGuard 配置管理" \
+            "查看服务安装态与组网模式" \
             "返回主菜单"
         case "$MENU_CHOICE" in
             1) cfg_deploy ;;
@@ -1158,7 +1191,8 @@ menu_config() {
             5) cfg_gen_panel ;;
             6) cfg_gen_env ;;
             7) menu_wireguard ;;
-            8) return ;;
+            8) menu_services_status ;;
+            9) return ;;
         esac
     done
 }
@@ -1261,12 +1295,13 @@ menu_selfcheck() {
     echo ""
     echo -e "${BOLD}关键脚本${NC}"
     local s
-    for s in lib-nodes.sh lib-pydeps.sh lib-panel-host.sh lib-network-audit.sh \
+    for s in lib-nodes.sh lib-services.sh lib-pydeps.sh lib-panel-host.sh \
+             lib-network-audit.sh \
              bootstrap.sh deploy.sh \
              health-check.sh backup.sh \
              restore.sh update-all.sh install-services.sh setup.sh \
              wireguard-setup.sh gen-panel-config.sh gen-node-env.sh \
-             firewall-recommend.sh; do
+             sync-panel-config.sh firewall-recommend.sh; do
         if [ -f "${SCRIPTS_DIR}/${s}" ]; then
             log_ok "存在: scripts/${s}"
         else

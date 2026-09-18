@@ -3,21 +3,57 @@
 let autoRefreshTimer = null;
 const REFRESH_INTERVAL = 10000;
 let currentNodes = [];
+let currentNet = {mode: "mixed", wg_enabled: true, label: ""};
+
+/**
+ * 统一的请求封装。
+ *
+ * 关键点 (见 docs/audit-2026-09.md C-1):
+ *   - credentials: "same-origin" 让会话 cookie 随请求发送。原先每处 fetch 都不带
+ *     凭据, 而后端 require_auth 保护了所有 /api/*, 导致浏览器里 100% 返回 401,
+ *     面板开箱即不可用。
+ *   - X-Requested-With 供后端 require_csrf_header 校验 (状态变更接口)。
+ *   - 401 时自动跳转登录页, 而不是静默失败。
+ */
+async function apiFetch(path, options) {
+    options = options || {};
+    const headers = Object.assign(
+        {"X-Requested-With": "OneCloudPanel"},
+        options.headers || {}
+    );
+    const res = await fetch(path, Object.assign({}, options, {
+        headers: headers,
+        credentials: "same-origin",
+    }));
+    if (res.status === 401) {
+        window.location.href = "/login?next=" + encodeURIComponent(window.location.pathname);
+        throw new Error("未登录");
+    }
+    return res;
+}
 
 async function refresh() {
     try {
-        const res = await fetch("/api/status");
+        const res = await apiFetch("/api/status");
         const data = await res.json();
         renderStatus(data);
     } catch (e) {
         console.error("获取状态失败:", e);
-        document.getElementById("updateTime").textContent = "最后更新: 错误";
+        const el = document.getElementById("updateTime");
+        if (el) el.textContent = "最后更新: 错误";
     }
 }
 
 function renderStatus(data) {
     currentNodes = data.nodes || [];
+    currentNet = {
+        mode: data.network_mode || "mixed",
+        wg_enabled: data.wg_enabled !== false,
+        label: data.network_mode_label || "",
+    };
     document.getElementById("clusterName").textContent = data.cluster_name;
+    const modeEl = document.getElementById("netMode");
+    if (modeEl) modeEl.textContent = currentNet.label ? `· ${currentNet.label}` : "";
     document.getElementById("updateTime").textContent = `更新: ${data.timestamp}`;
 
     const nodesEl = document.getElementById("nodes");
@@ -25,6 +61,33 @@ function renderStatus(data) {
 
     renderTopology(data.nodes);
     updateExecNodeSelect(data.nodes);
+}
+
+/** 三态判定: 未安装 / 已停止 / 运行中 */
+function serviceState(svc) {
+    if (!svc.installed) {
+        if (svc.install === "manual")   return {cls: "notinstalled", text: "待手动安装"};
+        if (svc.install === "external") return {cls: "notinstalled", text: "未启用"};
+        return {cls: "notinstalled", text: "未安装"};
+    }
+    return svc.running ? {cls: "running", text: "运行中"}
+                       : {cls: "stopped", text: "已停止"};
+}
+
+/** 未安装服务只给提示按钮, 不提供启停 (启停会对不存在的单元报错) */
+function serviceButtons(node, svc, st) {
+    if (!svc.installed) {
+        const hint = svc.install === "manual"
+            ? "该组件需手动安装, 详见 docs/sd-tools.md 与官方下载页"
+            : "该组件未安装, 请在节点执行: ./scripts/install-services.sh <服务名>";
+        return `<button onclick="showToast('${hint.replace(/'/g, "\\'")}', 6000)">? 说明</button>`;
+    }
+    return st.cls === "running"
+        ? `<button onclick="serviceAction('${node.name}','${svc.name}','restart')">↻</button>
+           <button onclick="serviceAction('${node.name}','${svc.name}','stop')">■</button>
+           <button onclick="serviceAction('${node.name}','${svc.name}','logs')">📋</button>`
+        : `<button onclick="serviceAction('${node.name}','${svc.name}','start')">▶</button>
+           <button onclick="serviceAction('${node.name}','${svc.name}','logs')">📋</button>`;
 }
 
 function renderNode(node) {
@@ -37,23 +100,36 @@ function renderNode(node) {
     const disk = sys.DISK || "-";
     const uptime = sys.UPTIME || "-";
 
-    const servicesHtml = (node.services || []).map(svc => `
+    const servicesHtml = (node.services || []).map(svc => {
+        const st = serviceState(svc);
+        return `
         <div class="service-item">
             <span class="service-name">
-                <span class="status-dot ${svc.running ? 'running' : 'stopped'}"></span>
+                <span class="status-dot ${st.cls}"></span>
                 ${svc.display}
-                <span class="muted">(${svc.type})</span>
+                <span class="muted">(${svc.type}${svc.port ? ' · ' + svc.port : ''})</span>
+                <span class="service-state muted">${st.text}</span>
             </span>
             <span class="service-actions">
-                ${svc.running
-                    ? `<button onclick="serviceAction('${node.name}','${svc.name}','restart')">↻</button>
-                       <button onclick="serviceAction('${node.name}','${svc.name}','stop')">■</button>`
-                    : `<button onclick="serviceAction('${node.name}','${svc.name}','start')">▶</button>`
-                }
-                <button onclick="serviceAction('${node.name}','${svc.name}','logs')">📋</button>
+                ${serviceButtons(node, svc, st)}
             </span>
-        </div>
-    `).join("");
+        </div>`;
+    }).join("");
+
+    // 汇总: 分母只算"应当安装"的服务, 未安装的不计入
+    const installedN = node.services_installed != null
+        ? node.services_installed
+        : (node.services || []).filter(s => s.installed).length;
+    const runningN = node.services_running != null
+        ? node.services_running
+        : (node.services || []).filter(s => s.running).length;
+    const totalN = node.services_total || (node.services || []).length;
+    const summary = `已装 ${installedN}/${totalN} · 运行 ${runningN}`;
+
+    // LAN 模式不展示 WG 行, 避免"没装却显示 10.8.0.x"的误导
+    const addr = (currentNet.wg_enabled && node.wg_ip)
+        ? `${node.name} · ${node.ip} (WG: ${node.wg_ip})`
+        : `${node.name} · ${node.ip}`;
 
     return `
         <div class="node-card" style="border-top: 4px solid ${node.color}">
@@ -62,7 +138,8 @@ function renderNode(node) {
                 <span class="node-badge ${statusClass}">${statusText}</span>
             </div>
             <div class="node-body">
-                <div class="node-ip">${node.name} · ${node.ip} (WG: ${node.wg_ip})</div>
+                <div class="node-ip">${addr}</div>
+                <div class="node-summary muted">${summary}</div>
                 <div class="system-stats">
                     <div class="stat-item">
                         <span class="stat-label">负载</span>
@@ -105,6 +182,28 @@ function renderTopology(nodes) {
             <div class="topo-online">${n.online ? '● ONLINE' : '○ OFFLINE'}</div>
         </div>
     `).join("");
+
+    // 组网方式: lan 模式完全不出现 WireGuard 字样
+    const modeEl = document.getElementById("topoMode");
+    if (modeEl) {
+        if (currentNet.mode === "lan") {
+            modeEl.textContent = "局域网直连 (" + (currentNet.lan_subnet || "LAN") + ")";
+            modeEl.className = "topo-mesh topo-lan";
+        } else if (currentNet.mode === "wireguard") {
+            modeEl.textContent = currentNet.label || "WireGuard 组网";
+            modeEl.className = "topo-mesh topo-wg";
+        } else {
+            modeEl.textContent = currentNet.label || "混合组网";
+            modeEl.className = "topo-mesh topo-mixed";
+        }
+    }
+}
+
+async function doLogout() {
+    try {
+        await fetch("/logout", {method: "POST", credentials: "same-origin"});
+    } catch (e) { /* 忽略 */ }
+    window.location.href = "/login";
 }
 
 function updateExecNodeSelect(nodes) {
@@ -114,13 +213,17 @@ function updateExecNodeSelect(nodes) {
 }
 
 async function serviceAction(node, svc, action) {
-    const res = await fetch(`/api/service/${node}/${svc}/${action}`, {
+    const res = await apiFetch(`/api/service/${node}/${svc}/${action}`, {
         method: "POST",
         headers: {"Content-Type": "application/json"}
     });
     const data = await res.json();
     refresh();
     const output = Array.isArray(data.output) ? data.output.join("\n") : (data.output || "");
+    if (!res.ok && data.error) {
+        showToast(`[${action}] ${svc}: ${data.error}`, 5000);
+        return;
+    }
     if (action === "logs") {
         const el = document.getElementById("execOutput");
         if (el) {
@@ -139,31 +242,33 @@ async function nodeAction(node, action) {
     if (action === "reboot" || action === "shutdown") {
         if (!confirm(`确定要对 ${node} 执行 ${action} 吗?`)) return;
     }
-    const res = await fetch(`/api/node/${node}/action`, {
+    const res = await apiFetch(`/api/node/${node}/action`, {
         method: "POST",
         headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({action})
+        body: JSON.stringify({action, confirm: true})
     });
     const data = await res.json();
     refresh();
-    showToast(`${node}: ${action} ${data.ok ? '✓' : '✗'}`);
+    showToast(`${node}: ${action} ${data.ok ? '✓' : '✗ ' + (data.error || '')}`);
 }
 
 async function clusterAction(action) {
     if (action === "health_check") {
         showToast("正在执行健康检查...");
         try {
-            const res = await fetch("/api/status");
+            const res = await apiFetch("/api/status");
             const data = await res.json();
             let summary = [];
+            summary.push(`组网模式: ${data.network_mode_label || data.network_mode}`);
             for (const node of data.nodes) {
                 const status = node.online ? "✅ 在线" : "❌ 离线";
-                const svcRunning = (node.services || []).filter(s => s.running).length;
-                const svcTotal = (node.services || []).length;
+                const inst = node.services_installed != null ? node.services_installed : 0;
+                const run = node.services_running != null ? node.services_running : 0;
+                const total = node.services_total || (node.services || []).length;
                 const load = (node.system || {}).LOAD || "-";
-                summary.push(`${node.display_name}: ${status} | 服务 ${svcRunning}/${svcTotal} | 负载 ${load}`);
+                summary.push(`${node.display_name}: ${status} | 已装 ${inst}/${total} 运行 ${run} | 负载 ${load}`);
             }
-            showToast(summary.join(" \n "), 5000);
+            showToast(summary.join(" \n "), 6000);
         } catch (e) {
             showToast("健康检查失败: " + e.message);
         }
@@ -184,7 +289,7 @@ async function clusterAction(action) {
         }
         let nodes = currentNodes || [];
         if (!nodes.length) {
-            const res = await fetch("/api/status").catch(() => null);
+            const res = await apiFetch("/api/status").catch(() => null);
             const d = res ? await res.json().catch(() => ({})) : {};
             nodes = d.nodes || [];
         }
@@ -195,10 +300,10 @@ async function clusterAction(action) {
         showToast(`正在对 ${nodes.length} 个节点执行 ${action}...`);
         const results = [];
         for (const node of nodes) {
-            const res = await fetch(`/api/node/${node.name}/action`, {
+            const res = await apiFetch(`/api/node/${node.name}/action`, {
                 method: "POST",
                 headers: {"Content-Type": "application/json"},
-                body: JSON.stringify({action})
+                body: JSON.stringify({action, confirm: true})
             }).catch(() => null);
             const d = res ? await res.json().catch(() => ({})) : {};
             results.push(`${node.display_name || node.name}: ${d.ok ? "✓" : "✗"}`);
@@ -218,14 +323,14 @@ async function execCmd() {
         showToast("请选择节点并输入命令");
         return;
     }
-    const res = await fetch("/api/exec", {
+    const res = await apiFetch("/api/exec", {
         method: "POST",
         headers: {"Content-Type": "application/json"},
         body: JSON.stringify({node, command: cmd})
     });
     const data = await res.json();
     const outputEl = document.getElementById("execOutput");
-    outputEl.textContent = (data.output || "") + (data.error ? "\n[错误] " + data.error : "") || "(无输出)";
+    outputEl.textContent = ((data.output || "") + (data.error ? "\n[错误] " + data.error : "")) || "(无输出)";
 }
 
 function showToast(msg, duration) {

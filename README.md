@@ -2,7 +2,7 @@
 
 > 基于玩客云 WS1608 (Amlogic S805, ARMv7, 1GB RAM) 多节点组建的家庭服务集群
 
-**当前版本: v1.5.5**
+**当前版本: v1.6.0**
 
 ---
 
@@ -489,6 +489,101 @@ python3 test_validate.py
   校验功能脚本无硬编码 IP、每个节点 hostname 字段齐全、环境变量覆盖真实生效
 - 验证项从 176 扩至 **184**（全部通过、0 警告）
 - 新增 `inventory/nodes.local.yaml.example` 覆盖模板（真实覆盖文件已 gitignore）
+
+---
+
+## 🚀 v1.6.0 变更说明
+
+**主题：组件可选安装 —— WireGuard 及可选组件支持"不安装"，面板区分显示，并适配
+仅 WireGuard / 仅局域网 / 混合三种组网模式。**
+
+### 1. 新增单一真相库 `scripts/lib-services.sh`
+
+- **根因**："这个组件装没装"原先散落在各处各自判断：`health-check.sh` 无条件检查
+  WireGuard（不装就永远报 FAIL）、`panel/app.py` 只报 `running` 不报 `installed`
+  （没装显示成"离线"）、数据根有 `/mnt/sd/srv/x`、`/mnt/sd/x`、`<DATA_ROOT>/srv/x`
+  三套写法。
+- **修复**：把「安装态 / 组网模式 / 数据根 / 探测地址」收敛为单点计算，任何脚本不得再自拼逻辑。
+  - **`installed` 语义 = "应当安装"**（清单声明 + 模式判定 + 安装方式），**不是**"探测到进程"；
+    运行态由 `running` 单独表达。二者组合三态：未安装 / 已停止 / 运行中。
+  - 关键函数：`network_mode`、`wg_enabled`、`service_installed`、`oc_data_root`、
+    `service_data_dir`、`probe_addr_for`、`wg_hub_node`、`services_status_table`。
+
+### 2. 清单新增字段
+
+| 文件 | 字段 | 含义 |
+|------|------|------|
+| `inventory/services.yaml` | `optional` | 是否可选组件（默认 false） |
+| | `default_enabled` | 是否默认安装（默认 true） |
+| | `install` | `空`\|`manual`\|`external`；`manual` = 无自动安装实现 |
+| | `provides` | 提供的组网能力（如 `wg-mesh`） |
+| `inventory/nodes.yaml` | `network.mode` | `auto`\|`wireguard`\|`lan`\|`mixed`（默认 `mixed`） |
+
+- 环境变量覆盖：`ONECLOUD_NET_MODE`（等价 bootstrap 的 `--net-mode`）。
+- **`mode=lan` 强制 `wg_enabled=0`** —— 即使清单里仍留着 `wireguard` 服务也视作未安装，
+  切模式不必同时改两处，避免"改了 mode 忘了删服务"的中间态。
+- 当前声明为可选：`wireguard`（`default_enabled: false`、`provides: wg-mesh`）、
+  `verysync`（`install: manual`）。
+
+### 3. 面板：区分「未安装 / 已停止 / 运行中」
+
+- `panel/config.json` 每个服务新增 `installed` / `optional` / `install` / `port`；
+  顶层新增 `network_mode` / `network_mode_label` / `wg_enabled` / `wg_subnet` / `lan_subnet`；
+  每个节点新增 `data_root` / `services_installed` / `services_total` / `services_running`。
+- 前端三态圆点：运行中（实心绿）/ 已停止（实心红）/ 未安装（灰色空心）；
+  未安装显示「未安装」或「待手动安装」，**不计为异常**。
+- 拓扑标题按模式切换（`lan` 模式不出现任何 WireGuard 字样）。
+- **未安装的服务不做 SSH 探测**，直接返回 `installed: false`，省一次连接。
+
+### 4. 面板安全加固（C-1 / C-2 / C-3 / M-1）
+
+| 编号 | 问题 | 修复 |
+|------|------|------|
+| C-1 | 默认口令硬编码为弱口令 | 无 `PANEL_PASS` 时随机生成并打印告警；登录改用 session，Basic Auth 仅作兜底 |
+| C-2 | CORS 允许任意来源 | 收敛为 localhost + `PANEL_URL_HOST` + `PANEL_CORS_ORIGINS`，`supports_credentials=True` |
+| C-3 | 远程路径按 `/mnt/sd` 拼 | 一律走 `data_root`（来自节点 `/etc/onecloud/install.conf`） |
+| M-1 | 无 CSRF 防护 | 写操作要求 `X-Requested-With: OneCloudPanel` 头，缺失返回 403 |
+
+- 新增路由：`GET/POST /login`、`POST /logout`、`GET /api/network`；`/` 需认证。
+- 新增 `panel/templates/login.html`；安全响应头（nosniff / X-Frame-Options / SameSite）。
+
+### 5. 数据根收敛（全项目唯一入口）
+
+- 节点侧配置文件改用 `__DATA_ROOT__` 占位符，安装时由 `scripts/install-services.sh`
+  的 `render_template()` 按本机实际数据根渲染（SD 挂载点，无卡回退 `/opt/onecloud`）：
+  `node-wk-iot-02/xiaomusic/config.json`、`node-wk-storage-03/verysync/config.yaml`。
+- `scripts/setup.sh` 修掉 `xiaomusic` 写死 `/mnt/sd/music` 与 `DATA_DIR` 决策相矛盾的 bug。
+- `node-wk-*/{clash,xiaomusic}/install-service.sh` 改为运行时解析数据根，不再写死。
+
+### 6. 三种组网模式全链路适配
+
+| 脚本 | 适配内容 |
+|------|----------|
+| `health-check.sh` | 服务清单来自清单；未安装 SKIP 不算失败；WireGuard 按模式判定；容器名加引号校验；端口匹配改精确尾段比对 |
+| `wireguard-setup.sh` | `wg_enabled=0` 时打印 SKIP 并 **exit 0**（配置选择不是失败）；Hub 节点由 `services.yaml` 反查 |
+| `firewall-recommend.sh` | `lan` 模式不生成任何 WG 规则与章节（避免建议放行无人监听的 51820） |
+| `deploy.sh` | 数据目录按 `service_installed` 过滤，`lan` 模式不建 `wireguard/config` |
+| `bootstrap.sh` | `BASE_PKGS` 动态化（`lan` 剔除 `wireguard-tools`）；`SVC_TREE` 同步；`install.conf` 新增 `NETWORK_MODE` / `WG_ENABLED`；新增 `--net-mode` / `--lan-only` |
+| `init/init.sh` | WireGuard 菜单显示当前模式并对 `lan` 给出说明；配置菜单新增「服务安装态与组网模式」 |
+
+### 7. 实现期修正（第 7 / 8 号缺陷）
+
+由新增反向断言抓出的两个真实缺陷，一并修复：
+
+- **生成器不再逐节点 SSH 探测数据根**。`gen-panel-config.sh` 原对每个节点调 `oc_data_root`，
+  而它内部会 `ssh -o ConnectTimeout=4` 读 `/etc/onecloud/install.conf` —— 生成静态配置却在
+  控制端白等秒级/节点。新增非阻塞 `oc_static_data_root()` / `static_data_root()`，
+  生成期只写默认值，**真实数据根由面板运行时自己探测**。（160s → 133s）
+- **修复所有容器服务端口静默为 0**。`_svc_first_port` 用裸 `${!_SVC_PORTMAP}` 展开关联数组键，
+  在 `set -u` 下对空数组报 `unbound variable`，而调用处 `2>/dev/null` 把它吞掉 → 返回空 →
+  端口退化成 `0`。实测 18 个服务只有 2 个非零，修复后 14 个。**现改为先判空 + 带引号展开。**
+
+同轮把热路径上的 `$( )` 子 shell 去掉（`service_installed` / `services_optional` /
+`services_install_mode` / `services_port` / `wg_enabled_on`），`service_field` 改关联数组直查，
+`gen-panel-config.sh` 整体 **160s → 104s**。新增第 36 组 21 项回归断言钉住这两处。
+
+残余耗时是本机 Git Bash 进程创建开销（bash 函数调用 ~0.68s/次），Linux 真机为亚秒级；
+该脚本每次部署只在控制端跑一次，不再继续优化。
 
 ---
 

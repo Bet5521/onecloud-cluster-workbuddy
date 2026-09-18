@@ -11,11 +11,13 @@
         <h1>🛠️ OneCloud Cluster 控制面板</h1>
         <div class="header-info">
             <span id="clusterName">加载中...</span>
+            <span id="netMode" class="muted"></span>
             <span id="updateTime" class="muted"></span>
             <button onclick="refresh()" class="btn-small">🔄 刷新</button>
             <label class="auto-refresh">
                 <input type="checkbox" id="autoRefresh" checked> 自动刷新
             </label>
+            <button onclick="doLogout()" class="btn-small">退出</button>
         </div>
     </header>
 
@@ -59,7 +61,8 @@
                 <div class="topo-nodes-row" id="topoNodes">
                     <!-- 拓扑节点动态渲染 -->
                 </div>
-                <div class="topo-mesh">WireGuard Mesh VPN (10.8.0.0/24)</div>
+                <!-- 组网方式由后端注入的 network_mode 决定 (lan 模式不出现 WireGuard 字样) -->
+                <div class="topo-mesh" id="topoMode">加载中...</div>
             </div>
         </section>
     </main>

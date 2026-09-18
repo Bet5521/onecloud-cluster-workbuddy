@@ -14,7 +14,8 @@ set -euo pipefail
 TARGET="$(cd "$(dirname "$0")/../../scripts" && pwd)/install-services.sh"
 if [ ! -f "$TARGET" ]; then
     echo "[ERROR] 未找到统一安装脚本: $TARGET" >&2
-    echo "        请先确认 scripts/install-services.sh 已分发到 /mnt/sd/scripts" >&2
+    echo "        请先确认本节点上存在 scripts/install-services.sh" >&2
+    echo "        (分发: ./scripts/deploy.sh 会把仓库同步到节点数据根下)" >&2
     exit 1
 fi
 

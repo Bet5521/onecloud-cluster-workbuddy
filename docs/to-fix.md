@@ -173,3 +173,52 @@ KNOWN_SERVICES="$(service_names | tr '\n' ' ')"
 - 目录清单仍有三处来源（`deploy.sh:93` / `bootstrap.sh` / `setup.sh ensure_svc_dir`），
   本次改用**测试**盯住（第 11 组断言 deploy 覆盖 compose 挂载），没有做物理收敛
 - mock 之外的真机语义：docker 行为、systemd、真实 firewalld/ufw 运行时
+
+---
+
+## 六、v1.6.0 可选组件改造期发现并修复的问题（2026-09-17/18）
+
+改造过程中由测试反向断言暴露出 6 个真实缺陷，均已修复并加了回归断言。
+
+| # | 严重度 | 缺陷 | 根因 | 修复 |
+|---|--------|------|------|------|
+| 1 | **P0** | **lan 模式防火墙清单仍输出 `in accept udp 51820`** | `firewall-recommend.sh` 的 `parse_service_ports()` 直接读 `services.yaml`，绕过了外层 `WG_ON` 门禁。于是"不装 WireGuard"的机器照样开了一个 UDP 端口 | `collect_ports()` 内层循环加 `service_installed` 过滤，未安装服务不进清单 |
+| 2 | **P1** | **`services_status_table` 的「安装方式」列显示成端口号** | `imode` 为空时输出空字段；调用方 `IFS=$'\t' read` 会**折叠相邻制表符之间的空字段**，后面的 `port` 左移顶位（实测 wireguard 行显示 `51820`） | 空值统一输出 `-` 占位，列数恒定；新增反向断言「任何一列都不许为空」 |
+| 3 | **P1** | **`install-services.sh list-installed` 表头中文列错位** | `printf '%-14s' "节点"` 按**字节**补空格，一个汉字 3 字节 → 补到 14 字节却只占 6 显示列 | 表头改为固定分隔符字符串，`% -Ns` 只用于 ASCII 数据行 |
+| 4 | **P1** | **`deploy.sh` 远程预建目录被改成裸空格列表，破坏括号展开契约** | 改造时把 `mkdir -p ${REMOTE_BASE}/{a,b,c}` 换成 `${dirs}` 拼接空格分隔，导致一条 mkdir 变成多参数、且测试无法解析覆盖关系 | 改回**花括号展开**形式（`adguard/{work,conf}` 等按服务生成后逗号拼接），保持单条命令且可静态核对 |
+| 5 | **P2** | **`get_service_status` 把 config.json 的服务名直接拼进 shell** | 面板配置文件是可写文件，等于把远程命令执行入口留在配置里（审计 C-3 同源问题） | 新增 `_SAFE_SVC_NAME` 白名单正则（`^[A-Za-z0-9][A-Za-z0-9_.-]*$`）并给插值名加单引号；实测 `a;rm -rf /`、`` a`id` ``、`$HOME` 均被拒 |
+| 6 | **P2** | **模式标签双重括号 `lan (局域网直连 (192.168.1.0/24))`** | `network_mode_label` 自带括号说明，调用处又套了一层 | `wireguard-setup.sh` / `health-check.sh` / `install-services.sh` 三处改为直接用 label |
+
+### 性能：`services_status_table` 从 200s 降到 105s（本环境）
+
+原本每次调用重解析 YAML 并逐元素 fork `sed`。加了四层进程内缓存（`_parse_services_fields`
+整表、`service_field` 值、`node_has_service` 集合、`services_port` 值），`service_installed`
+从 13s → 4s。剩余 ~105s 是本环境 shim 的**函数调用开销**（实测 `_svc_bool` 单次 ~0.55s，
+而该表有 ~110 次函数调用），非代码缺陷；测试改为单次调用后已不再超时。
+
+### 第二轮：`gen-panel-config.sh` 160s → 104s，并修掉一个静默数据缺陷（2026-09-18）
+
+第 32 组单跑持续超时（>300s），顺线排查出**两个独立缺陷**，都不是"测试超时"而是真问题。
+
+| # | 严重度 | 缺陷 | 根因 | 修复 |
+|---|--------|------|------|------|
+| 7 | **P1** | **生成器对每个节点做 SSH 探测数据根** | `gen-panel-config.sh` 逐节点调 `oc_data_root "$ip"`，而它走到 `node_data_root` → `ssh -o ConnectTimeout=4`。该脚本在**控制端**生成静态配置，节点离线时 3 个节点白等 ~15~27s（纯构建期浪费，且离线越久越慢） | 新增非阻塞 `static_data_root()`（lib-nodes）/ `oc_static_data_root()`（lib-services），只产出「默认值」；真实数据根仍由面板运行时自探。生成器改用它 |
+| 8 | **P1** | **所有容器服务端口静默退化为 0** | `_svc_first_port` 用裸 `${!_SVC_PORTMAP}` 展开关联数组键；在 `set -u` 下对「已声明但为空」的数组报 `unbound variable`，而调用处是 `2>/dev/null` → **报错被吞掉，函数返回空**，于是 `wireguard`/`piwigo`/`aria2`/`gitea` 等 `ports: [...]` 形式的服务端口全变 0（实测 18 个服务里只有 2 个非零） | 展开前先判 `${#_SVC_PORTMAP[@]} -eq 0`，并改用带引号 `"${!arr[@]}"`。修复后 14 个服务报出真实端口 |
+
+同轮还顺手把热路径上的 `$( )` 子 shell 去掉（`service_installed` / `services_optional` /
+`services_install_mode` / `services_port` / `wg_enabled_on` 全部改为「先赋值再判返回码」），
+`service_field` 从 while 扫表改为 `_SVC_FIELD_INDEX` 关联数组直查，`wg_enabled()` 加缓存，
+`node_has_service` 的比对从 for 循环改为 `case` 整词匹配。**160s → 104s**（35%）。
+残余 ~104s 仍是本环境 bash 函数调用 + fork 的固有开销，该脚本每次部署只跑一次，不再继续优化。
+
+> **教训（写测试时要用）**：`set -u` + `2>/dev/null` 的组合会把 unbound variable 变成
+> **静默的错误返回值**。凡是「关联数组展开 / 可能未定义的变量」出现在会产生输出的路径上，
+> 就要警惕被 `|| true` / `2>/dev/null` 吃掉。本轮已加第 36 组断言：
+> ① 生成器不得用 `oc_data_root` 逐节点探测；② `_svc_first_port` 不得裸展开 `${!arr}`；
+> ③ `set -u` 下全链路跑通且 stderr 无 `unbound variable`；④ 7 个容器服务端口逐一核对。
+
+### 测试超时（本环境注意）
+
+`_oc_bash` 默认超时 120s → **300s**，重的防火墙/面板生成调用显式给 420s。原因是
+Git Bash on Windows 的进程创建开销是 Linux 的十几倍，子脚本里再嵌套 `bash -c` 会
+叠加，120s 会出现「脚本本身没问题但被 kill」的假失败。

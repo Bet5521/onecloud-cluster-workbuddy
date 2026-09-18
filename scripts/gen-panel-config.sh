@@ -17,8 +17,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 source "$SCRIPT_DIR/lib-nodes.sh"
+# 安装态 / 组网模式 / 数据根 单一真相 (见 docs/design-optional-components.md §2)
+# shellcheck source=lib-services.sh
+source "$SCRIPT_DIR/lib-services.sh"
 
-VERSION="${ONECLOUD_PANEL_VERSION:-1.5.5}"
+VERSION="${ONECLOUD_PANEL_VERSION:-1.6.0}"
 
 # 输出路径: 命令行 > 环境变量 > 仓库内 panel/config.json
 #   --out FILE  写指定文件; 若传入的是已存在的目录, 则写 <目录>/config.json
@@ -83,13 +86,24 @@ done < <(awk '
 require_nodes
 
 # 逐节点生成 services 子 JSON
+# 新增字段 (见 docs/design-optional-components.md §4.2):
+#   installed 是否"应当安装" (清单声明 + 模式判定 + 安装方式)
+#   optional  是否可选组件
+#   install   空 / manual / external
+#   port      主端口 (0 = 无)
 build_services() {
-    local n="$1" s d c out=""
+    local n="$1" s d c inst opt imode port out=""
     for s in $(node_services "$n"); do
         d="${DISPLAY[$s]:-$s}"
         c="${CONTAINER[$s]:-true}"
+        inst="$(service_installed "$n" "$s")"
+        opt="$(services_optional "$s")"
+        imode="$(services_install_mode "$s")"
+        port="$(services_port "$s")"
+        [ "$inst" = "1" ] && inst="true" || inst="false"
+        [ "$opt"  = "1" ] && opt="true"  || opt="false"
         [ -n "$out" ] && out="${out},"
-        out="${out}{\"name\":\"$s\",\"display\":\"$d\",\"container\":$c}"
+        out="${out}{\"name\":\"$s\",\"display\":\"$d\",\"container\":$c,\"installed\":$inst,\"optional\":$opt,\"install\":\"$imode\",\"port\":$port}"
     done
     echo "$out"
 }
@@ -102,6 +116,11 @@ mkdir -p "$(dirname "$PANEL_CONFIG")" 2>/dev/null || true
     echo "{"
     echo '  "cluster_name": "OneCloud Cluster",'
     echo "  \"version\": \"${VERSION}\","
+    echo "  \"network_mode\": \"$(network_mode)\","
+    echo "  \"network_mode_label\": \"$(network_mode_label)\","
+    echo "  \"wg_enabled\": $([ "$(wg_enabled)" = "1" ] && echo true || echo false),"
+    echo "  \"wg_subnet\": \"${NET_WG_SUBNET}\","
+    echo "  \"lan_subnet\": \"${NET_LAN_SUBNET}\","
     echo '  "update_interval": 10,'
     echo '  "ssh_timeout": 3,'
     echo '  "generated_by": "scripts/gen-panel-config.sh",'
@@ -120,6 +139,10 @@ mkdir -p "$(dirname "$PANEL_CONFIG")" 2>/dev/null || true
         host="$(node_hostname "$n")"
         color="$(node_color "$n")"; [ -z "$color" ] && color="#9E9E9E"
         svc="$(build_services "$n")"
+        # 该节点数据根 (面板执行 docker 命令与查磁盘都用它, 不再拼 /mnt/sd)
+        # 用 oc_static_data_root: 生成器只写默认值, 面板运行时会自己探测真实根;
+        # 这里若走 oc_data_root 会对每个节点 SSH, 离线时整脚本白等数秒。
+        droot="$(oc_static_data_root)"
 
         echo "  {"
         echo "    \"name\": \"$name\","
@@ -129,6 +152,7 @@ mkdir -p "$(dirname "$PANEL_CONFIG")" 2>/dev/null || true
         echo "    \"wg_ip\": \"$wg\","
         echo "    \"hostname\": \"$host\","
         echo "    \"color\": \"$color\","
+        echo "    \"data_root\": \"$droot\","
         echo "    \"services\": [${svc}]"
         echo "  }"
     done

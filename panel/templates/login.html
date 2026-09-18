@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>登录 · OneCloud Cluster 控制面板</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body class="login-body">
+    <main class="login-wrap">
+        <form class="login-card" method="post" action="/login">
+            <h1>🛠️ OneCloud Cluster</h1>
+            <p class="login-sub">控制面板登录</p>
+
+            {% if error %}
+            <div class="login-error">{{ error }}</div>
+            {% endif %}
+
+            <label class="login-field">
+                <span>用户名</span>
+                <input type="text" name="username" autocomplete="username"
+                       autofocus required value="admin">
+            </label>
+            <label class="login-field">
+                <span>密码</span>
+                <input type="password" name="password" autocomplete="current-password" required>
+            </label>
+
+            <button type="submit" class="btn btn-login">登 录</button>
+
+            <p class="login-hint">
+                账号密码在节点的 <code>/etc/onecloud/panel.env</code> 中配置。<br>
+                若未配置，面板启动日志会打印本次运行的临时密码。
+            </p>
+        </form>
+        <footer class="login-footer">OneCloud Cluster v{{ version }}</footer>
+    </main>
+</body>
+</html>

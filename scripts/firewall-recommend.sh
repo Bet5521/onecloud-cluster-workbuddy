@@ -27,6 +27,9 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 # 共享日志/清单库 (lib-nodes.sh 自带 log_info/log_warn/log_error 与 load_nodes)
 # shellcheck source=lib-nodes.sh
 source "${SCRIPT_DIR}/lib-nodes.sh"
+# 安装态 / 组网模式 单一真相库 (未启用 WireGuard 时不生成任何 WG 相关规则)
+# shellcheck source=lib-services.sh
+source "${SCRIPT_DIR}/lib-services.sh"
 require_nodes
 
 SERVICES_YAML="${PROJECT_DIR}/inventory/services.yaml"
@@ -57,7 +60,14 @@ LAN_SUBNET="${LAN_SUBNET_OVERRIDE:-${NET_LAN_SUBNET:-192.168.1.0/24}}"
 WG_PORT="${NET_WG_PORT:-51820}"
 
 # Hub 节点: 承担外网端点与流量转发
-HUB_NODE="$(node_name_by_role edge-gateway 2>/dev/null || echo "${NODE_NAMES[0]}")"
+#   先按 services.yaml 的声明反查; 未启用 WireGuard 时 wg_hub_node 返回空,
+#   下面的 WG_ON 闸门会让所有 WG 相关规则与章节整体消失。
+HUB_NODE="$(wg_hub_node 2>/dev/null || node_name_by_role edge-gateway 2>/dev/null || echo "${NODE_NAMES[0]}")"
+
+# 是否生成 WireGuard 相关规则/章节
+#   组网模式为 lan 时不生成 —— 否则会给出"放行 UDP 51820"这类无意义建议,
+#   用户照做会在防火墙上开一个没有任何服务监听的公网端口。
+WG_ON="$(wg_enabled)"
 
 # ------------------------------------------------------------
 # host 网络模式的服务: 端口由应用自身决定, 清单里声明的 ports/port 用不上,
@@ -182,8 +192,8 @@ collect_ports() {
         fi
     done
 
-    # WireGuard 只在 Hub 上需要入站
-    if [ "$node" = "$HUB_NODE" ]; then
+    # WireGuard 只在 Hub 上需要入站, 且仅在组网模式启用 WireGuard 时
+    if [ "$WG_ON" = "1" ] && [ "$node" = "$HUB_NODE" ]; then
         _add_port udp "$WG_PORT" "WireGuard 端点 (外网客户端接入)" pub
     fi
 
@@ -191,6 +201,16 @@ collect_ports() {
     while IFS='|' read -r svc node_name proto port src; do
         [ -z "${svc:-}" ] && continue
         [ "$node_name" = "$node" ] || continue
+
+        # 未安装的服务不开端口
+        #   services.yaml 是"声明"而不是"实装": wireguard 在清单里始终列着
+        #   (便于日后切模式), verysync 标了 install: manual。照单开端口会在
+        #   防火墙上留下一个没有任何进程监听的公网 UDP 51820 —— 既无用又
+        #   多一个攻击面。以 service_installed 为准, 与面板/健康检查同一真相。
+        if [ "$(service_installed "$node" "$svc")" != "1" ]; then
+            continue
+        fi
+
         if service_is_tunneled "$svc"; then who="tunnel"; else who="lan"; fi
 
         if [ "$src" = "host" ]; then
@@ -251,12 +271,17 @@ render_node() {
         return 0
     fi
 
+    # 未启用 WireGuard 时不显示 wg 地址与 WG 相关描述, 避免留下误导线索
+    local wg_line=""
+    [ "$WG_ON" = "1" ] && wg_line="    WireGuard: ${wg}"
+
     cat << EOF
 ================================================================
  OneCloud 防火墙建议清单 — ${node} (${disp})
  生成时间: $(date '+%Y-%m-%d %H:%M:%S')
- 节点地址: ${ip}    WireGuard: ${wg}    主机名: ${host}
+ 节点地址: ${ip}${wg_line}    主机名: ${host}
  角色    : ${role}
+ 组网模式: $(network_mode_label)
 ================================================================
 
 【0】先读这段
@@ -301,7 +326,16 @@ EOF
 
 EOF
 
-    if [ "$node" = "$HUB_NODE" ]; then
+    if [ "$WG_ON" != "1" ]; then
+        cat << EOF
+【4】本节点不需要 WireGuard 相关规则
+  当前组网模式为 $(network_mode), 未启用 WireGuard。
+  因此本清单**不含** UDP ${WG_PORT} 放行, 也不需要转发 / NAT 规则 (FORWARD、
+  POSTROUTING MASQUERADE) —— 照上面【2】的端口清单配即可。
+  (通信走局域网直连, 各节点 IP 见上文"节点地址"。)
+
+EOF
+    elif [ "$node" = "$HUB_NODE" ]; then
         cat << EOF
 【4】DSL 表达不了的部分 —— WireGuard 转发 (本节点是 Hub, 必做)
   转发 + NAT 不是"放行端口", DSL 里没有对应写法, 需要在节点上单独执行:

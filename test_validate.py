@@ -1376,13 +1376,32 @@ def test_service_consistency():
             log_fail("宿主端口两处不一致", "; ".join(sorted(bad)))
 
         # ---- 8. deploy.sh 远程预建目录必须覆盖 compose 的相对挂载 ----
+        # 目录清单现在是**运行时按 service_installed 过滤后拼出来的**, 不再是
+        # 一条写死的 `mkdir -p ${REMOTE_BASE}/{a,b,c}` 字面量 —— 所以这里改成
+        # 「静态求值」: 逐个节点把 case 分支里的 item 收集起来, 拼成同一个
+        # 括号展开串, 再让 _expand_brace 展开。这样既保留了「deploy 覆盖
+        # compose 挂载」的保证, 又不会因为改成动态生成而失效。
         dep = (SCRIPTS_DIR / "deploy.sh").read_text(encoding="utf-8")
-        # 贪婪匹配到行尾最后一个 }, 否则嵌套花括号只会被截到第一层
-        m = re.search(r'mkdir -p \$\{REMOTE_BASE\}/\{(.*)\}"\s*$', dep, re.M)
-        prebuilt = set(_expand_brace(m.group(1))) if m else set()
-        if not m:
-            log_fail("deploy.sh 未找到远程目录预建语句")
+        prebuilt = set()
+        if "mkdir -p ${dirs}" in dep:
+            # 抽取 case 分支: <服务>) item="<目录模板>" ;;
+            for svc_pat, item in re.findall(
+                    r'^\s*([a-z0-9_|*-]+)\)\s+item="([^"]+)"\s*;;', dep, re.M):
+                for one in svc_pat.split("|"):
+                    if one in ("*", "\\*"):
+                        continue
+                    prebuilt |= set(_expand_brace(item))
+            # 单服务/无子目录分支 (*) item="$s") -> 服务名自身即目录
+            if re.search(r'^\s*\*\)\s+item="\$s"\s*;;', dep, re.M):
+                for node, svcs in cid.items():
+                    for name in svcs:
+                        prebuilt.add(name)
         else:
+            m = re.search(r'mkdir -p \$\{REMOTE_BASE\}/\{(.*)\}"\s*$', dep, re.M)
+            prebuilt = set(_expand_brace(m.group(1))) if m else set()
+            if not m:
+                log_fail("deploy.sh 未找到远程目录预建语句")
+        if prebuilt:
             need = {}
             for node, svcs in cid.items():
                 for name, meta_c in svcs.items():
@@ -1746,7 +1765,11 @@ def test_panel_frontend_contract():
     # 3) 集群 docker_* 操作必须真正下发请求, 不能只弹提示
     cidx = js_src.find("async function clusterAction")
     cbody = js_src[cidx:js_src.find("async function execCmd")] if cidx >= 0 else ""
-    if "/api/node/" in cbody and "JSON.stringify({action})" in cbody:
+    # 判据要松紧适度: 早期实现只弹提示 (无 fetch), 现在是逐个节点真实 POST。
+    # 不写死 `JSON.stringify({action})` —— 实际代码带 confirm: true 更安全,
+    # 精确匹配字面量会把这种改进误判成失败。
+    if "/api/node/" in cbody and "method: \"POST\"" in cbody and \
+       re.search(r"JSON\.stringify\(\{[^}]*\baction\b", cbody):
         log_pass("集群 docker_up/down/pull 会对各节点真实下发请求")
     else:
         log_fail("集群批量操作只弹提示未调用 API", "按钮点了没有任何实际效果")
@@ -1906,7 +1929,9 @@ def test_bootstrap_sd_and_risk():
         return f"/{m.group(1).lower()}/{m.group(2)}" if m else s
 
     tmpdir = Path(tempfile.mkdtemp(prefix="oc_t17_"))
-    probe = SCRIPTS_DIR / "_probe_t17.sh"
+    # 探针放临时目录而非 scripts/: 原实现写 SCRIPTS_DIR/_probe_t17.sh, 与工作区共享,
+    # 一旦有并发清理 (或被人工 rm) 就会让整组 6 项以 "No such file or directory" 假失败。
+    probe = tmpdir / "_probe_t17.sh"
     harness = tmpdir / "harness.sh"
 
     harness.write_text(f"""#!/bin/bash
@@ -4086,9 +4111,9 @@ exit 0
                 Path(tmpdir / "run.rules").write_text("", encoding="utf-8")
                 Path(tmpdir / "run.log").write_text("", encoding="utf-8")
                 # 模拟 wg-quick 的执行方式 (bash -c), 连跑两次
-                subprocess.run(["bash", "-c", post_up], capture_output=True, env=env, timeout=60)
+                subprocess.run(["bash", "-c", post_up], capture_output=True, env=env, timeout=240)
                 log1 = Path(tmpdir / "run.log").read_text(encoding="utf-8")
-                subprocess.run(["bash", "-c", post_up], capture_output=True, env=env, timeout=60)
+                subprocess.run(["bash", "-c", post_up], capture_output=True, env=env, timeout=240)
                 log2 = Path(tmpdir / "run.log").read_text(encoding="utf-8")
 
                 if "-o end0" in log1:
@@ -4427,9 +4452,11 @@ def test_deploy_no_firewall():
         env.pop("ONECLOUD_WG_FIREWALL", None)
         env.pop("ENV", None)
 
-        def run_sh(argv, extra_env=None, cwd=proj, timeout=120):
+        def run_sh(argv, extra_env=None, cwd=proj, timeout=240):
             # 注意: argv 里的路径要用 POSIX 形式 (给 bash), 但 cwd 必须是
             # Windows 原生路径 —— Python 的 CreateProcess 不认 /d/... 形式。
+            # timeout 240s: 被调脚本会内部再起 bash/awk/grep, Git Bash on
+            # Windows 进程创建极慢, 60~120s 会出"脚本没问题但被 kill"的假失败。
             e = dict(env)
             if extra_env:
                 e.update(extra_env)
@@ -4481,7 +4508,7 @@ def test_deploy_no_firewall():
 
         # ---- C1) 建议清单: DSL 语法 ----
         rec_path = _posix(rec)
-        dsl = run_sh([rec_path, "--emit-dsl"], cwd=PROJECT_ROOT, timeout=60)
+        dsl = run_sh([rec_path, "--emit-dsl"], cwd=PROJECT_ROOT, timeout=300)
         lines = [l.strip() for l in dsl.stdout.splitlines() if l.strip()]
         dsl_re = re.compile(
             r"^(in|out)\s+(accept|drop)\s+(tcp|udp|any)\s+(\S+)\s+(\S+)\s+(\S+)$")
@@ -4515,7 +4542,7 @@ def test_deploy_no_firewall():
             log_fail("清单漏了 services.yaml 里声明的端口", f"缺失: {absent}")
 
         # ---- C3) 完整报告: 变量端口要显式提示人工确认 ----
-        rep = run_sh([rec_path, "--stdout"], cwd=PROJECT_ROOT, timeout=60)
+        rep = run_sh([rec_path, "--stdout"], cwd=PROJECT_ROOT, timeout=300)
         text = rep.stdout
         if "onecloud 的部署脚本不会改防火墙" in text and "setup_firewall.sh" in text:
             log_pass("清单开宗明义说明「部署脚本不改防火墙」并指明唯一执行入口")
@@ -4540,7 +4567,7 @@ def test_deploy_no_firewall():
 
         # ---- C4) 落盘 ----
         outdir = tmpdir / "fwout"
-        r5 = run_sh([rec_path, "--out", _posix(outdir)], cwd=PROJECT_ROOT, timeout=60)
+        r5 = run_sh([rec_path, "--out", _posix(outdir)], cwd=PROJECT_ROOT, timeout=300)
         made = sorted(p.name for p in outdir.glob("*.txt")) if outdir.exists() else []
         if r5.returncode == 0 and len(made) >= 3:
             okfile = all("in accept tcp 22" in (outdir / n).read_text(
@@ -5439,10 +5466,12 @@ def test_init_deploy_sync():
                     break
         return "\n".join(out)
 
-    def run_bash(args, extra=None, cwd=None, timeout=120):
+    def run_bash(args, extra=None, cwd=None, timeout=300):
         e = dict(_os.environ)
         # 去掉宿主 Bash 工具注入的 BASH_ENV shim: 它会在每次非交互 bash 启动时
         # 重置 PATH, 使子进程里的 awk/mv/sed 等 coreutils 不可用 (环境假失败)。
+        # timeout 300s: gen-panel-config.sh 会 source 两个库并遍历全部服务,
+        # Git Bash on Windows 进程创建极慢, 120s 会出"脚本没问题但被 kill"。
         e.pop("BASH_ENV", None)
         e["PATH"] = f"{_GIT}/usr/bin;{_GIT}/bin;" + e.get("PATH", "")
         if extra:
@@ -5656,6 +5685,841 @@ def test_init_deploy_sync():
           "health-check.sh 磁盘检查改用节点实际数据根")
 
 
+# ============================================================
+# 测试 33 / 34 / 35: 可选组件与三种组网模式 (v1.6.0)
+#
+# 这三组共享一套 bash 执行外壳; 抽出 _oc_test_env() / _oc_bash() /
+# _oc_read() 放在模块级, 避免在每个测试函数里重复定义 (组 32 当年是内联的,
+# 复制第三遍时已经明显重复了)。
+# ============================================================
+
+_OC_GIT = "C:/Users/betyk/.workbuddy/binaries/PortableGit/versions/1.2.0"
+
+
+def _oc_pp(x):
+    """Windows 路径 -> msys 路径。
+    必须先把反斜杠换成 /, 否则传给 bash 的参数会被反斜杠转义吃掉。"""
+    s = str(x).replace("\\", "/")
+    m = re.match(r"^([A-Za-z]):/(.*)$", s)
+    return f"/{m.group(1).lower()}/{m.group(2)}" if m else s
+
+
+def _oc_env(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """构造干净的子进程环境。
+    要点: 去掉宿主注入的 BASH_ENV shim —— 它会在每次非交互 bash 启动时重置
+    PATH, 导致子进程里的 awk/sed/grep 等 coreutils 找不到 (环境假失败)。"""
+    e = dict(os.environ)
+    e.pop("BASH_ENV", None)
+    e["PATH"] = f"{_OC_GIT}/usr/bin;{_OC_GIT}/bin;" + e.get("PATH", "")
+    if extra:
+        e.update({k: str(v) for k, v in extra.items()})
+    return e
+
+
+def _oc_bash(script: str, extra_env=None, timeout: int = 300):
+    """在 Git Bash 里跑一段 bash 脚本, 返回 CompletedProcess。
+
+    超时给 300s: 这段 bash 在 Windows 上要反复 fork (子脚本里再嵌套
+    `bash -c` 取值), 冷启动进程创建开销是 Linux 的十几倍, 90~120s 会
+    出现「脚本本身没问题但被 kill」的假失败。"""
+    return subprocess.run(
+        [f"{_OC_GIT}/bin/bash.exe", "-c", script],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        cwd=str(PROJECT_ROOT), env=_oc_env(extra_env), timeout=timeout,
+    )
+
+
+def _oc_read(rel: str) -> str:
+    return (PROJECT_ROOT / rel).read_text(encoding="utf-8")
+
+
+def _oc_check(cond, msg: str):
+    log_pass(msg) if cond else log_fail(msg)
+
+
+def test_lib_services():
+    """测试 33: lib-services.sh 单一真相库 (安装态 / 组网模式 / 数据根)"""
+    print("\n" + "=" * 60)
+    print("测试 33: lib-services.sh 单一真相库")
+    print("=" * 60)
+
+    libs = SCRIPTS_DIR / "lib-services.sh"
+    _oc_check(libs.exists(), "scripts/lib-services.sh 存在")
+    if not libs.exists():
+        return
+
+    src = _oc_read("scripts/lib-services.sh")
+
+    # ---- 1) 库约定 ----
+    _oc_check("_LIB_SERVICES_LOADED" in src, "具备幂等加载守卫 _LIB_SERVICES_LOADED")
+    _oc_check(not re.search(r"^\s*set -e", src, re.M),
+              "不启用 set -e (由调用方控制)")
+    _oc_check(not re.search(r"^log_info\(\)", src, re.M),
+              "不重复定义 log_info (避免与调用方冲突)")
+    _oc_check(". \"${_LIB_SERVICES_DIR}/lib-nodes.sh\"" in src,
+              "只依赖 lib-nodes.sh, 不重复实现清单解析")
+
+    # ---- 2) 关键函数齐全 ----
+    for fn in ("network_mode", "wg_enabled", "wg_enabled_on", "node_has_service",
+               "services_optional", "services_default_enabled",
+               "services_install_mode", "services_provides", "services_port",
+               "service_installed", "oc_data_root", "node_data_dir",
+               "service_data_dir", "probe_addr_for", "probe_fallback_addr_for",
+               "wg_hub_node", "wg_hub_ip", "services_status_table",
+               "network_mode_label"):
+        _oc_check(f"{fn}()" in src, f"导出函数 {fn}()")
+
+    # ---- 3) installed 语义 + 三态 ----
+    _oc_check("应当安装" in src,
+              "注释明确 installed = 应当安装 (非探测到进程)")
+    _oc_check("未安装" in src and "已安装但停止" in src and "运行中" in src,
+              "文档化三态 (未安装 / 已停止 / 运行中)")
+    _oc_check("wg_enabled_on" in src and 'if [ "$s" = "wireguard" ]' in src,
+          "service_installed 对 wireguard 走 wg_enabled_on 判定")
+
+    # ---- 4) 运行时行为: 四种模式 ----
+    probe = r'''
+set -u
+cd "$ONECLOUD_PROJECT_ROOT"
+export ONECLOUD_SKIP_DATA_ROOT_RESOLVE=1
+source scripts/lib-nodes.sh
+source scripts/lib-services.sh
+printf 'mode=%s\n' "$(network_mode)"
+printf 'wg=%s\n' "$(wg_enabled)"
+printf 'hub=%s\n' "$(wg_hub_node 2>/dev/null || echo -)"
+printf 'label=%s\n' "$(network_mode_label)"
+'''
+    for mode, want_wg in (("lan", "0"), ("wireguard", "1"), ("mixed", "1")):
+        r = _oc_bash(probe, {"ONECLOUD_NET_MODE": mode,
+                             "ONECLOUD_PROJECT_ROOT": _oc_pp(PROJECT_ROOT)})
+        out = r.stdout
+        _oc_check(f"mode={mode}" in out, f"network_mode 在 ONECLOUD_NET_MODE={mode} 时回显 {mode}")
+        _oc_check(f"wg={want_wg}" in out,
+                  f"wg_enabled 在 {mode} 模式为 {want_wg}")
+
+    # auto 模式: 清单里 wireguard.default_enabled=false -> lan
+    r = _oc_bash(probe, {"ONECLOUD_NET_MODE": "auto",
+                         "ONECLOUD_PROJECT_ROOT": _oc_pp(PROJECT_ROOT)})
+    _oc_check("mode=lan" in r.stdout and "wg=0" in r.stdout,
+              "auto 模式按 wireguard.default_enabled=false 推导为 lan / wg=0")
+
+    # ---- 5) lan 强制关闭 WG (即使清单仍声明 wireguard) ----
+    r = _oc_bash(r'''
+set -u
+cd "$ONECLOUD_PROJECT_ROOT"
+export ONECLOUD_SKIP_DATA_ROOT_RESOLVE=1
+source scripts/lib-nodes.sh
+source scripts/lib-services.sh
+printf 'has_svc=%s\n' "$(node_has_service wk-edge-01 wireguard)"
+printf 'wg_on_node=%s\n' "$(wg_enabled_on wk-edge-01)"
+printf 'installed=%s\n' "$(service_installed wk-edge-01 wireguard)"
+''', {"ONECLOUD_NET_MODE": "lan", "ONECLOUD_PROJECT_ROOT": _oc_pp(PROJECT_ROOT)})
+    _oc_check("has_svc=1" in r.stdout,
+              "lan 模式清单里仍声明 wireguard (用于验证强制关闭)")
+    _oc_check("wg_on_node=0" in r.stdout,
+              "lan 模式强制 wg_enabled_on=0")
+    _oc_check("installed=0" in r.stdout,
+              "lan 模式 service_installed(wireguard)=0")
+
+    # ---- 6) manual 安装方式 -> installed=0 ----
+    r = _oc_bash(r'''
+set -u
+cd "$ONECLOUD_PROJECT_ROOT"
+export ONECLOUD_SKIP_DATA_ROOT_RESOLVE=1
+source scripts/lib-nodes.sh
+source scripts/lib-services.sh
+printf 'verysync_installed=%s\n' "$(service_installed wk-storage-03 verysync)"
+printf 'verysync_mode=%s\n' "$(services_install_mode verysync)"
+printf 'wg_optional=%s\n' "$(services_optional wireguard)"
+printf 'wg_default=%s\n' "$(services_default_enabled wireguard)"
+printf 'wg_provides=%s\n' "$(services_provides wireguard)"
+printf 'nonsvc_optional=%s\n' "$(services_optional syncthing)"
+printf 'nonsvc_default=%s\n' "$(services_default_enabled syncthing)"
+''', {"ONECLOUD_PROJECT_ROOT": _oc_pp(PROJECT_ROOT)})
+    _oc_check("verysync_installed=0" in r.stdout,
+              "verysync (install: manual) -> installed=0")
+    _oc_check("verysync_mode=manual" in r.stdout, "verysync 安装方式解析为 manual")
+    _oc_check("wg_optional=1" in r.stdout, "wireguard optional=1")
+    _oc_check("wg_default=0" in r.stdout, "wireguard default_enabled=0")
+    _oc_check("wg_provides=wg-mesh" in r.stdout, "wireguard provides=wg-mesh")
+    _oc_check("nonsvc_optional=0" in r.stdout,
+              "未声明 optional 的服务默认 false (必装)")
+    _oc_check("nonsvc_default=1" in r.stdout,
+              "未声明 default_enabled 的服务默认 true")
+
+    # ---- 7) 端口解析 (含 ports 列表回退) ----
+    r = _oc_bash(r'''
+set -u
+cd "$ONECLOUD_PROJECT_ROOT"
+export ONECLOUD_SKIP_DATA_ROOT_RESOLVE=1
+source scripts/lib-nodes.sh
+source scripts/lib-services.sh
+printf 'wg=%s\n'    "$(services_port wireguard)"
+printf 'clash=%s\n' "$(services_port clash)"
+printf 'gitea=%s\n' "$(services_port gitea)"
+printf 'adg=%s\n'   "$(services_port adguard)"
+printf 'memos=%s\n' "$(services_port memos)"
+''', {"ONECLOUD_PROJECT_ROOT": _oc_pp(PROJECT_ROOT)})
+    _oc_check("wg=51820" in r.stdout,
+              "services_port wireguard=51820 (从 ports 列表首项取宿主端口)")
+    _oc_check("clash=9090" in r.stdout, "services_port clash=9090 (标量 port)")
+    _oc_check("gitea=3000" in r.stdout,
+              "services_port gitea=3000 (列表首项 '3000:3000' 取宿主侧)")
+    _oc_check("adg=0" in r.stdout,
+              "services_port adguard=0 (host 网络/无 ports, 视为无主端口)")
+    _oc_check("memos=0" in r.stdout,
+              "services_port memos=0 (端口是 ${VAR} 占位, 无法静态解析)")
+
+    # ---- 8) 数据根拼接: 一律 <DATA_ROOT>/srv/<完整节点名>/<服务> ----
+    r = _oc_bash(r'''
+set -u
+cd "$ONECLOUD_PROJECT_ROOT"
+export ONECLOUD_SKIP_DATA_ROOT_RESOLVE=1
+export ONECLOUD_REMOTE_DATA_ROOT=/opt/onecloud
+source scripts/lib-nodes.sh
+source scripts/lib-services.sh
+printf 'svc=%s\n'  "$(service_data_dir wk-edge-01 clash)"
+printf 'node=%s\n' "$(node_data_dir wk-edge-01)"
+printf 'root=%s\n' "$(oc_data_root)"
+''', {"ONECLOUD_PROJECT_ROOT": _oc_pp(PROJECT_ROOT)})
+    _oc_check("/opt/onecloud/srv/wk-edge-01/clash" in r.stdout,
+              "service_data_dir 拼接为 <DATA_ROOT>/srv/<完整节点名>/<服务名>")
+    _oc_check("/opt/onecloud/srv/wk-edge-01" in r.stdout,
+              "node_data_dir 用完整节点名 (wk-edge-01, 非短名 edge-01)")
+
+    # ---- 9) services_status_table: TSV 6 列 / 无空字段 ----
+    # 注意: 本环境的 bash 函数调用被 BASH_ENV shim 拖到 ~0.5s/次, 而本函数内部
+    # 有 ~110 次函数调用 => 单次就接近 2 分钟。所以这里**只调一次**, 三件事
+    # (列数 / 行数 / 空字段) 在同一次输出上断言, 不要再起第二次进程。
+    r = _oc_bash(r'''
+set -u
+cd "$ONECLOUD_PROJECT_ROOT"
+export ONECLOUD_SKIP_DATA_ROOT_RESOLVE=1
+source scripts/lib-nodes.sh
+source scripts/lib-services.sh
+services_status_table | awk -F'\t' '
+  { rows++
+    if (NF != 6) bad++
+    for (i = 1; i <= NF; i++) if ($i == "") empty++
+  }
+  END { printf "rows=%d bad=%d empty=%d\n", rows+0, bad+0, empty+0 }'
+''', {"ONECLOUD_PROJECT_ROOT": _oc_pp(PROJECT_ROOT)}, timeout=420)
+    _oc_check("bad=0" in r.stdout,
+              "services_status_table 每行恰好 6 列 (TSV)")
+    m = re.search(r"rows=(\d+)", r.stdout)
+    _oc_check(m and int(m.group(1)) >= 18,
+              f"services_status_table 覆盖全部服务 (实测 {m.group(1) if m else '?'} 行)")
+    # 反向断言: 任何一列都不得为空 —— `IFS=$'\t' read` 会折叠空字段,
+    # 后面的列左移顶位 (实测把端口号显示进了「安装方式」列)。
+    _oc_check("empty=0" in r.stdout,
+              "services_status_table 无空字段 (空值以 - 占位, 避免 read 折叠)")
+
+    # ---- 10) 非法模式不静默通过 ----
+    r = _oc_bash(probe, {"ONECLOUD_NET_MODE": "bogus",
+                         "ONECLOUD_PROJECT_ROOT": _oc_pp(PROJECT_ROOT)})
+    _oc_check("不是合法取值" in (r.stdout + r.stderr),
+              "非法 network.mode 打出告警 (不静默接受)")
+    _oc_check("mode=lan" in r.stdout,
+              "非法 network.mode 回退 auto (无 default_enabled 时为 lan)")
+
+
+def test_optional_components_chain():
+    """测试 34: 可选组件在安装/部署/检查全链路的适配 (7 条反向断言)"""
+    print("\n" + "=" * 60)
+    print("测试 34: 可选组件全链路适配 (含 7 条反向断言)")
+    print("=" * 60)
+
+    # ---------- A. 清单字段 ----------
+    svc_src = _oc_read("inventory/services.yaml")
+    _oc_check(re.search(r"^  wireguard:", svc_src, re.M) and
+              re.search(r"^    optional: true", svc_src, re.M),
+              "services.yaml wireguard 声明 optional: true")
+    _oc_check(re.search(r"^    default_enabled: false", svc_src, re.M),
+              "services.yaml wireguard 声明 default_enabled: false")
+    _oc_check(re.search(r"^    provides: wg-mesh", svc_src, re.M),
+              "services.yaml wireguard 声明 provides: wg-mesh")
+    _oc_check(re.search(r"^  verysync:", svc_src, re.M) and
+              re.search(r"^    install: manual", svc_src, re.M),
+              "services.yaml verysync 声明 install: manual")
+
+    nodes_src = _oc_read("inventory/nodes.yaml")
+    _oc_check(re.search(r"^  mode: \w+", nodes_src, re.M),
+              "nodes.yaml network 段含 mode 字段")
+    _oc_check("auto" in nodes_src and "wireguard" in nodes_src and
+              "lan" in nodes_src and "mixed" in nodes_src,
+              "nodes.yaml 文档化 auto|wireguard|lan|mixed 四种取值")
+    _oc_check("强制" in nodes_src and "视作未安装" in nodes_src,
+              "nodes.yaml 说明 lan 强制关闭 WireGuard")
+
+    # ---------- B. 反向断言 ① 不含字面 /mnt/sd/srv 拼接 ----------
+    for rel in ("scripts/install-services.sh", "scripts/deploy.sh",
+                "scripts/health-check.sh", "scripts/lib-services.sh"):
+        s = _oc_read(rel)
+        bad = [ln for ln in s.splitlines()
+               if "/mnt/sd/srv" in ln and not ln.strip().startswith("#")]
+        _oc_check(not bad, f"{rel} 无未注释的 /mnt/sd/srv 字面拼接")
+
+    # ---------- C. 反向断言 ② 不含 /mnt/sd/<短名> 硬编码 ----------
+    short_hard = []
+    for pf in sorted(PROJECT_ROOT.glob("node-wk-*/*/*")):
+        if not pf.is_file() or pf.suffix not in (".sh", ".json", ".yaml", ".yml"):
+            continue
+        try:
+            txt = pf.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        for ln in txt.splitlines():
+            if ln.strip().startswith("#"):
+                continue
+            # /mnt/sd/edge-01 ... 即"/mnt/sd/"后直接跟短名 (而非 srv/)
+            if re.search(r"/mnt/sd/(edge|iot|storage)-", ln):
+                short_hard.append(f"{pf.relative_to(PROJECT_ROOT)}: {ln.strip()[:70]}")
+    _oc_check(not short_hard,
+              f"节点侧无 /mnt/sd/<短名> 硬编码 (检出 {len(short_hard)} 处)")
+
+    # ---------- D. 节点侧数据根改为 __DATA_ROOT__ 占位 ----------
+    cfg = _oc_read("node-wk-iot-02/xiaomusic/config.json")
+    _oc_check("__DATA_ROOT__" in cfg,
+              "xiaomusic config.json 用 __DATA_ROOT__ 占位")
+    _oc_check("/mnt/sd/iot-02" not in cfg,
+              "xiaomusic config.json 不再写死 /mnt/sd/iot-02")
+    try:
+        json.loads(cfg)
+        _oc_check(True, "xiaomusic config.json 仍是合法 JSON")
+    except Exception as e:
+        _oc_check(False, f"xiaomusic config.json JSON 合法 ({e})")
+
+    vy = _oc_read("node-wk-storage-03/verysync/config.yaml")
+    _oc_check(vy.count("__DATA_ROOT__") >= 4,
+              f"verysync config.yaml 全部路径用占位 ({vy.count('__DATA_ROOT__')} 处)")
+    _oc_check("/mnt/sd/storage-03" not in vy,
+              "verysync config.yaml 不再写死 /mnt/sd/storage-03")
+
+    # 渲染函数确实存在且被调用
+    isvc = _oc_read("scripts/install-services.sh")
+    _oc_check("render_template()" in isvc, "install-services.sh 定义 render_template()")
+    _oc_check("service_template_dir()" in isvc,
+              "install-services.sh 定义 service_template_dir()")
+    for call in ('render_template "$tpl" "${xm_dir}/config.json"',):
+        _oc_check(call in isvc,
+                  f"xiaomusic 安装时渲染模板配置 ({call[:40]}...)")
+    _oc_check('render_template "$tpl" "${dir}/config.yaml"' in isvc,
+              "verysync 手动安装指引里也渲染模板")
+
+    # ---------- E. 反向断言 ③ 每个 fetch( 都要带 credentials ----------
+    # 统一走 apiFetch 包装器; 例外: 包装器自身 + /logout (显式带 credentials)
+    with open(PANEL_DIR / "static" / "js" / "app.js", encoding="utf-8") as f:
+        js_lines = f.read().splitlines()
+    bad_fetch = []
+    for i, ln in enumerate(js_lines):
+        if "fetch(" not in ln or ln.strip().startswith("//"):
+            continue
+        window = "\n".join(js_lines[max(0, i - 3):i + 6])
+        if "credentials" in window or "function apiFetch" in window:
+            continue
+        bad_fetch.append(f"L{i+1}: {ln.strip()[:60]}")
+    _oc_check(not bad_fetch,
+              f"app.js 所有 fetch 均带 credentials (或走 apiFetch): 违规 {len(bad_fetch)}")
+    _oc_check("X-Requested-With" in "\n".join(js_lines),
+              "app.js apiFetch 设置 X-Requested-With (CSRF 头)")
+
+    # ---------- F. 反向断言 ④ require_auth 路由集 == 前端调用集 ----------
+    app_src = _oc_read("panel/app.py")
+
+    # 后端: 收集 (route 路径, 其紧跟的装饰器里是否有 require_auth)
+    #   装饰器顺序在源码里是 route 在前、require_auth 在后, 但也允许反过来,
+    #   所以按"从 @app.route 起向后看 3 行内是否出现 @require_auth"判定。
+    app_lines = app_src.splitlines()
+    be_routes = set()
+    for i, ln in enumerate(app_lines):
+        m = re.match(r'\s*@app\.route\("([^"]+)"', ln)
+        if not m:
+            continue
+        path = m.group(1)
+        if not path.startswith("/api/"):
+            continue
+        window = "\n".join(app_lines[i:i + 4])
+        if "@require_auth" in window:
+            be_routes.add(path)
+
+    # 前端: apiFetch("...") / apiFetch(`...${..}...`) 调用的路径
+    #   JS 模板串里是 /api/service/${node}/${svc}/${action},
+    #   后端是 /api/service/<node_name>/<svc_name>/<action> —— 归一化动态段后再比。
+    js_src = "\n".join(js_lines)
+    fe_raw = set(re.findall(r'apiFetch\(\s*[`"\'](/api/[^`"\'?]*)', js_src))
+
+    def _norm(p: str) -> str:
+        # 把 ${x} / <x> / :x 统一成 * , 便于跨语言比较
+        p = re.sub(r"\$\{[^}]*\}", "*", p)
+        p = re.sub(r"<[^>]*>", "*", p)
+        p = re.sub(r":[A-Za-z_]\w*", "*", p)
+        return p.rstrip("/")
+
+    be_norm = {_norm(p) for p in be_routes}
+    fe_missing = sorted(p for p in fe_raw if _norm(p) not in be_norm)
+    _oc_check(bool(be_routes),
+              f"后端声明了 require_auth 的 /api 路由 ({len(be_routes)} 条: "
+              f"{', '.join(sorted(be_routes))})")
+    _oc_check(bool(fe_raw),
+              f"前端经 apiFetch 调用了 /api 路由 ({len(fe_raw)} 条)")
+    _oc_check(not fe_missing,
+              f"前端调用的 /api 路由都在受保护集合内 (越权调用 {len(fe_missing)}: {fe_missing})")
+    # 每个写操作路由都要带 CSRF 头校验
+    write_routes = [p for p in be_routes
+                    if re.search(r'@app\.route\("' + re.escape(p) + r'"[^)]*methods=\[[^]]*"POST"',
+                                 app_src)]
+    missing_csrf = []
+    for p in write_routes:
+        i = next(i for i, ln in enumerate(app_lines)
+                 if f'@app.route("{p}"' in ln)
+        if "@require_csrf_header" not in "\n".join(app_lines[i:i + 5]):
+            missing_csrf.append(p)
+    _oc_check(not missing_csrf,
+              f"全部 POST 路由都带 require_csrf_header (缺失 {missing_csrf})")
+
+    # ---------- G. 反向断言 ⑤ container:false 必须有 case 分支或 install:manual ----------
+    # 解析 services.yaml 的 container 标志
+    conts = dict(re.findall(
+        r"^  ([\w-]+):\n(?:^(?:    .*)\n)*?^    container: (\w+)",
+        svc_src, re.M))
+    manual_svcs = set(re.findall(
+        r"^  ([\w-]+):\n(?:^(?:    .*)\n)*?^    install: manual", svc_src, re.M))
+    native = {k for k, v in conts.items() if v == "false"}
+    isvc_src = isvc
+    # 两个例外, 各有独立的安装入口 (不在 install-services.sh 的 case 里):
+    #   panel  -> panel/install-service.sh (systemd 单元 + 文件迁移)
+    #   clash / xiaomusic -> 本就在 case 分支中
+    external_installers = {"panel": "panel/install-service.sh"}
+    uncovered = []
+    for svc in sorted(native):
+        if svc in manual_svcs:
+            continue
+        if re.search(rf"^\s*{re.escape(svc)}\s*\)", isvc_src, re.M):
+            continue
+        if f"{svc})" in isvc_src or f'"{svc}"' in isvc_src:
+            continue
+        owner = external_installers.get(svc)
+        if owner and (PROJECT_ROOT / owner).exists():
+            continue
+        uncovered.append(svc)
+    _oc_check(not uncovered,
+              f"全部 container:false 服务都有安装分支或标 manual ({uncovered})")
+    _oc_check((PROJECT_ROOT / "panel/install-service.sh").exists(),
+              "panel 有独立安装脚本 panel/install-service.sh")
+
+    # ---------- H. 反向断言 ⑥ lan 模式防火墙不含 WireGuard 端口 ----------
+    fw = SCRIPTS_DIR / "firewall-recommend.sh"
+    fw_src = _oc_read("scripts/firewall-recommend.sh")
+    _oc_check('WG_ON="$(wg_enabled)"' in fw_src,
+              "firewall-recommend.sh 取 wg_enabled 作为 WG 开关")
+    _oc_check('if [ "$WG_ON" = "1" ] && [ "$node" = "$HUB_NODE" ]' in fw_src,
+              "WG 端口规则被 mode 开关包裹")
+    r = _oc_bash(r'''
+set -u
+cd "$ONECLOUD_PROJECT_ROOT"
+export ONECLOUD_SKIP_DATA_ROOT_RESOLVE=1
+for _n in $(bash scripts/lib-nodes.sh >/dev/null 2>&1; source scripts/lib-nodes.sh; node_names); do
+  bash scripts/firewall-recommend.sh --emit-dsl "$_n"
+done
+''', {"ONECLOUD_NET_MODE": "lan", "ONECLOUD_PROJECT_ROOT": _oc_pp(PROJECT_ROOT)}, timeout=420)
+    dsl_lan = r.stdout
+    _oc_check("51820" not in dsl_lan,
+              f"lan 模式全部节点 DSL 不含 51820 ({dsl_lan.count(chr(10))} 行规则)")
+    _oc_check("in accept" in dsl_lan,
+              "lan 模式仍输出常规放行规则 (非空清单)")
+    # verysync 是 manual -> 未安装, 不应出现在规则里
+    _oc_check("19900" not in dsl_lan,
+              "lan 模式不含 verysync 端口 19900 (manual 未安装)")
+
+    r2 = _oc_bash(r'''
+set -u
+cd "$ONECLOUD_PROJECT_ROOT"
+export ONECLOUD_SKIP_DATA_ROOT_RESOLVE=1
+bash scripts/firewall-recommend.sh --emit-dsl
+''', {"ONECLOUD_NET_MODE": "mixed", "ONECLOUD_PROJECT_ROOT": _oc_pp(PROJECT_ROOT)}, timeout=420)
+    _oc_check("51820" in r2.stdout,
+              "mixed 模式 DSL 含 51820 (WireGuard Hub 入站)")
+
+    # 正文里 WireGuard 章节也要按模式切换
+    r3 = _oc_bash(r'''
+set -u
+cd "$ONECLOUD_PROJECT_ROOT"
+export ONECLOUD_SKIP_DATA_ROOT_RESOLVE=1
+bash scripts/firewall-recommend.sh --stdout wk-edge-01
+''', {"ONECLOUD_NET_MODE": "lan", "ONECLOUD_PROJECT_ROOT": _oc_pp(PROJECT_ROOT)}, timeout=420)
+    _oc_check("不需要 WireGuard 相关规则" in r3.stdout,
+              "lan 模式清单正文声明无需 WG 规则")
+    # 不能只查 "MASQUERADE" 是否出现 —— lan 章节会明确写"不需要 ... MASQUERADE"
+    # (否定句), 于是要在正文里找的是**可执行命令块**: "iptables -t nat -A POSTROUTING"。
+    _oc_check("iptables -t nat -A POSTROUTING" not in r3.stdout,
+              "lan 模式清单不含可执行的 MASQUERADE 命令")
+    _oc_check("iptables -C FORWARD -i wg0 -j ACCEPT" not in r3.stdout,
+              "lan 模式清单不含可执行的 FORWARD 放行命令")
+    # 不能直接查 "51820" 是否出现 —— 本清单会用一句说明文字明确告诉用户
+    # "本清单**不含** UDP 51820 放行", 那是必要的提示而非规则。
+    # 真正要否定的是「可执行的放行/转发命令」, 故只筛命令行 (以 iptables/nft 开头)。
+    wg_cmds = [ln.strip() for ln in r3.stdout.splitlines()
+               if ln.strip().startswith(("iptables", "nft", "firewall-cmd", "ufw"))
+               and "51820" in ln]
+    _oc_check(not wg_cmds,
+              f"lan 模式清单无可执行 51820 规则 ({wg_cmds[:2]})")
+
+    # ---------- I. 反向断言 ⑦ 远程路径前必须先取数据根 ----------
+    for rel, funcs in (("scripts/deploy.sh", ("node_data_root",)),
+                       ("scripts/health-check.sh", ("node_data_root",))):
+        s = _oc_read(rel)
+        _oc_check(all(f in s for f in funcs),
+                  f"{rel} 使用 node_data_root 取远端数据根")
+    isvc2 = _oc_read("scripts/install-services.sh")
+    _oc_check("node_data_dir" in isvc2 and "oc_data_root" in isvc2,
+              "install-services.sh 远程路径经 node_data_dir/oc_data_root")
+    # 只查未注释的代码行: 注释里明明白白写着"原先写成 ${DATA_ROOT:-/mnt/sd/srv}"
+    # (记录修复原因), 用整文件搜索会把这条注释误判成残留。
+    isvc_code = [ln for ln in isvc2.splitlines()
+                 if not ln.strip().startswith("#")]
+    _oc_check(all("${DATA_ROOT:-/mnt/sd/srv}" not in ln for ln in isvc_code),
+              "install-services.sh 已去掉 ${DATA_ROOT:-/mnt/sd/srv} 的恒定拼接 (仅注释提及)")
+
+    # ---------- J. 各脚本的 mode 适配 ----------
+    hc = _oc_read("scripts/health-check.sh")
+    _oc_check("source \"${SCRIPT_DIR}/lib-services.sh\"" in hc,
+              "health-check.sh 引入 lib-services.sh")
+    _oc_check("services_install_mode" in hc and "待手动安装" in hc,
+              "health-check.sh 对 manual 服务给出「待手动安装」")
+    _oc_check('if [ "$inst" != "1" ]' in hc,
+              "health-check.sh 未安装服务走 SKIP 分支")
+    _oc_check("node_services" in hc,
+              "health-check.sh 服务清单来自 inventory 而非硬编码")
+
+    wg = _oc_read("scripts/wireguard-setup.sh")
+    _oc_check("source \"${SCRIPT_DIR}/lib-services.sh\"" in wg,
+              "wireguard-setup.sh 引入 lib-services.sh")
+    _oc_check('if [ "$(wg_enabled)" != "1" ]' in wg,
+              "wireguard-setup.sh 有 wg_enabled 闸门")
+    _oc_check(re.search(r"wg_enabled\)\" != \"1\" \][\s\S]{0,600}?exit 0", wg),
+              "wireguard-setup.sh 未启用时 exit 0 (不算失败)")
+    _oc_check("wg_hub_node" in wg,
+              "wireguard-setup.sh Hub 节点由 services.yaml 反查")
+
+    dep = _oc_read("scripts/deploy.sh")
+    _oc_check("source \"${SCRIPT_DIR}/lib-services.sh\"" in dep,
+              "deploy.sh 引入 lib-services.sh")
+    _oc_check("service_installed" in dep,
+              "deploy.sh 按 service_installed 过滤建目录")
+
+    bs = _oc_read("scripts/bootstrap.sh")
+    _oc_check("base_pkgs_dynamic()" in bs,
+              "bootstrap.sh 定义 base_pkgs_dynamic()")
+    _oc_check("grep -vx 'wireguard-tools'" in bs,
+              "lan 模式从核心包剔除 wireguard-tools")
+    _oc_check("wg_enabled_for_bootstrap()" in bs,
+              "bootstrap.sh 定义 wg_enabled_for_bootstrap()")
+    _oc_check("NETWORK_MODE=" in bs and "WG_ENABLED=" in bs,
+              "install.conf 记录 NETWORK_MODE / WG_ENABLED")
+    _oc_check('--net-mode' in bs and "--lan-only" in bs,
+              "bootstrap.sh 支持 --net-mode / --lan-only")
+    _oc_check("非法的组网模式" in bs,
+              "bootstrap.sh 校验 --net-mode 取值")
+    _oc_check(re.search(r"if \[ \"\$SD_ENABLE\"[\s\S]{0,80}?\n", bs) is not None,
+              "bootstrap.sh 结构未被破坏 (--no-sd 分支仍在)")
+
+
+def test_network_modes_and_panel():
+    """测试 35: 三种组网模式的端到端表现 + 面板三态 + 版本同步"""
+    print("\n" + "=" * 60)
+    print("测试 35: 三种组网模式 / 面板三态 / 版本同步")
+    print("=" * 60)
+
+    # ---------- A. panel/config.json 新增字段 ----------
+    with open(PANEL_DIR / "config.json", encoding="utf-8") as f:
+        cfg = json.load(f)
+    for k in ("version", "network_mode", "network_mode_label", "wg_enabled",
+              "wg_subnet", "lan_subnet"):
+        _oc_check(k in cfg, f"panel/config.json 顶层含 {k}")
+    _oc_check(cfg.get("network_mode") in ("lan", "wireguard", "mixed"),
+              f"network_mode 取值合法 ({cfg.get('network_mode')})")
+    _oc_check(isinstance(cfg.get("wg_enabled"), bool),
+              "wg_enabled 是布尔 (不是字符串)")
+    for nd in cfg.get("nodes", []):
+        _oc_check("data_root" in nd, f"{nd['name']} 含 data_root")
+        for s in nd.get("services", []):
+            for k in ("installed", "optional", "install", "port"):
+                if k not in s:
+                    _oc_check(False, f"{nd['name']}/{s.get('name')} 缺字段 {k}")
+                    break
+            else:
+                continue
+            break
+        else:
+            continue
+        break
+    else:
+        _oc_check(True, "全部节点/服务的 installed/optional/install/port 字段齐全")
+
+    # installed 是布尔而非字符串
+    all_svcs = [s for nd in cfg["nodes"] for s in nd["services"]]
+    _oc_check(all(isinstance(s["installed"], bool) for s in all_svcs),
+              "installed 全为布尔值")
+    _oc_check(all(isinstance(s["port"], int) for s in all_svcs),
+              "port 全为整数")
+
+    # verysync 具体断言
+    vy = [s for s in all_svcs if s["name"] == "verysync"]
+    _oc_check(len(vy) == 1, "config.json 中 verysync 恰有一条")
+    if vy:
+        _oc_check(vy[0]["installed"] is False,
+                  "config.json verysync installed=false (manual 未装)")
+        _oc_check(vy[0]["install"] == "manual", "config.json verysync install=manual")
+        _oc_check(vy[0]["optional"] is True, "config.json verysync optional=true")
+
+    wg = [s for s in all_svcs if s["name"] == "wireguard"]
+    _oc_check(len(wg) == 1, "config.json 中 wireguard 恰有一条")
+    if wg:
+        _oc_check(wg[0]["optional"] is True, "config.json wireguard optional=true")
+        _oc_check(wg[0]["port"] == 51820,
+                  f"config.json wireguard port=51820 (实测 {wg[0]['port']})")
+
+    # ---------- B. gen-panel-config.sh 在 lan 模式下产出 ----------
+    r = _oc_bash(r'''
+set -u
+cd "$ONECLOUD_PROJECT_ROOT"
+export ONECLOUD_SKIP_DATA_ROOT_RESOLVE=1
+export ONECLOUD_REMOTE_DATA_ROOT=/tmp/ocroot
+_out=/tmp/oc_panel_lan.json
+bash scripts/gen-panel-config.sh --out "$_out" >/dev/null 2>&1
+cat "$_out"
+rm -f "$_out"
+''', {"ONECLOUD_NET_MODE": "lan", "ONECLOUD_PROJECT_ROOT": _oc_pp(PROJECT_ROOT)},
+        timeout=420)
+    if r.returncode == 0 and r.stdout.strip().startswith("{"):
+        try:
+            lan_cfg = json.loads(r.stdout)
+            _oc_check(lan_cfg["network_mode"] == "lan",
+                      "gen-panel-config: lan 模式 network_mode=lan")
+            _oc_check(lan_cfg["wg_enabled"] is False,
+                      "gen-panel-config: lan 模式 wg_enabled=false")
+            _oc_check(all(nd.get("data_root") == "/tmp/ocroot"
+                          for nd in lan_cfg["nodes"]),
+                      "gen-panel-config: data_root 来自 ONECLOUD_REMOTE_DATA_ROOT")
+            lwg = [s for nd in lan_cfg["nodes"] for s in nd["services"]
+                   if s["name"] == "wireguard"]
+            _oc_check(lwg and lwg[0]["installed"] is False,
+                      "gen-panel-config: lan 模式 wireguard installed=false")
+            _oc_check("WireGuard" not in lan_cfg.get("network_mode_label", ""),
+                      "gen-panel-config: lan 模式 label 不含 WireGuard 字样")
+        except json.JSONDecodeError as e:
+            _oc_check(False, f"gen-panel-config lan 输出是合法 JSON ({e})")
+    else:
+        _oc_check(False, f"gen-panel-config --out 在 lan 模式可运行 (rc={r.returncode})")
+
+    # ---------- C. 面板代码: 三态与未安装不探测 ----------
+    app_src = _oc_read("panel/app.py")
+    _oc_check('"installed": False' in app_src or "'installed': False" in app_src,
+              "app.py 未安装服务返回 installed=False")
+    _oc_check('if not service.get("installed", True):' in app_src,
+              "app.py 未安装时提前返回 (不做 SSH 探测)")
+    _oc_check("services_installed" in app_src,
+              "app.py 汇总 services_installed")
+    _oc_check("network_mode" in app_src, "app.py 透出 network_mode")
+    _oc_check("wg_enabled" in app_src, "app.py 透出 wg_enabled")
+
+    # 未安装分支必须在 SSH 调用之前
+    m = re.search(r"def get_service_status\([\s\S]*?\n(?=def )", app_src)
+    if m:
+        body = m.group(0)
+        pos_inst = body.find("installed")
+        pos_ssh = body.find("_ssh_executive") if "_ssh_executive" in body else body.find("ssh")
+        _oc_check(pos_inst != -1 and (pos_ssh == -1 or pos_inst < pos_ssh),
+                  "get_service_status: installed 判定在 SSH 探测之前")
+
+    # ---------- D. 三态在 CSS/JS 里都有样式与逻辑 ----------
+    css = _oc_read("panel/static/css/style.css")
+    _oc_check(".status-dot.notinstalled" in css,
+              "style.css 有 .status-dot.notinstalled (灰色空心)")
+    _oc_check(".topo-mesh" in css and "topo-lan" in css,
+              "style.css 有拓扑模式样式 (topo-lan 等)")
+    _oc_check(".login-card" in css, "style.css 有登录页样式")
+
+    js = _oc_read("panel/static/js/app.js")
+    _oc_check("serviceState" in js, "app.js 有 serviceState() 三态判定")
+    _oc_check("currentNet" in js, "app.js 保存 currentNet 模式状态")
+    _oc_check("doLogout" in js, "app.js 有 doLogout()")
+    _oc_check("已装" in js and "运行" in js,
+              "app.js 节点摘要显示「已装 N/M · 运行 K」")
+
+    idx = _oc_read("panel/templates/index.html")
+    _oc_check("netMode" in idx, "index.html 有 netMode 显示位")
+    _oc_check("topoMode" in idx, "index.html 拓扑标题有 id=topoMode")
+    _oc_check("WireGuard Mesh VPN (10.8.0.0/24)" not in idx,
+              "index.html 不再硬编码 WireGuard Mesh 标题")
+
+    _oc_check((PANEL_DIR / "templates" / "login.html").exists(),
+              "panel/templates/login.html 存在")
+
+    # ---------- E. 面板安全修复 (C-1/C-2/C-3/M-1) ----------
+    _oc_check("secrets.token_urlsafe" in app_src,
+              "C-1: 无 PANEL_PASS 时随机生成口令")
+    _oc_check("PANEL_PASS_GENERATED" in app_src,
+              "C-1: 标记 PANEL_PASS_GENERATED 并告警")
+    _oc_check('os.environ.get("PANEL_PASS", "")' in app_src or
+              "PANEL_PASS" in app_src and '""' in app_src,
+              "C-1: PANEL_PASS 默认值为空 (不再硬编码弱口令)")
+    _oc_check("PANEL_CORS_ORIGINS" in app_src,
+              "C-2: CORS 来源可由 PANEL_CORS_ORIGINS 收敛")
+    _oc_check("supports_credentials=True" in app_src,
+              "C-2: CORS 带 supports_credentials")
+    _oc_check("require_csrf_header" in app_src,
+              "M-1: 定义 require_csrf_header")
+    _oc_check("X-Requested-With" in app_src,
+              "M-1: 校验 X-Requested-With 头")
+    _oc_check("app.secret_key" in app_src, "session 需要 app.secret_key")
+
+    # C-3: /mnt/sd 只允许作为回退默认值出现
+    bad_sd = []
+    for i, ln in enumerate(app_src.splitlines()):
+        if "/mnt/sd" not in ln or ln.strip().startswith("#"):
+            continue
+        if re.search(r'=\s*"/mnt/sd"', ln) or 'or "/mnt/sd"' in ln or \
+           re.search(r'get\([^)]*"/mnt/sd"', ln) or '"/mnt/sd"' in ln and "def " in ln:
+            continue
+        if re.search(r'"/mnt/sd"', ln):
+            continue
+        bad_sd.append(f"L{i+1}: {ln.strip()[:70]}")
+    _oc_check(not bad_sd,
+              f"C-3: app.py 的 /mnt/sd 仅作回退默认值 (违规 {len(bad_sd)})")
+
+    # ---------- F. 版本 6 处同步 ----------
+    ver_sites = {
+        "README.md": r"\*\*当前版本: (v[\d.]+)\*\*",
+        "panel/config.json": r'"version":\s*"([\d.]+)"',
+        "panel/app.py": r'"version":\s*"([\d.]+)"',
+        "scripts/gen-panel-config.sh": r'VERSION="\$\{ONECLOUD_PANEL_VERSION:-([\d.]+)\}"',
+        "panel/README.md": r'"version":\s*"([\d.]+)"',
+    }
+    vers = {}
+    for rel, pat in ver_sites.items():
+        m = re.search(pat, _oc_read(rel))
+        vers[rel] = m.group(1) if m else None
+    uniq = set(v.lstrip("v") for v in vers.values() if v)
+    _oc_check(len(uniq) == 1,
+              f"5 个文件版本声明一致 ({dict(vers)})")
+    _oc_check(list(uniq)[0] == "1.6.0" if uniq else False,
+              f"版本为 1.6.0 (实测 {uniq})")
+
+    # README 变更说明标题也要跟上
+    rd = _oc_read("README.md")
+    _oc_check("## 🚀 v1.6.0 变更说明" in rd,
+              "README.md 有 v1.6.0 变更说明章节")
+
+
+def test_services_lib_perf_and_ports():
+    """测试 36: lib-services 性能回归 + 容器端口解析 (两个真实缺陷)
+
+    背景: 一次 `gen-panel-config.sh` 实测耗时 160s, 排查出两个独立缺陷:
+      缺陷 A 生成器对每个节点调 oc_data_root -> SSH 探测 (空闲节点白等 4~5s/节点)
+      缺陷 B 容器服务端口全为 0: _svc_first_port 里 `${!_SVC_PORTMAP}` 在
+             `set -u` 下对"已声明但为空"的关联数组报 unbound variable, 报错被
+             2>/dev/null 吞掉 -> 所有 ports: [...] 形式的服务端口退化成 0
+    本组把两者都钉成断言, 防止回归。
+    """
+    print("\n" + "=" * 60)
+    print("测试 36: lib-services 性能回归 + 容器端口解析")
+    print("=" * 60)
+
+    libsvc = _oc_read("scripts/lib-services.sh")
+    libnodes = _oc_read("scripts/lib-nodes.sh")
+    gen = _oc_read("scripts/gen-panel-config.sh")
+
+    # ---------- A. 生成器不得在每节点做 SSH ----------
+    _oc_check("oc_static_data_root()" in libsvc,
+              "lib-services.sh 定义非阻塞数据根 oc_static_data_root()")
+    _oc_check("static_data_root()" in libnodes,
+              "lib-nodes.sh 定义非阻塞数据根 static_data_root()")
+    _oc_check("oc_static_data_root" in gen,
+              "gen-panel-config.sh 用 oc_static_data_root 取数据根 (不在每节点 SSH)")
+    # 反向断言: 生成器里不许再出现会 SSH 的取法
+    _oc_check(not re.search(r'droot="\$\(oc_data_root', gen),
+              "gen-panel-config.sh 不再用 oc_data_root 逐节点探测 (会 SSH)")
+
+    # ---------- B. set -u 下关联数组展开必须先判空 ----------
+    m = re.search(r"_svc_first_port\(\)\s*\{[\s\S]*?\n\}", libsvc)
+    _oc_check(m is not None, "_svc_first_port 函数存在")
+    if m:
+        # 必须剔除注释行再断言 —— 函数里正好写着解释「裸 ${!arr} 会 unbound」的
+        # 注释, 不剔注释就会把说明文字当成违规代码 (本项目踩过同类坑)。
+        body = "\n".join(ln for ln in m.group(0).splitlines()
+                         if not ln.strip().startswith("#"))
+        # 必须用带引号的 "${!arr[@]}" 且前面判过元素个数
+        _oc_check("${!_SVC_PORTMAP[@]}" in body,
+                  "_svc_first_port 用 \"${!_arr[@]}\" 形式展开关联数组键")
+        _oc_check("#_SVC_PORTMAP[@]}" in body.replace('"', "").replace("'", ""),
+                  "_svc_first_port 展开了数组元素个数做判空")
+        # 裸展开 = ${!arr} (结尾直接是 }), 而非 ${!arr[@]}。
+        # 不要用字符类否定式 (如 [^[]) —— [A-Za-z0-9_]+ 会回溯吞掉名字再拿
+        # [^[] 去匹配字面 '[' , 正样本也会误报。直接比较展开串的结尾即可。
+        bare = [x for x in re.findall(r"\$\{![^}]*\}", body) if not x.endswith("[@]}")]
+        _oc_check(not bare,
+                  f"_svc_first_port 不再用裸 ${{!arr}} 展开 (set -u 下会 unbound; 实际: {bare})")
+
+    # 实测: 容器服务必须解析出真实端口 (曾全为 0)
+    probe = _oc_bash(
+        'set -euo pipefail; source scripts/lib-nodes.sh; '
+        'source scripts/lib-services.sh; require_nodes; '
+        'for s in wireguard piwigo aria2 gitea cupsd xiaomusic panel; do '
+        'printf "%s=%s\\n" "$s" "$(services_port "$s")"; done',
+        timeout=240)
+    out = probe.stdout or ""
+    expect = {"wireguard": "51820", "piwigo": "8080", "aria2": "6800",
+              "gitea": "3000", "cupsd": "631", "xiaomusic": "8081",
+              "panel": "9000"}
+    for svc, want in expect.items():
+        got = (re.search(rf"^{svc}=(\d+)", out, re.M) or [None, None])[1]
+        _oc_check(got == want,
+                  f"services_port {svc} = {want} (实测 {got})")
+
+    # 整体: 至少 12 个服务有非零端口 (曾只有 2 个)
+    nz = len(re.findall(r"^[a-z0-9_-]+=[1-9]\d*$", out, re.M))
+    _oc_check(nz >= len(expect),
+              f"容器服务端口解析正常 ({nz} 个非零, 期望 >= {len(expect)})")
+
+    # ---------- C. set -u 严格模式不得有 unbound ----------
+    strict = _oc_bash(
+        'set -euo pipefail; source scripts/lib-nodes.sh; '
+        'source scripts/lib-services.sh; require_nodes; '
+        'services_status_table >/dev/null; '
+        'for n in $(node_names); do for s in $(node_services "$n"); do '
+        'service_installed "$n" "$s" >/dev/null; '
+        'services_optional "$s" >/dev/null; '
+        'services_install_mode "$s" >/dev/null; '
+        'services_port "$s" >/dev/null; done; done; echo STRICT_OK',
+        timeout=300)
+    sout = (strict.stdout or "") + (strict.stderr or "")
+    _oc_check("unbound variable" not in sout,
+              "set -u 下无 unbound variable (关联数组展开已判空)")
+    _oc_check("STRICT_OK" in sout,
+              "set -u 严格模式全链路跑通")
+
+    # ---------- D. service_field 走内存索引 (性能) ----------
+    _oc_check("_SVC_FIELD_INDEX" in libnodes,
+              "lib-nodes.sh 用 _SVC_FIELD_INDEX 预载字段索引")
+    m2 = re.search(r"service_field\(\)\s*\{[\s\S]*?\n\}", libnodes)
+    if m2:
+        _oc_check("_SVC_FIELD_INDEX[" in m2.group(0),
+                  "service_field 走关联数组查表 (不再 while 扫全表)")
+
+    # ---------- E. 面板配置端口字段与清单一致 (端到端) ----------
+    with open(PANEL_DIR / "config.json", encoding="utf-8") as f:
+        cfg = json.load(f)
+    portmap = {}
+    for nd in cfg.get("nodes", []):
+        for s in nd.get("services", []):
+            portmap.setdefault(s["name"], s.get("port", 0))
+    bad = [k for k, v in expect.items()
+           if k in portmap and portmap[k] != int(v)]
+    _oc_check(not bad,
+              f"panel/config.json 端口字段与清单一致 (不一致: {bad})")
+
+
 def main():
     print("=" * 60)
     print("OneCloud Cluster 功能验证")
@@ -5696,6 +6560,10 @@ def main():
         ("安装路径自适应 (SD卡->/opt 回退)", test_install_path_adaptive),
         ("SD 卡工具箱 (格式化/迁移/更换)", test_sd_tools),
         ("初始化部署修复 (权限/迁移/IP同步/数据根)", test_init_deploy_sync),
+        ("lib-services 单一真相库 (安装态/模式/数据根)", test_lib_services),
+        ("可选组件全链路适配 (7 条反向断言)", test_optional_components_chain),
+        ("三种组网模式/面板三态/版本同步", test_network_modes_and_panel),
+        ("lib-services 性能回归 + 容器端口解析", test_services_lib_perf_and_ports),
     ]
     
     for test_name, test_func in tests:

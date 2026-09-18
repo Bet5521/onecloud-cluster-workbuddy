@@ -135,6 +135,19 @@ header h1 { font-size: 1.5rem; color: #fff; }
 .status-dot.running { background: #38ef7d; box-shadow: 0 0 8px #38ef7d; }
 .status-dot.stopped { background: #f5576c; }
 .status-dot.unknown { background: #888; }
+/* 未安装: 灰色空心 —— 与"已停止(红色实心)"明确区分 */
+.status-dot.notinstalled {
+    background: transparent;
+    border: 1.5px solid #777;
+    width: 7px; height: 7px;
+}
+
+/* 服务状态文字 (三态文案: 运行中 / 已停止 / 未安装) */
+.service-state { font-size: 0.75rem; margin-left: 4px; }
+.service-item:has(.status-dot.notinstalled) .service-state { color: #999; }
+
+/* 节点服务汇总: 已装 N/M · 运行 K */
+.node-summary { font-size: 0.78rem; margin: 2px 0 8px; }
 
 .service-actions { display: flex; gap: 4px; }
 .service-actions button {
@@ -272,6 +285,74 @@ header h1 { font-size: 1.5rem; color: #fff; }
     background: rgba(102, 126, 234, 0.1);
     border-radius: 8px;
 }
+
+/* 组网方式标识: 三种模式各自的视觉 (lan 模式不出现 WireGuard 字样) */
+.topo-mesh.topo-wg    { color: #667eea; background: rgba(102, 126, 234, 0.1); }
+.topo-mesh.topo-lan   { color: #38ef7d; background: rgba(56, 239, 125, 0.10); }
+.topo-mesh.topo-mixed { color: #ffa726; background: rgba(255, 167, 38, 0.12); }
+
+/* ---- 登录页 ---- */
+.login-body {
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin: 0;
+}
+
+.login-wrap { width: 100%; max-width: 380px; padding: 20px; }
+
+.login-card {
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 14px;
+    padding: 32px 28px 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+}
+
+.login-card h1 { font-size: 1.25rem; margin: 0; text-align: center; }
+.login-sub { text-align: center; color: #888; font-size: 0.85rem; margin: 0 0 6px; }
+
+.login-field { display: flex; flex-direction: column; gap: 6px; }
+.login-field span { font-size: 0.82rem; color: #aaa; }
+.login-field input {
+    padding: 10px 12px;
+    border-radius: 8px;
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    background: rgba(0, 0, 0, 0.25);
+    color: #eee;
+    font-size: 0.95rem;
+}
+.login-field input:focus { outline: none; border-color: #667eea; }
+
+.btn-login {
+    margin-top: 6px;
+    padding: 11px;
+    border-radius: 8px;
+    border: none;
+    background: linear-gradient(135deg, #667eea, #764ba2);
+    color: #fff;
+    font-size: 0.95rem;
+    cursor: pointer;
+}
+.btn-login:hover { filter: brightness(1.1); }
+
+.login-error {
+    background: rgba(245, 87, 108, 0.15);
+    border: 1px solid rgba(245, 87, 108, 0.4);
+    color: #f5576c;
+    padding: 9px 12px;
+    border-radius: 8px;
+    font-size: 0.85rem;
+    text-align: center;
+}
+
+.login-hint { color: #777; font-size: 0.75rem; line-height: 1.6; margin: 6px 0 0; }
+.login-hint code { background: rgba(255, 255, 255, 0.08); padding: 1px 5px; border-radius: 4px; }
+
+.login-footer { text-align: center; color: #555; font-size: 0.78rem; margin-top: 16px; }
 
 footer {
     text-align: center;

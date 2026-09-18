@@ -63,10 +63,113 @@ log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
 #     rsync             迁移 /var/lib/docker 到 SD 卡
 #     parted            SD 卡分区 (mklabel / mkpart)
 #     wireguard-tools   集群组网 (wg / wg-quick), 三节点互通的地基
+#                       **仅组网模式启用 WireGuard 时安装** —— 纯局域网模式
+#                       (network.mode: lan) 下装它没有意义, 只占空间。见
+#                       base_pkgs_dynamic() 的说明。
 #   iproute2 / e2fsprogs / util-linux 属系统基础包 (Priority: required/important),
 #   系统一定自带, 不重复声明。
 # ------------------------------------------------------------
 BASE_PKGS="curl git ca-certificates jq rsync parted wireguard-tools"
+
+# 核心包清单 (按组网模式动态调整)
+#
+#   why: BASE_PKGS 里含 wireguard-tools, 但"不装 WireGuard"是合法配置。
+#        固定清单会在纯局域网模式下一并装上 wg 工具链, 与"该组件未安装"
+#        的语义矛盾 —— 面板/健康检查说没装, dpkg 里却查得到, 排查时误导人。
+#
+#   只依赖清单字段, 不 source lib-services.sh: bootstrap 在裸 Debian 上运行,
+#   那时 inventory 可能还没克隆到本地。取不到清单就按"装"处理 (保守,
+#   与旧行为一致, 不会让已装 WG 的机器少了工具)。
+base_pkgs_dynamic() {
+    local pkgs="$BASE_PKGS" mode=""
+    local nodes_yaml=""
+    for nodes_yaml in \
+        "${LIB_NODES_PROJECT_DIR:-}/inventory/nodes.yaml" \
+        "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)/inventory/nodes.yaml"
+    do
+        [ -n "$nodes_yaml" ] && [ -f "$nodes_yaml" ] && break
+        nodes_yaml=""
+    done
+
+    if [ -n "$nodes_yaml" ]; then
+        mode="$(awk '
+            /^network:/ { inet = 1; next }
+            /^[A-Za-z_]/ { inet = 0 }
+            inet && /^  mode:/ { v = $2; gsub(/["\r]/, "", v); print v; exit }
+        ' "$nodes_yaml" 2>/dev/null || true)"
+    fi
+    # 环境变量优先 (与 lib-nodes.sh 的 ONECLOUD_NET_MODE 保持一致)
+    mode="${ONECLOUD_NET_MODE:-${mode:-}}"
+
+    case "$(printf '%s' "$mode" | tr 'A-Z' 'a-z')" in
+        lan)
+            # 纯局域网直连: 不需要 wg 工具链
+            printf '%s' "$(printf '%s' "$pkgs" | tr ' ' '\n' | grep -vx 'wireguard-tools' | tr '\n' ' ' | sed 's/ *$//')"
+            ;;
+        *)
+            printf '%s' "$pkgs"
+            ;;
+    esac
+}
+
+# 组网模式裸值 (bootstrap 版; 与 lib-nodes.sh 的取值优先级一致)
+bootstrap_net_mode() {
+    local mode="" nodes_yaml=""
+    for nodes_yaml in \
+        "${LIB_NODES_PROJECT_DIR:-}/inventory/nodes.yaml" \
+        "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)/inventory/nodes.yaml"
+    do
+        [ -n "$nodes_yaml" ] && [ -f "$nodes_yaml" ] && break
+        nodes_yaml=""
+    done
+    if [ -n "$nodes_yaml" ]; then
+        mode="$(awk '
+            /^network:/ { inet = 1; next }
+            /^[A-Za-z_]/ { inet = 0 }
+            inet && /^  mode:/ { v = $2; gsub(/["\r]/, "", v); print v; exit }
+        ' "$nodes_yaml" 2>/dev/null || true)"
+    fi
+    printf '%s' "${ONECLOUD_NET_MODE:-${mode:-auto}}"
+}
+
+# Bootstrap 版 WireGuard 启用判定 (0|1)
+#   取不到清单时按 auto 处理: 有 wireguard 服务声明就启用。
+#   这里不 source lib-services.sh —— bootstrap 可能在裸 Debian 上跑,
+#   那会儿仓库还没克隆到本地; 逻辑与 lib-services.sh 的 wg_enabled 等价。
+wg_enabled_for_bootstrap() {
+    local mode; mode="$(printf '%s' "$(bootstrap_net_mode)" | tr 'A-Z' 'a-z')"
+    # 用显式 if 而非 `[ ... ] && { ... }` 链: 后者在条件为假时留下非 0 退出码,
+    # 与后续 `||`/`&&` 混用时优先级容易读错 (1.6.0 开发期实际写错过一次,
+    # 表现为 auto 模式下 default_enabled=false 被判成启用)。
+    if [ "$mode" = "lan" ]; then
+        printf '0'; return 0
+    fi
+    if [ "$mode" = "wireguard" ] || [ "$mode" = "mixed" ]; then
+        printf '1'; return 0
+    fi
+
+    # auto: 看清单里 wireguard 服务是否 default_enabled
+    local svc_yaml=""
+    for svc_yaml in \
+        "${LIB_NODES_PROJECT_DIR:-}/inventory/services.yaml" \
+        "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)/inventory/services.yaml"
+    do
+        [ -n "$svc_yaml" ] && [ -f "$svc_yaml" ] && break
+        svc_yaml=""
+    done
+    [ -z "$svc_yaml" ] && { printf '1'; return 0; }
+
+    local de
+    de="$(awk '
+        BEGIN { cur = ""; want = 0 }
+        /^  [A-Za-z_][A-Za-z0-9_-]*:/ { s = $0; sub(/^  /, "", s); sub(/:.*$/, "", s); cur = s; next }
+        cur == "wireguard" && /^    default_enabled:/ { v = $2; print v; exit }
+    ' "$svc_yaml" 2>/dev/null || true)"
+    case "$(printf '%s' "$de" | tr 'A-Z' 'a-z' | tr -d '"')" in
+        false|no|0|off) printf '0' ;;
+        *)              printf '1' ;;
+    esac
+}
 
 # 可选包预设: 仅当显式开启 (--extra-pkgs) 时才安装
 OPT_PKGS_PRESET="wget vim htop iotop net-tools dnsutils unzip dosfstools fdisk lsb-release gnupg"
@@ -125,7 +228,7 @@ extra_pkgs_apply() {
 # 计算最终装包清单 (核心 + 可选, 且已剔除桌面/图形组件), 结果写入 INSTALL_PKGS
 # 按入参缓存: 配置摘要与真正安装两步都会用到它, 不缓存的话剔除告警会打印两次
 pkg_install_list() {
-    local key="${DO_APT_PKGS}|${DO_EXTRA_PKGS:-false}|${EXTRA_PKGS_REQUEST:-}"
+    local key="${DO_APT_PKGS}|${DO_EXTRA_PKGS:-false}|${EXTRA_PKGS_REQUEST:-}|${ONECLOUD_NET_MODE:-}"
     [ "${INSTALL_PKGS_KEY:-}" = "$key" ] && return 0
     INSTALL_PKGS_KEY="$key"
     INSTALL_EXTRA_PKGS=""
@@ -133,7 +236,8 @@ pkg_install_list() {
         INSTALL_PKGS=""
         return 0
     fi
-    INSTALL_PKGS="$(pkg_gui_filter $BASE_PKGS)"
+    # 核心清单按组网模式动态化 (lan 模式不含 wireguard-tools)
+    INSTALL_PKGS="$(pkg_gui_filter $(base_pkgs_dynamic))"
     if [ "${DO_EXTRA_PKGS:-false}" = true ]; then
         local _extra
         _extra="$(pkg_gui_filter $(extra_pkgs_apply "${EXTRA_PKGS_REQUEST:-}"))"
@@ -672,6 +776,10 @@ usage() {
   -m, --sd-mount DIR    SD 卡挂载点 (默认 /mnt/sd)
       --no-sd           完全跳过 SD 卡挂载与 Docker 数据迁移
       --no-sd-automount 挂载 SD 卡但不写入 fstab (不自动挂载)
+      --net-mode MODE   组网模式: auto|wireguard|lan|mixed (默认 auto, 按清单推导)
+                          lan  = 仅局域网直连 (不装 wireguard-tools, 不建 wg 数据目录)
+                          wireguard / mixed = 启用 WireGuard
+      --lan-only        等价于 --net-mode lan
   -y, --yes             跳过交互确认 (非交互/自动化场景必填)
       --dry-run         只打印将要应用的配置, 不修改系统 (可单独使用)
       --no-detect       不自动采用本机探测到的 IP/网关 (仍会探测并用于风险提示)
@@ -691,6 +799,7 @@ usage() {
 
 初始化装包范围 (无头服务器, 不装任何桌面/图形组件):
   核心 (默认装)  curl git ca-certificates jq rsync parted wireguard-tools
+                 -- 其中 wireguard-tools 在 --net-mode lan 时自动剔除
   可选 (默认不装) wget vim htop iotop net-tools dnsutils unzip dosfstools
                  fdisk lsb-release gnupg        -- 需要时加 --extra-pkgs
   桌面/图形 (永不装) 桌面套件 / Xorg / 显示管理器 / 字体 / 浏览器 / 远程桌面等,
@@ -843,6 +952,11 @@ while [[ $# -gt 0 ]]; do
         -g|--gateway)   GATEWAY="$2";      shift 2 ;;
         -D|--dns)       DNS_SERVERS="$2";  DNS_EXPLICIT=true; shift 2 ;;
         --dns-dhcp)     DNS_SERVERS="dhcp"; DNS_EXPLICIT=true; shift ;;
+        # 组网模式: 决定是否安装 wireguard-tools / 是否创建 wireguard 数据目录
+        #   auto 按清单推导 | wireguard 仅 WG | lan 仅局域网 | mixed 混合
+        --net-mode)     ONECLOUD_NET_MODE="$2"; shift 2 ;;
+        --net-mode=*)   ONECLOUD_NET_MODE="${1#*=}"; shift ;;
+        --lan-only)     ONECLOUD_NET_MODE="lan"; shift ;;
         -s|--sd)        SD_DEV="$2";       shift 2 ;;
         -m|--sd-mount)  SD_MOUNT="$2";     shift 2 ;;
         --no-sd)        NO_SD=true;        shift ;;
@@ -876,6 +990,17 @@ while [[ $# -gt 0 ]]; do
         *) log_error "未知选项: $1"; usage; exit 1 ;;
     esac
 done
+
+# 组网模式取值校验: 非法值不静默回退 (静默回退会让用户以为 lan 生效了, 实际还在装 WG)
+if [ -n "${ONECLOUD_NET_MODE:-}" ]; then
+    case "$(printf '%s' "$ONECLOUD_NET_MODE" | tr 'A-Z' 'a-z')" in
+        auto|wireguard|lan|mixed) ;;
+        *)
+            log_error "非法的组网模式: ${ONECLOUD_NET_MODE} (可选 auto|wireguard|lan|mixed)"
+            exit 2
+            ;;
+    esac
+fi
 
 # 交互判定: 默认看是否有 TTY; 自动化场景可用 ONECLOUD_BOOTSTRAP_TTY=1/0 强制指定
 if [ -n "${ONECLOUD_BOOTSTRAP_TTY:-}" ]; then
@@ -1711,10 +1836,19 @@ else
 fi
 
 # 服务数据目录清单 (相对 srv/<节点>); SD 写入失败会自动降级到 /opt 同路径
-SVC_TREE="cloudflared adguard/{work,conf} wireguard/config \
+#
+#   wireguard/config 仅在组网模式启用 WireGuard 时创建 —— 与 deploy.sh 的
+#   目录推导保持同一套判定, 避免"节点上有个空 wireguard 目录"被误读成已安装。
+SVC_TREE="cloudflared adguard/{work,conf} \
     clash memos/data homeassistant piwigo/{config,gallery} xiaomusic \
     migpt syncthing/{config,data} verysync/{temp} aria2/{config,downloads} \
     cupsd/{config,printers,spool} cups-web/config panel"
+if [ "$(wg_enabled_for_bootstrap)" = "1" ]; then
+    SVC_TREE="cloudflared adguard/{work,conf} wireguard/config \
+    clash memos/data homeassistant piwigo/{config,gallery} xiaomusic \
+    migpt syncthing/{config,data} verysync/{temp} aria2/{config,downloads} \
+    cupsd/{config,printers,spool} cups-web/config panel"
+fi
 
 log_info "创建目录结构: ${DATA_ROOT}/srv/${NODE_NAME} (来源: ${INSTALL_SOURCE})"
 safe_install_tree "srv/${NODE_NAME}" "${SVC_TREE}" "服务数据目录"
@@ -1741,6 +1875,11 @@ if mkdir -p "$INSTALL_CONF_DIR" 2>/dev/null; then
         echo "WG_IP=${WG_IP_EFF}"
         echo "DATA_ROOT=${DATA_ROOT}"
         echo "INSTALL_VIA_SD=${INSTALL_VIA_SD}"
+        # 组网模式与 WireGuard 启用态: 供节点侧安装脚本/健康检查判定
+        #   NETWORK_MODE = auto|wireguard|lan|mixed (原样记录清单/环境变量取值)
+        #   WG_ENABLED   = 0|1 (LAN 模式强制 0, 便于下游直接判断"要不要建 wg 目录")
+        echo "NETWORK_MODE=${ONECLOUD_NET_MODE:-$(bootstrap_net_mode)}"
+        echo "WG_ENABLED=$(wg_enabled_for_bootstrap)"
     } > "${INSTALL_CONF_DIR}/install.conf" 2>/dev/null \
         && log_info "已记录安装信息: ${INSTALL_CONF_DIR}/install.conf" \
         || log_warn "写入 ${INSTALL_CONF_DIR}/install.conf 失败"

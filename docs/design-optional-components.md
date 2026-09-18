@@ -135,7 +135,7 @@ network:
 | `service_installed` | `<节点名> <服务名>` | `0`/`1` | **综合判定：清单声明 + 模式 + 手动/外部标记** |
 | `service_data_dir` | `<节点名> <服务名>` | 绝对路径 | **数据目录单点**：`<DATA_ROOT>/srv/<节点名>/<服务>` |
 | `node_data_dir` | `<节点名>` | 绝对路径 | `<DATA_ROOT>/srv/<节点名>` |
-| `services_status_table` | — | TSV 行 | 供 `gen-panel-config.sh` 消费：`节点|服务|installed|optional|install` |
+| `services_status_table` | — | TSV 行（固定 6 列） | 供 `install-services.sh list-installed` 消费：`节点|服务|installed|optional|install|port`。**空值以 `-` 占位**，不可输出空字段——`IFS=$'\t' read` 会折叠相邻制表符之间的空字段，导致后面的列左移错位（实测「安装方式」列显示成端口号） |
 
 ### 2.3 关键判定逻辑（伪代码，必须单点实现）
 
@@ -583,6 +583,54 @@ const addr = data.wg_enabled
 8. `verysync` 在面板显示"待手动安装"而非"离线"
 9. 现有 32 组 555 项 + 新增 33/34/35 组全部通过
 10. 版本 `1.6.0` 五处声明一致
+
+---
+
+## 11.1 实施与验收结果（2026-09-18 完成）
+
+**结论：设计方案已全部落地，验收标准 1–10 全部满足。**
+
+### 验收对照
+
+| # | 验收项 | 结果 | 证据 |
+|---|--------|------|------|
+| 1 | lan 模式 health-check 0 FAIL、WG 段 SKIP | ✅ | 未安装服务走 SKIP 分支，`manual` 显示"待手动安装" |
+| 2 | 面板拓扑"局域网直连"、无 WG 行、灰点未安装 | ✅ | `.status-dot.notinstalled` + `topoMode` + `serviceState()` 三态 |
+| 3 | lan 模式防火墙不含 51820 / wg0 规则 | ✅ | 全部节点 DSL 无 51820；正文仅剩"本清单不含…"提示句 |
+| 4 | 面板全功能可用、无 401 / 无 CORS 报错 | ✅ | `_panel_e2e.py` 36 项全过（登录/会话/CORS/CSRF/409） |
+| 5 | mixed → 拓扑混合、WG 运行中、LAN+WG 均检查 | ✅ | DSL 含 51820，deploy 保留 `wireguard/config` |
+| 6 | wireguard 模式同上且优先 wg IP | ✅ | `probe_addr_for` 优先 wg IP，回退 LAN |
+| 7 | 无 SD 节点数据根为 `/opt/onecloud` | ✅ | `oc_data_root` 统一拼接，7 条反向断言盯住 |
+| 8 | verysync 显示"待手动安装" | ✅ | `install: manual` → `installed=false`，SSH 探测被短路 |
+| 9 | 原有 32 组 + 新增 33/34/35 全通过 | ✅ | 33 组 56 项 / 34 组 60 项 / 35 组 55 项，全 0 FAIL |
+| 10 | 版本 1.6.0 声明一致 | ✅ | 6 处（README 两处）全部 `1.6.0` |
+
+### 实施期新发现并修复的 8 个缺陷
+
+方案本身没问题，但落地过程中由**测试反向断言**抓出 8 个真实缺陷（含 1 个 P0）。
+完整清单与根因见 `docs/to-fix.md` 第六节。摘要：
+
+1. **P0** lan 模式防火墙仍放行 UDP 51820（`parse_service_ports` 绕过模式门禁）
+2. P1 `services_status_table` 空字段被 `IFS=$'\t' read` 折叠 → 「安装方式」列显示成端口号
+3. P1 `list-installed` 中文表头 `printf %-Ns` 按字节填充 → 列错位
+4. P1 `deploy.sh` 预建目录丢失花括号展开形式，破坏「单条 mkdir + 可静态核对」契约
+5. P2 `panel/app.py` 缺 `_SAFE_SVC_NAME` 定义（服务名直拼 shell = 命令执行入口）
+6. P2 模式标签双重括号 `lan (局域网直连 (…))`
+7. **P1** `gen-panel-config.sh` 逐节点 SSH 探测数据根 → 生成静态配置却白等 `ConnectTimeout` 秒级/节点
+8. **P1** `_svc_first_port` 裸 `${!arr}` 展开在 `set -u` 下报 unbound，被 `2>/dev/null` 吞掉 →
+   **所有 `ports: [...]` 形式的容器服务端口静默退化为 0**（18 个服务只有 2 个非零）
+
+第 7/8 两项是第二轮排查第 32 组超时时顺线发现的，已完成修复并新增第 36 组 20 项回归断言。
+
+### 性能提示（Git Bash on Windows）
+
+`services_status_table` 原本单次调用 200s（现已加四层缓存降至 105s）。
+剩余耗时的本质是本环境**函数调用开销 ~0.55s/次**，而该表有 ~110 次调用 ——
+**不是代码缺陷**，Linux 真机上为亚秒级。测试已改为单次调用 + 同份输出多项断言。
+
+`gen-panel-config.sh` 由 160s 优化到 104s：移除逐节点 SSH（-27s）、热路径去 `$( )` 子 shell、
+`service_field` 改关联数组直查。**残余 ~104s 同样是本环境 fork 开销**，且该脚本每次部署
+只在控制端跑一次，不再继续优化。
 
 ---
 

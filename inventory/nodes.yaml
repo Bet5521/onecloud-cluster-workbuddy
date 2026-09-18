@@ -82,7 +82,16 @@ nodes:
 # ---- 网络参数 ----
 # 以下均为默认值, 可按实际环境修改 (或用 nodes.local.yaml / 环境变量覆盖)
 network:
+  # 组网模式 (可用环境变量 ONECLOUD_NET_MODE 覆盖):
+  #   auto      按清单推导 —— wireguard 服务存在且 default_enabled -> mixed, 否则 lan
+  #   wireguard 仅 WireGuard 组网 (节点间全程走隧道, 不依赖 LAN 互通)
+  #   lan       仅局域网直连 (强制不启用 WireGuard, 不产生任何 WG 配置与检查)
+  #   mixed     混合 (LAN 直连优先, 跨网段/异地走 WireGuard) —— 推荐
+  # 注意: mode=lan 时即使下面 services 里仍留着 wireguard 也一律视作未安装,
+  #       切模式时不必同时改两处。
+  mode: mixed
   lan_subnet: 192.168.1.0/24
+  # wg_subnet / wg_port 在 mode=lan 时不参与任何计算与校验 (保留便于日后切换)
   wg_subnet: 10.8.0.0/24
   gateway: 192.168.1.1
   # dns: dhcp = 由 DHCP/系统自动获取 (默认); 也可写具体地址, 多个用逗号分隔

@@ -19,28 +19,88 @@ log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
 # shellcheck source=lib-pydeps.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib-pydeps.sh"
 
+# 节点清单库 + 安装态/数据根单一真相库
+# 修复: 本脚本原先既不 source lib-nodes.sh, 也从不定义 DATA_ROOT,
+#       导致 ${DATA_ROOT:-/mnt/sd/srv} 恒定为 /mnt/sd/srv (见审计 C-3)。
+#       现在数据根由 lib-services.sh 单点提供, 无 SD 回退 /opt/onecloud 也能正确取到。
+# shellcheck source=lib-nodes.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib-nodes.sh"
+# shellcheck source=lib-services.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib-services.sh"
+
+# 本机数据根 (lib-install-path.sh 可用时优先按其决策, 否则回退默认值)
+if [ -f "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib-install-path.sh" ]; then
+    # shellcheck source=lib-install-path.sh
+    source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib-install-path.sh"
+    # 本机执行时按实际 SD 卡状态决策; 失败不阻断 (resolve_data_root 自身已容错)
+    [ -z "${ONECLOUD_SKIP_DATA_ROOT_RESOLVE:-}" ] && resolve_data_root 2>/dev/null || true
+fi
+# 当前节点名 (供本机场景定位数据目录; 取不到时由调用方按角色传参)
+CURRENT_NODE="$(node_by_ip "$(hostname -I 2>/dev/null | awk '{print $1}')" 2>/dev/null || true)"
+[ -z "$CURRENT_NODE" ] && CURRENT_NODE="$(node_names | head -n 1)"
+
+# 数据根目录 (集中一处, 供本脚本所有路径拼接使用)
+svc_data_root() { oc_data_root; }
+
+# ----------------------------------------------------------------------------
+# 渲染模板里的 __DATA_ROOT__ / __NODE_NAME__ 占位符
+#   配置文件 (xiaomusic config.json / verysync config.yaml) 与 systemd 单元
+#   都只写占位符, 安装时才落到实际数据根。这样 SD 卡用户与无卡用户共用一份
+#   受版本控制的配置, 不会有人误把 /mnt/sd 提交进去 (审计 C-3)。
+#
+#   用法: render_template <源文件> <目标文件>
+#   源文件不存在 -> 返回 0 (跳过, 由调用方决定是否告警)
+# ----------------------------------------------------------------------------
+render_template() {
+    local src="${1:-}" dst="${2:-}"
+    [ -n "$src" ] && [ -n "$dst" ] || return 1
+    [ -f "$src" ] || return 0
+    local dr
+    dr="$(svc_data_root)"
+    mkdir -p "$(dirname "$dst")"
+    sed -e "s|__DATA_ROOT__|${dr}|g" \
+        -e "s|__NODE_NAME__|${CURRENT_NODE}|g" \
+        "$src" > "$dst"
+}
+
+# 定位仓库内某节点的某服务配置模板 (脚本从仓库 scripts/ 运行时可用)
+service_template_dir() {   # service_template_dir <节点名> <服务名>
+    local n="${1:-}" s="${2:-}" root
+    root="${LIB_NODES_PROJECT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+    printf '%s/node-%s/%s' "$root" "$n" "$s"
+}
+
 usage() {
     cat << EOF
-用法: $0 <服务名>
+用法: $0 <服务名|子命令>
 
 可安装的服务 (原生二进制):
   mihomo       - Clash Meta 代理
   xiaomusic    - 小米音乐
   migpt        - AI 助手 (proxy.py)
-  verysync     - 微力同步
+  verysync     - 微力同步 (无自动安装实现, 打印手动部署指引)
   all-native   - 安装所有原生服务
 
-Docker 服务:
-  edge         - NODE-01 全部 Docker 服务
-  iot          - NODE-02 全部 Docker 服务
-  storage      - NODE-03 全部 Docker 服务
+Docker 服务 (按角色启动对应节点):
+  edge         - 边缘网关节点全部 Docker 服务
+  iot          - IoT 节点全部 Docker 服务
+  storage      - 存储与同步节点全部 Docker 服务
   all-docker   - 安装全部
+
+状态查询:
+  list-installed  列出各服务的安装态与组网模式
 
 示例:
   $0 mihomo            # 安装 Clash
   $0 xiaomusic         # 安装 xiaomusic
-  $0 edge              # 启动 NODE-01 所有容器
+  $0 edge              # 启动边缘网关节点所有容器
   $0 all-native        # 安装所有原生二进制
+  $0 list-installed    # 查看安装态
+
+说明:
+  数据根由 lib-services.sh 统一解析 (SD 卡挂载点, 无卡回退 /opt/onecloud),
+  不再固定使用 /mnt/sd。配置模板里的 __DATA_ROOT__ 占位符会在安装时按本机
+  实际数据根渲染。未安装的服务可在面板上区分显示。
 EOF
 }
 
@@ -105,6 +165,13 @@ install_mihomo() {
         log_error "安装后未在 PATH 中找到 mihomo"
         return 1
     fi
+
+    # 数据目录按本机实际数据根创建 (不再写死 /mnt/sd)
+    local clash_dir
+    clash_dir="$(service_data_dir "$CURRENT_NODE" clash)"
+    mkdir -p "$clash_dir"
+    log_info "数据目录: ${clash_dir}"
+    log_info "systemd 单元: 运行 node-${CURRENT_NODE}/clash/install-service.sh"
 }
 
 install_xiaomusic() {
@@ -149,6 +216,19 @@ install_xiaomusic() {
         return 1
     fi
     rm -rf "$tmpdir"
+
+    # 渲染配置模板到本机实际数据根 (路径不再写死 /mnt/sd)
+    local xm_dir tpl
+    xm_dir="$(service_data_dir "$CURRENT_NODE" xiaomusic)"
+    tpl="$(service_template_dir "$CURRENT_NODE" xiaomusic)/config.json"
+    mkdir -p "${xm_dir}/downloads" "${xm_dir}/cache" "${xm_dir}/session"
+    if [ -f "$tpl" ]; then
+        render_template "$tpl" "${xm_dir}/config.json"
+        log_info "配置已渲染: ${xm_dir}/config.json"
+    else
+        log_warn "未找到配置模板 ($tpl), 请手动创建 ${xm_dir}/config.json"
+    fi
+    log_info "systemd 单元: 运行 node-${CURRENT_NODE}/xiaomusic/install-service.sh"
 }
 
 install_migpt() {
@@ -174,14 +254,55 @@ install_migpt() {
 }
 
 install_verysync() {
-    log_warn "verysync 需要从官网手动下载"
-    log_warn "访问 https://www.verysync.com/download 获取 Linux ARM 版本"
+    # verysync 在 services.yaml 里标了 install: manual —— 无自动化安装实现。
+    # 这里如实说明并提供下载与部署指引, 不再只是"需要手动下载"一句话。
+    local dir
+    dir="$(service_data_dir "$CURRENT_NODE" verysync)"
+    log_warn "verysync 无自动化安装实现 (services.yaml 标记 install: manual)"
+    echo ""
+    echo "  手动安装步骤:"
+    echo "    1. 从 https://www.verysync.com/download 下载 Linux ARM 版本"
+    echo "       (玩客云 S805 为 armv7, 选择 armv7 / arm 版)"
+    echo "    2. 放到节点并安装:"
+    echo "         tar -xzf verysync-linux-armv7-*.tar.gz"
+    echo "         install -m 0755 verysync /usr/local/bin/verysync"
+    echo "    3. 数据目录 (已按本机数据根解析):"
+    echo "         mkdir -p '${dir}'"
+    echo "    4. 写入 systemd 单元后启用:"
+    echo "         ExecStart=/usr/local/bin/verysync -gui-address=0.0.0.0:19900 -config=${dir}"
+    echo "         systemctl daemon-reload && systemctl enable --now verysync"
+    echo ""
+    # 配置模板里的路径占位符按本机数据根渲染, 避免手工再改一遍
+    local tpl
+    tpl="$(service_template_dir "$CURRENT_NODE" verysync)/config.yaml"
+    if [ -f "$tpl" ]; then
+        mkdir -p "$dir"
+        render_template "$tpl" "${dir}/config.yaml"
+        echo "  配置已按本机数据根渲染: ${dir}/config.yaml"
+    fi
+    echo ""
+    echo "  面板会把未安装的 verysync 显示为「待手动安装」, 不计为运行异常。"
+    return 0
 }
 
 # 在指定节点目录启动 compose (兼容 docker compose / docker-compose)
+# 数据根来自 lib-services.sh: oc_data_root() —— 不再拼 /mnt/sd
 start_compose() {
-    local node=$1
-    local dir="${DATA_ROOT:-/mnt/sd/srv}/${node}"
+    local role=$1
+    # 角色 -> 节点名 (从清单反查, 不硬编码 wk-xxx 名字)
+    local node=""
+    case "$role" in
+        edge)    node="$(node_name_by_role edge-gateway  || true)" ;;
+        iot)     node="$(node_name_by_role iot-core      || true)" ;;
+        storage) node="$(node_name_by_role storage-sync  || true)" ;;
+    esac
+    if [ -z "$node" ]; then
+        log_error "清单中未找到角色为 '$role' 的节点 (请检查 inventory/nodes.yaml)"
+        return 1
+    fi
+
+    local dir
+    dir="$(node_data_dir "$node")"
     if [ ! -d "$dir" ]; then
         log_error "目录不存在: $dir (请先运行 ./scripts/deploy.sh 分发配置)"
         return 1
@@ -195,18 +316,40 @@ start_compose() {
 }
 
 start_edge() {
-    log_info "启动 NODE-01 Docker 服务..."
-    start_compose "wk-edge-01"
+    log_info "启动边缘网关节点的 Docker 服务..."
+    start_compose "edge"
 }
 
 start_iot() {
-    log_info "启动 NODE-02 Docker 服务..."
-    start_compose "wk-iot-02"
+    log_info "启动 IoT 节点的 Docker 服务..."
+    start_compose "iot"
 }
 
 start_storage() {
-    log_info "启动 NODE-03 Docker 服务..."
-    start_compose "wk-storage-03"
+    log_info "启动存储节点的 Docker 服务..."
+    start_compose "storage"
+}
+
+# 列出各服务安装态 (供 init.sh 与运维排查使用)
+list_installed() {
+    # 表头是中文, **不能**用 %-Ns 填充 —— printf 按字节补空格, 一个汉字 3 字节,
+    # 于是"节点"被补成 14 字节宽却只占 6 个显示列, 整行右移错位。
+    # 表头用固定分隔符, 数据行 (纯 ASCII + 单字"是/否") 才用 %-Ns。
+    printf '%s\n' "节点           服务           已安装     可选     安装方式"
+    printf '%s\n' "-------------- -------------- ---------- -------- --------"
+    local n s inst opt imode port
+    # services_status_table 输出固定 6 列 (空值以 "-" 占位, 避免 IFS 折叠
+    # 空字段导致列错位), 这里按 6 列读, 只用前 5 列。
+    while IFS=$'\t' read -r n s inst opt imode port; do
+        local im iopt
+        [ "$inst" = "1" ] && im="是" || im="否"
+        [ "$opt"  = "1" ] && iopt="是" || iopt="否"
+        [ "$imode" = "-" ] && imode="自动"
+        printf '%-14s %-14s %-10s %-8s %s\n' "$n" "$s" "$im" "$iopt" "$imode"
+    done < <(services_status_table)
+    echo ""
+    echo "组网模式: $(network_mode_label)"
+    echo "WireGuard: $([ "$(wg_enabled)" = "1" ] && echo 启用 || echo 未启用)"
 }
 
 case "${1:-}" in
@@ -214,6 +357,16 @@ case "${1:-}" in
     xiaomusic)   install_xiaomusic ;;
     migpt)       install_migpt ;;
     verysync)    install_verysync ;;
+    # 组网模式关闭 WireGuard 时, 明确拒绝而不是装出一个不可用的环境
+    wireguard)
+        if [ "$(wg_enabled)" = "1" ]; then
+            log_info "WireGuard 由 edges 节点的容器提供 (docker compose up -d 即可), 无需原生安装"
+            log_info "配置生成: ./scripts/wireguard-setup.sh"
+        else
+            log_warn "当前组网模式为 $(network_mode), 未启用 WireGuard, 跳过安装"
+            log_info "如需启用: 在 inventory/nodes.yaml 设 network.mode: mixed (或 wireguard)"
+        fi
+        ;;
     all-native)
         # 单个原生服务失败不应中断其余安装 (set -e 下需显式容错)
         install_mihomo    || log_warn "mihomo 安装失败"
@@ -224,11 +377,12 @@ case "${1:-}" in
     edge)        start_edge ;;
     iot)         start_iot ;;
     storage)     start_storage ;;
+    list-installed|status) list_installed ;;
     all-docker)
         # 单个节点通常只跑其中一个, 任一失败不应中断其余
-        start_edge    || log_warn "NODE-01 启动失败"
-        start_iot     || log_warn "NODE-02 启动失败"
-        start_storage || log_warn "NODE-03 启动失败"
+        start_edge    || log_warn "边缘节点启动失败"
+        start_iot     || log_warn "IoT 节点启动失败"
+        start_storage || log_warn "存储节点启动失败"
         ;;
     *)           usage ;;
 esac
